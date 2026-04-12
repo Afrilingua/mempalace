@@ -138,7 +138,7 @@ On empty results: return a result object with empty inner lists, never raise. Sp
 
 **Required operators:** `$eq`, `$ne`, `$in`, `$nin`, `$and`, `$or`, `$contains`.
 
-Backends that do not support full-text natively must implement `$contains` via payload string match. A `$contains_fast` capability flag lets callers check whether a backend's implementation is indexed (fast) or scan-based (slow).
+Backends that do not support full-text natively must implement `$contains` via payload string match. The `supports_contains_fast` capability flag (§2.1) lets callers check whether a backend's implementation is indexed (fast) or scan-based (slow).
 
 **Unknown operators:** backends MUST raise `UnsupportedFilterError`. Silent dropping is forbidden — it produces incorrect results.
 
@@ -368,12 +368,12 @@ Backends receive an `Embedder` via `get_collection(embedder=...)`. Backends with
 
 The sync subsystem is out of scope for this spec. What this spec defines:
 
-- `sync_capable` capability flag — a backend advertising it agrees to implement idempotent upserts under conflict and to expose change data.
+- `supports_sync` capability flag (§2.1) — a backend advertising it agrees to implement idempotent upserts under conflict and to expose change data.
 - Optional method on `BaseCollection`:
   ```python
   def changes_since(self, cursor: SyncCursor) -> Iterator[Change]: ...
   ```
-- Backends without `change_feed` / `sync_capable` are rejected by the sync subsystem at bind time.
+- Backends without `supports_change_feed` / `supports_sync` are rejected by the sync subsystem at bind time.
 
 Local single-user deployments never load the sync subsystem; non-sync-capable backends cost them nothing.
 

@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,16 +34,20 @@ from typing import Iterator, Optional
 
 from .palace import get_collection
 
+logger = logging.getLogger(__name__)
+
 
 # ── JSONL parsing ────────────────────────────────────────────────────
+
 
 def _flatten_content(content) -> str:
     """Normalize Claude Code's message content to a plain string.
 
     User messages are strings already; assistant messages are a list of
     content blocks like [{"type": "text", "text": "..."}, {"type":
-    "tool_use", ...}]. We keep text blocks verbatim and describe non-text
-    blocks as a marker so the drawer carries a faithful record.
+    "tool_use", ...}]. All blocks are preserved verbatim — the design
+    principle is "verbatim always", so tool inputs and results are
+    serialized in full, never truncated.
     """
     if isinstance(content, str):
         return content
@@ -57,14 +62,12 @@ def _flatten_content(content) -> str:
             elif btype == "tool_use":
                 parts.append(
                     f"[tool_use: {block.get('name', '?')} "
-                    f"input={json.dumps(block.get('input', {}), default=str)[:500]}]"
+                    f"input={json.dumps(block.get('input', {}), default=str)}]"
                 )
             elif btype == "tool_result":
-                parts.append(
-                    f"[tool_result: {json.dumps(block.get('content', ''), default=str)[:500]}]"
-                )
+                parts.append(f"[tool_result: {json.dumps(block.get('content', ''), default=str)}]")
             else:
-                parts.append(f"[{btype}]")
+                parts.append(f"[{btype}: {json.dumps(block, default=str)}]")
         return "\n".join(p for p in parts if p)
     return str(content)
 
@@ -127,19 +130,32 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
 
 # ── Cursor resolution ────────────────────────────────────────────────
 
+
 def get_palace_cursor(collection, session_id: str) -> Optional[str]:
     """Return the max timestamp of drawers for this session_id, or None.
 
     ISO-8601 strings compare lexically in the right order, so we don't
-    need to parse them. Query scans metadatas for the session (ChromaDB
-    where-filter), then reduces.
+    need to parse them. Query scans metadatas for the session via the
+    backend's where-filter, then reduces.
+
+    Backend errors are logged at WARNING and surface as a `None` cursor —
+    which makes the caller treat the session as empty and ingest every
+    message. That's intentional: a no-cursor sweep is recovered from on
+    the next run by deterministic drawer IDs, so a degraded cursor never
+    causes silent data loss.
     """
     try:
         data = collection.get(
             where={"session_id": session_id},
             include=["metadatas"],
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "sweeper: cursor lookup failed for session_id=%s (%s); "
+            "treating as empty — drawers will be re-upserted idempotently.",
+            session_id,
+            exc,
+        )
         return None
     metas = data.get("metadatas") or []
     timestamps = [m.get("timestamp") for m in metas if m and m.get("timestamp")]
@@ -150,13 +166,18 @@ def get_palace_cursor(collection, session_id: str) -> Optional[str]:
 
 # ── Sweep ────────────────────────────────────────────────────────────
 
+
 def _drawer_id_for_message(session_id: str, message_uuid: str) -> str:
-    """Deterministic drawer ID so upserts at the same message are no-ops."""
-    return f"sweep_{session_id[:12]}_{message_uuid}"
+    """Deterministic drawer ID so upserts at the same message are no-ops.
+
+    Uses the full session_id (not a prefix) to avoid any cross-session
+    collision risk if a transcript source ever uses non-UUID session
+    identifiers or shares prefixes across sessions.
+    """
+    return f"sweep_{session_id}_{message_uuid}"
 
 
-def sweep(jsonl_path: str, palace_path: str,
-          source_label: Optional[str] = None) -> dict:
+def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None) -> dict:
     """Ingest every user/assistant message not already represented.
 
     For each message in the jsonl:
@@ -241,23 +262,29 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
     total_skipped = 0
     per_file = []
 
+    failures: list[dict] = []
     for f in files:
         try:
             result = sweep(str(f), palace_path, source_label=str(f))
         except Exception as exc:
-            print(f"  ⚠ sweep failed on {f}: {exc}", file=sys.stderr)
+            logger.error("sweeper: sweep failed on %s: %s", f, exc)
+            print(f"  \u26a0 sweep failed on {f}: {exc}", file=sys.stderr)
+            failures.append({"file": str(f), "error": str(exc)})
             continue
         total_added += result["drawers_added"]
         total_skipped += result["drawers_skipped"]
-        per_file.append({
-            "file": str(f),
-            "added": result["drawers_added"],
-            "skipped": result["drawers_skipped"],
-        })
+        per_file.append(
+            {
+                "file": str(f),
+                "added": result["drawers_added"],
+                "skipped": result["drawers_skipped"],
+            }
+        )
 
     return {
         "files_processed": len(per_file),
         "drawers_added": total_added,
         "drawers_skipped": total_skipped,
         "per_file": per_file,
+        "failures": failures,
     }

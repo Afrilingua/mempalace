@@ -16,8 +16,6 @@ This test file is TDD — written BEFORE mempalace/sweeper.py exists.
 """
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -28,27 +26,45 @@ def mock_claude_jsonl(tmp_path):
     path = tmp_path / "session_abc.jsonl"
     lines = [
         # Noise: progress event, no message
-        {"type": "progress", "timestamp": "2026-04-18T10:00:00Z",
-         "sessionId": "abc", "uuid": "p-1"},
+        {
+            "type": "progress",
+            "timestamp": "2026-04-18T10:00:00Z",
+            "sessionId": "abc",
+            "uuid": "p-1",
+        },
         # User message
-        {"type": "user", "timestamp": "2026-04-18T10:00:05Z",
-         "sessionId": "abc", "uuid": "u-1",
-         "message": {"role": "user", "content": "What's the capital of France?"}},
+        {
+            "type": "user",
+            "timestamp": "2026-04-18T10:00:05Z",
+            "sessionId": "abc",
+            "uuid": "u-1",
+            "message": {"role": "user", "content": "What's the capital of France?"},
+        },
         # Assistant reply
-        {"type": "assistant", "timestamp": "2026-04-18T10:00:06Z",
-         "sessionId": "abc", "uuid": "a-1",
-         "message": {"role": "assistant",
-                     "content": [{"type": "text", "text": "Paris."}]}},
+        {
+            "type": "assistant",
+            "timestamp": "2026-04-18T10:00:06Z",
+            "sessionId": "abc",
+            "uuid": "a-1",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Paris."}]},
+        },
         # Noise: file-history-snapshot
         {"type": "file-history-snapshot", "messageId": "abc-snap"},
         # Second user/assistant exchange
-        {"type": "user", "timestamp": "2026-04-18T10:01:00Z",
-         "sessionId": "abc", "uuid": "u-2",
-         "message": {"role": "user", "content": "And of Germany?"}},
-        {"type": "assistant", "timestamp": "2026-04-18T10:01:01Z",
-         "sessionId": "abc", "uuid": "a-2",
-         "message": {"role": "assistant",
-                     "content": [{"type": "text", "text": "Berlin."}]}},
+        {
+            "type": "user",
+            "timestamp": "2026-04-18T10:01:00Z",
+            "sessionId": "abc",
+            "uuid": "u-2",
+            "message": {"role": "user", "content": "And of Germany?"},
+        },
+        {
+            "type": "assistant",
+            "timestamp": "2026-04-18T10:01:01Z",
+            "sessionId": "abc",
+            "uuid": "a-2",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Berlin."}]},
+        },
     ]
     path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
     return path
@@ -57,6 +73,7 @@ def mock_claude_jsonl(tmp_path):
 class TestSweeperParsing:
     def test_parse_yields_only_user_and_assistant(self, mock_claude_jsonl):
         from mempalace.sweeper import parse_claude_jsonl
+
         records = list(parse_claude_jsonl(str(mock_claude_jsonl)))
         roles = [r["role"] for r in records]
         assert roles == ["user", "assistant", "user", "assistant"], (
@@ -67,6 +84,7 @@ class TestSweeperParsing:
 
     def test_parse_extracts_session_id_and_timestamp(self, mock_claude_jsonl):
         from mempalace.sweeper import parse_claude_jsonl
+
         records = list(parse_claude_jsonl(str(mock_claude_jsonl)))
         first = records[0]
         assert first["session_id"] == "abc"
@@ -75,12 +93,52 @@ class TestSweeperParsing:
 
     def test_parse_normalizes_assistant_content_list_to_text(self, mock_claude_jsonl):
         from mempalace.sweeper import parse_claude_jsonl
+
         records = list(parse_claude_jsonl(str(mock_claude_jsonl)))
         assistant_rec = records[1]
         assert assistant_rec["role"] == "assistant"
-        assert "Paris" in assistant_rec["content"], (
-            f"Assistant content blocks must be flattened to text; "
-            f"got: {assistant_rec['content']!r}"
+        assert (
+            "Paris" in assistant_rec["content"]
+        ), f"Assistant content blocks must be flattened to text; got: {assistant_rec['content']!r}"
+
+    def test_parse_preserves_tool_blocks_verbatim(self, tmp_path):
+        """Per the design principle "verbatim always", tool_use and
+        tool_result blocks must NOT be truncated. A long tool input
+        (e.g. a large diff handed to a code-edit tool) must round-trip
+        in full, otherwise we silently lose user-adjacent data.
+        """
+        import json as _json
+
+        from mempalace.sweeper import parse_claude_jsonl
+
+        big_input = {"diff": "x" * 5000}  # well past the old 500-char cap
+        path = tmp_path / "session_tools.jsonl"
+        path.write_text(
+            _json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-04-18T10:00:00Z",
+                    "sessionId": "tools-1",
+                    "uuid": "a-tool",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "name": "Edit", "input": big_input},
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+
+        records = list(parse_claude_jsonl(str(path)))
+        assert len(records) == 1
+        content = records[0]["content"]
+        # The full 5000-char value must be present — no truncation marker,
+        # no [:500] slice. Look for the raw string in the serialized form.
+        assert big_input["diff"] in content, (
+            "tool_use input was truncated. The verbatim guarantee requires "
+            f"the full payload to round-trip. Got len={len(content)}."
         )
 
 
@@ -89,6 +147,7 @@ class TestSweeperTandem:
 
     def test_sweep_empty_palace_ingests_all_messages(self, mock_claude_jsonl, tmp_path):
         from mempalace.sweeper import sweep
+
         palace_path = str(tmp_path / "palace")
         result = sweep(str(mock_claude_jsonl), palace_path)
         assert result["drawers_added"] == 4, (
@@ -99,6 +158,7 @@ class TestSweeperTandem:
     def test_sweep_is_idempotent(self, mock_claude_jsonl, tmp_path):
         """Running the sweep twice must not duplicate drawers."""
         from mempalace.sweeper import sweep
+
         palace_path = str(tmp_path / "palace")
         first = sweep(str(mock_claude_jsonl), palace_path)
         second = sweep(str(mock_claude_jsonl), palace_path)
@@ -116,13 +176,20 @@ class TestSweeperTandem:
 
         jsonl_path = tmp_path / "session.jsonl"
         lines = [
-            {"type": "user", "timestamp": "2026-04-18T09:00:00Z",
-             "sessionId": "s1", "uuid": "u1",
-             "message": {"role": "user", "content": "first"}},
-            {"type": "assistant", "timestamp": "2026-04-18T09:00:01Z",
-             "sessionId": "s1", "uuid": "a1",
-             "message": {"role": "assistant",
-                         "content": [{"type": "text", "text": "one"}]}},
+            {
+                "type": "user",
+                "timestamp": "2026-04-18T09:00:00Z",
+                "sessionId": "s1",
+                "uuid": "u1",
+                "message": {"role": "user", "content": "first"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-18T09:00:01Z",
+                "sessionId": "s1",
+                "uuid": "a1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+            },
         ]
         jsonl_path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
 
@@ -132,13 +199,20 @@ class TestSweeperTandem:
 
         # Append two more exchanges simulating live session growth.
         more_lines = [
-            {"type": "user", "timestamp": "2026-04-18T09:05:00Z",
-             "sessionId": "s1", "uuid": "u2",
-             "message": {"role": "user", "content": "second"}},
-            {"type": "assistant", "timestamp": "2026-04-18T09:05:01Z",
-             "sessionId": "s1", "uuid": "a2",
-             "message": {"role": "assistant",
-                         "content": [{"type": "text", "text": "two"}]}},
+            {
+                "type": "user",
+                "timestamp": "2026-04-18T09:05:00Z",
+                "sessionId": "s1",
+                "uuid": "u2",
+                "message": {"role": "user", "content": "second"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-18T09:05:01Z",
+                "sessionId": "s1",
+                "uuid": "a2",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "two"}]},
+            },
         ]
         with open(jsonl_path, "a") as f:
             for x in more_lines:
@@ -156,8 +230,7 @@ class TestSweeperDrawerMetadata:
     """Each drawer must carry the metadata the tandem-miner coordination
     depends on: session_id, timestamp, uuid, role."""
 
-    def test_drawer_has_session_id_and_timestamp_metadata(
-            self, mock_claude_jsonl, tmp_path):
+    def test_drawer_has_session_id_and_timestamp_metadata(self, mock_claude_jsonl, tmp_path):
         from mempalace.sweeper import sweep
         from mempalace.palace import get_collection
 
@@ -170,15 +243,10 @@ class TestSweeperDrawerMetadata:
         assert metas, "No drawers written"
 
         for m in metas:
-            assert m.get("session_id") == "abc", (
-                f"Drawer missing session_id metadata: {m}"
-            )
-            assert m.get("timestamp"), (
-                f"Drawer missing timestamp metadata: {m}"
-            )
-            assert m.get("message_uuid"), (
-                f"Drawer missing message_uuid metadata: {m}"
-            )
-            assert m.get("role") in ("user", "assistant"), (
-                f"Drawer missing or wrong role metadata: {m}"
-            )
+            assert m.get("session_id") == "abc", f"Drawer missing session_id metadata: {m}"
+            assert m.get("timestamp"), f"Drawer missing timestamp metadata: {m}"
+            assert m.get("message_uuid"), f"Drawer missing message_uuid metadata: {m}"
+            assert m.get("role") in (
+                "user",
+                "assistant",
+            ), f"Drawer missing or wrong role metadata: {m}"

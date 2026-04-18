@@ -108,9 +108,11 @@ class TestJsonlNotSilentlySkipped:
             def fake_stat(self, *args, **kwargs):
                 result = real_stat(self, *args, **kwargs)
                 if self.name == "big_transcript.jsonl":
+
                     class _FakeStat:
                         st_size = fake_size
                         st_mode = result.st_mode
+
                     return _FakeStat()
                 return result
 

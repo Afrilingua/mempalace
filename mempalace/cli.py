@@ -170,6 +170,13 @@ def cmd_sweep(args):
             f"+{result['drawers_added']} drawers, "
             f"{result['drawers_skipped']} already present."
         )
+        failures = result.get("failures") or []
+        if failures:
+            print(
+                f"  ⚠ {len(failures)} file(s) failed to sweep — see stderr / logs for details.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     else:
         print(f"  ✗ Not a file or directory: {target}", file=sys.stderr)
         sys.exit(1)
@@ -580,7 +587,7 @@ def main():
     p_sweep = sub.add_parser(
         "sweep",
         help="Tandem miner: catch anything the primary miner missed "
-             "(message-level, timestamp-coordinated, idempotent)",
+        "(message-level, timestamp-coordinated, idempotent)",
     )
     p_sweep.add_argument(
         "target",

@@ -20,11 +20,13 @@ from typing import Optional
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    MineAlreadyRunning,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -993,6 +995,52 @@ def mine(
     ``mine`` walks the tree itself just like before.
     """
 
+    if dry_run:
+        return _mine_impl(
+            project_dir,
+            palace_path,
+            wing_override=wing_override,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+            files=files,
+        )
+
+    try:
+        with mine_palace_lock(palace_path):
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+            )
+    except MineAlreadyRunning:
+        print(
+            f"mempalace: another `mine` is already running against "
+            f"{palace_path} — exiting cleanly.",
+            file=sys.stderr,
+        )
+        return
+
+
+def _mine_impl(
+    project_dir: str,
+    palace_path: str,
+    wing_override: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    respect_gitignore: bool = True,
+    include_ignored: list = None,
+    files: list = None,
+):
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
 

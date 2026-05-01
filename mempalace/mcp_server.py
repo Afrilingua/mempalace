@@ -57,6 +57,8 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
+from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
+
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
@@ -284,14 +286,22 @@ def _get_collection(create=False):
             # palaces whose collections were created before this fix (the
             # runtime config does not persist cross-process in chromadb 1.5.x,
             # so the retrofit runs every time _get_collection opens a cache).
-            raw = client.get_or_create_collection(
-                _config.collection_name,
-                metadata={
-                    "hnsw:space": "cosine",
-                    "hnsw:num_threads": 1,
-                    **_HNSW_BLOAT_GUARD,
-                },
-            )
+            #
+            # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
+            # is called with metadata that differs from what's stored. The split
+            # below skips the metadata-comparison codepath for existing
+            # collections, mirroring the backend-layer fix from #1262.
+            try:
+                raw = client.get_collection(_config.collection_name)
+            except _ChromaNotFoundError:
+                raw = client.create_collection(
+                    _config.collection_name,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
+                )
             _pin_hnsw_threads(raw)
             _collection_cache = ChromaCollection(raw)
             _metadata_cache = None

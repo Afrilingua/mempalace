@@ -412,12 +412,17 @@ def detect_convo_room(content: str) -> str:
 # =============================================================================
 
 
-def scan_convos(convo_dir: str) -> list:
+def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
     """Find all potential conversation files.
 
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why an apparent conversation directory yielded no files.
+
+    By default, ``subagents/`` directories are skipped: Claude Code records
+    Explore/Plan/Grep subagent transcripts there, and on a typical workspace
+    they outweigh main session files ~80:1 (#1217). Pass
+    ``include_subagents=True`` to mine them anyway.
     """
     # A direct conversation file is a valid source. For a file, feed only
     # its basename through the existing directory validation loop.
@@ -429,7 +434,9 @@ def scan_convos(convo_dir: str) -> list:
     )
     files = []
     for root, dirs, filenames in scan_entries:
-        dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
+        dirs[:] = [
+            d for d in dirs if d not in CONVO_SKIP_DIRS and (include_subagents or d != "subagents")
+        ]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
@@ -739,12 +746,16 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    include_subagents: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+    include_subagents:
+        False (default) — skip Claude Code ``subagents/`` directories
+        True            — also mine subagent transcripts
 
     The real work is in :func:`_mine_convos_impl`; this wrapper holds the
     per-palace flock around it so two concurrent ``mempalace mine --mode
@@ -886,7 +897,7 @@ def _mine_convos_impl(
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
 
-    files = scan_convos(convo_dir)
+    files = scan_convos(convo_dir, include_subagents=include_subagents)
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")

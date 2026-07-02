@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 36 MCP tools.
+Detailed parameter schemas for all 42 MCP tools.
 
 ## Palace — Read Tools
 
@@ -111,7 +111,6 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 | `items` | array | **Yes** | Verbatim items to file. Each is `{ wing, room, content }` |
 | `diary` | object | No | Diary entry written after filing: `{ agent_name, entry, topic?, wing? }` (`entry` is AAAK-format) |
 | `dedup_threshold` | number | No | Similarity threshold 0–1 for the per-item dedup check (default 0.9) |
-| `added_by` | string | No | Who is filing these drawers. An explicit value takes precedence; otherwise the diary `agent_name`, else `checkpoint` |
 
 **Returns:** `{ added: [...], duplicates: [...], errors: [...], diary? }`
 
@@ -261,22 +260,6 @@ Mark a fact as no longer true.
 | `ended` | string | No | When it stopped being true (default: today) |
 
 **Returns:** `{ success, fact, ended }`
-
----
-
-### `mempalace_kg_supersede`
-
-Atomically replace a fact with its successor at a single shared boundary. Use when a single-valued fact changes (model, employer, address) instead of a separate `mempalace_kg_invalidate` + `mempalace_kg_add` — a point-in-time query at the boundary then returns only the new value.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `subject` | string | **Yes** | Entity whose fact is changing |
-| `predicate` | string | **Yes** | Relationship (e.g. `uses_model`, `works_at`) |
-| `old_object` | string | **Yes** | Value being replaced |
-| `new_object` | string | **Yes** | New value |
-| `at` | string | No | Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ; default: now UTC) |
-
-**Returns:** `{ success, triple_id, fact, superseded }`
 
 ---
 
@@ -480,3 +463,126 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 **Parameters:** None
 
 **Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
+
+---
+
+## Agent Coordination Tools (Logstream)
+
+Append-only coordination events and exact artifacts for multi-agent work — see the [Agent Logstream](/concepts/agent-logstream) concept page. Backed by `logstream.sqlite3` in the palace directory, independent of the vector index. In `--read-only` mode the mutating tools (`event_append`, `event_ack`, `artifact_put`, `patch_submit`) are hidden and refused.
+
+### `mempalace_event_append`
+
+Append an immutable coordination event.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `type` | string | **Yes** | Event type, e.g. `task.request`, `task.reply`, `patch.ready` |
+| `stream` | string | **Yes** | Logical stream, e.g. `project/myapp` or `shared_agent_brain` |
+| `room` | string | **Yes** | Sub-channel: `delegation`, `patches`, `reviews`, `status` |
+| `from_agent` | string | **Yes** | Writer agent identity |
+| `to_agent` | string | No | Target agent, or `*` for broadcast |
+| `correlation_id` | string | No | Task id tying request and reply events together |
+| `branch` | string | No | Git branch, when relevant |
+| `base_commit` | string | No | Git commit the work started from |
+| `status` | string | No | `open`, `claimed`, `ready`, `applied`, `blocked`, `failed`, `superseded` |
+| `body` | string | No | Verbatim content (max 256 KiB) |
+| `metadata` | object | No | Extra structured fields, stored verbatim |
+| `artifact_ids` | array | No | Ids of already-stored artifacts to reference |
+
+**Returns:** `{ success, event }` — the stored event including server-generated `id`, `seq`, and `created_at`.
+
+---
+
+### `mempalace_event_list`
+
+List events with structured filters, oldest first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `stream` | string | No | Filter by stream |
+| `room` | string | No | Filter by room |
+| `type` | string | No | Filter by event type |
+| `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
+| `from_agent` | string | No | Filter by writer |
+| `correlation_id` | string | No | Filter by correlation id |
+| `status` | string | No | Filter by status |
+| `since_event_id` | string | No | Only events strictly after this id (precise cursor) |
+| `since_created_at` | string | No | Only events at/after this time (inclusive) |
+| `limit` | integer | No | Max events (default 50, cap 500) |
+
+**Returns:** `{ events: [...], count }`
+
+---
+
+### `mempalace_event_wait`
+
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the same filters as `event_list` plus:
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `timeout_ms` | integer | No | Wait duration in ms (default 60000, clamped to 300000) |
+
+**Returns:** `{ timed_out, events: [...], count }` — timeout is a normal result, not an error.
+
+---
+
+### `mempalace_event_ack`
+
+Acknowledge an event: appends a new `event.ack` routed back to the original writer, with `correlation_id` copied from the target (falling back to the target's id). Never mutates the target event.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `event_id` | string | **Yes** | Event to acknowledge |
+| `from_agent` | string | **Yes** | Acknowledging agent identity |
+| `status` | string | No | e.g. `applied`, `failed` |
+| `body` | string | No | Verbatim ack notes |
+
+**Returns:** `{ success, event }` — the new ack event.
+
+---
+
+### `mempalace_artifact_put`
+
+Store exact artifact content for handoffs. UTF-8 text only, max 4 MiB.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `kind` | string | **Yes** | `patch`, `file`, `log`, `json`, `note` |
+| `content` | string | **Yes** | Exact content |
+| `created_by` | string | **Yes** | Writer agent identity |
+| `metadata` | object | No | Extra fields, e.g. branch/base_commit |
+
+**Returns:** `{ success, artifact: { id, kind, sha256, size_bytes, created_by, created_at } }`
+
+---
+
+### `mempalace_artifact_get`
+
+Fetch an artifact by id — exact content plus `sha256` for verification.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `artifact_id` | string | **Yes** | Artifact id |
+
+**Returns:** `{ artifact: { id, kind, sha256, size_bytes, content, created_by, created_at, metadata } }` (or `{ error }` if not found)
+
+---
+
+### `mempalace_patch_submit`
+
+Convenience: store a patch artifact and append its `patch.ready` event in one call.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `content` | string | **Yes** | Unified diff content |
+| `from_agent` | string | **Yes** | Submitting agent identity |
+| `stream` | string | **Yes** | Logical stream |
+| `room` | string | No | Sub-channel (default `patches`) |
+| `to_agent` | string | No | Target agent or `*` |
+| `correlation_id` | string | No | Task id tying the patch to its request |
+| `branch` | string | No | Git branch |
+| `base_commit` | string | No | Git commit the patch applies to |
+| `body` | string | No | Verbatim notes |
+| `metadata` | object | No | Extra structured fields |
+
+**Returns:** `{ success, artifact, event }`

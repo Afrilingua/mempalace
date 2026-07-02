@@ -108,30 +108,50 @@ CUDA-accelerated embeddings, build the GPU variant with
 
 ## Storage backends
 
-ChromaDB is the default and needs no configuration. MemPalace also ships a
-pluggable backend contract, exercised across deliberately different substrates
-so the contract is never accidentally shaped around one vendor. Every
-non-default backend is opt-in.
+ChromaDB is the default. For the pluggable-backend preview, MemPalace also
+ships `sqlite_exact` for local exact-vector correctness checks, and two opt-in
+external service backends — `qdrant` (REST) and `pgvector` (Postgres). The two
+external backends exercise the storage contract on different substrates (a
+REST/dict store and a SQL/JSONB store), so it is not accidentally shaped around
+one vendor.
 
-| Backend | Mode | Install | Namespaces | Lexical | Configure with |
-| ------- | ---- | ------- | :--------: | :-----: | -------------- |
-| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
-| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
-| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
-| `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
-| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
+```bash
+# local no-service backend
+mempalace mine ~/projects/myapp --backend sqlite_exact
 
-Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
-`"backend": "<name>"` in `config.json`. See
-[Storage backends](/guide/configuration#storage-backends) for connection
-variables, namespace behavior, and deployment notes.
+# Qdrant backend, defaulting to http://localhost:6333
+MEMPALACE_QDRANT_URL=http://localhost:6333 \
+  mempalace mine ~/projects/myapp --backend qdrant
+
+# Postgres + pgvector backend, defaulting to postgresql://localhost:5432/mempalace
+#   needs the optional driver: pip install mempalace[pgvector]
+#   and the `vector` extension available on the server
+MEMPALACE_PGVECTOR_DSN=postgresql://localhost:5432/mempalace \
+  mempalace mine ~/projects/myapp --backend pgvector
+```
+
+Qdrant can also be configured with `MEMPALACE_QDRANT_API_KEY`,
+`MEMPALACE_QDRANT_NAMESPACE`, and `MEMPALACE_QDRANT_TIMEOUT`; pgvector with
+`MEMPALACE_PGVECTOR_NAMESPACE`. Both external backends isolate tenants by
+namespace (advertised via the `supports_namespace_isolation` capability) and
+write a local marker (`qdrant_backend.json` / `pgvector_backend.json`) to guard
+against silently opening a palace against the wrong server.
+
+When `MEMPALACE_QDRANT_URL` or `MEMPALACE_PGVECTOR_DSN` points anywhere other
+than your own local or trusted self-hosted service, MemPalace will send and
+store verbatim drawer text and metadata there. That is an explicit opt-in
+backend choice, never the default.
 
 ## Quickstart
 
 ```bash
+# Optional: choose a shared local palace for multiple agents on one machine
+mempalace config set palace-path ~/.mempalace/palaces/shared-agent-brain
+
 # Mine content into the palace
 mempalace mine ~/projects/myapp                    # project files
 mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+mempalace mine ~/.local/share/opencode --mode convos # OpenCode sessions
 
 # Search
 mempalace search "why did we switch to GraphQL"
@@ -209,10 +229,24 @@ Usage and tool reference:
 
 ## MCP server
 
-36 MCP tools cover palace reads/writes, knowledge-graph operations,
-cross-wing navigation, drawer management, and agent diaries. Installation
+42 MCP tools cover palace reads/writes, knowledge-graph operations,
+cross-wing navigation, drawer management, agent diaries, and agent
+coordination (logstream events + artifact handoffs). Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
+
+For multiple agents writing to the same local palace, run one shared MCP
+HTTP server and connect every client to that endpoint:
+
+```bash
+mempalace serve --host 127.0.0.1 --port 8765
+```
+
+Launching separate stdio `mempalace-mcp` servers against one palace is
+safe for recall, but only the first writer can mutate; later servers run
+mutating tools read-only to avoid ChromaDB stale-state corruption. The
+`mempalace serve` command prints ready-to-paste client config for the
+shared-server shape.
 
 ## Agents
 
@@ -269,7 +303,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.7.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.5.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

@@ -1,9 +1,9 @@
 """Tests for the MemPalace ↔ Hermes integration provider.
 
-The provider lives outside the importable ``mempalace`` package (it sits in
-``mempalace/integrations/hermes/`` so it can be copied into
-``~/.hermes/plugins/`` at install time). These tests load it the same way:
-by file path.
+The provider ships inside the ``mempalace`` package (at
+``mempalace/integrations/hermes/``) but at runtime Hermes loads it from a
+copy in ``~/.hermes/plugins/`` via ``spec_from_file_location`` — not as a
+package import. These tests load it the same way: by file path.
 
 They also stub ``agent.memory_provider`` to mirror the runtime contract — the
 plugin is only ever imported with Hermes on the import path.
@@ -634,3 +634,71 @@ def test_env_vars_override_config_file(provider, tmp_dir, palace_path, monkeypat
         assert provider._config["wing"] == "wing_forced"
     finally:
         provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# PR #1915 review fixes: scan truncation boundary, None metadata, bad keywords.
+# ---------------------------------------------------------------------------
+
+
+class _FakeScanCollection:
+    """Serves ``n`` rows through the same get(limit=...) shape chroma uses."""
+
+    def __init__(self, n, metadatas=None):
+        self._n = n
+        self._metadatas = metadatas
+
+    def count(self):
+        return self._n
+
+    def get(self, **kwargs):
+        if self._metadatas is not None:
+            return {"metadatas": list(self._metadatas)}
+        limit = kwargs.get("limit") or self._n
+        return {"metadatas": [{"wing": "wing_a", "room": "r"} for _ in range(min(self._n, limit))]}
+
+
+def test_scan_metadatas_not_truncated_at_exactly_cap(provider):
+    cap = provider.STATUS_SCAN_LIMIT
+    metas, truncated = provider._scan_metadatas(_FakeScanCollection(cap))
+    assert len(metas) == cap
+    # Exactly cap rows means the view is complete — flagging it truncated
+    # makes the model qualify a breakdown that is in fact 100% coverage.
+    assert truncated is False
+
+
+def test_scan_metadatas_truncated_above_cap(provider):
+    cap = provider.STATUS_SCAN_LIMIT
+    metas, truncated = provider._scan_metadatas(_FakeScanCollection(cap + 1))
+    assert truncated is True
+    # Callers still get at most cap rows — the +1 probe row is trimmed.
+    assert len(metas) == cap
+
+
+def test_status_and_list_tools_tolerate_none_metadata_entries(provider):
+    # Legacy palaces / raw writers can leave None metadata entries; the
+    # breakdown loops must count them as "unknown", not fail the tool call.
+    rows = [None, {"wing": "wing_a", "room": "room_a"}]
+    provider._collection = _FakeScanCollection(2, metadatas=rows)
+
+    status = provider._tool_status()
+    assert "error" not in status
+    assert status["wings"] == {"unknown": 1, "wing_a": 1}
+
+    wings = provider._tool_list_wings()
+    assert "error" not in wings
+    assert wings["wings"] == {"unknown": 1, "wing_a": 1}
+
+    rooms = provider._tool_list_rooms("wing_a")
+    assert "error" not in rooms
+    assert rooms["rooms"] == {"unknown": 1, "room_a": 1}
+
+
+def test_match_wing_by_keywords_ignores_non_string_keywords(integration_module):
+    # A hand-edited wing_config.json with a number/null in a keyword list
+    # must not break wing routing — a raised AttributeError inside
+    # _file_turn's try/except silently drops every live turn.
+    fn = integration_module._match_wing_by_keywords
+    wing_config = {"wing_dev": {"keywords": [None, 3, "python"]}}
+    assert fn("write some python code", wing_config) == "wing_dev"
+    assert fn("unrelated chatter", wing_config) == "wing_general"

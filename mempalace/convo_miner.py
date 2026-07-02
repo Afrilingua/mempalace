@@ -82,14 +82,38 @@ def file_conversation_exchange(
     traversal, entity search, and since/before date filters see
     integration drawers exactly like mined ones.
 
+    ``wing`` and ``room`` are validated with the same ``sanitize_name``
+    rules the MCP write tools apply, but a failed name falls back
+    (``wing_general`` / ``conversations``) instead of erroring: this
+    path files *live* turns, and dropping a turn over a config typo
+    would break the verbatim / 100%-recall promise. The fallback is
+    logged at warning level so the misconfiguration is visible.
+
     ``extra_metadata`` lets callers append integration-specific fields
-    (e.g. ``source`` / ``session_id``) but cannot be used to *drop* the
-    canonical keys. Returns the drawer id, or None when ``text`` is
-    empty after stripping.
+    (e.g. ``source`` / ``session_id``); keys that collide with the
+    canonical fields are ignored, so it cannot be used to overwrite or
+    drop them. Returns the drawer id, or None when ``text`` is empty
+    after stripping.
     """
+    from .config import sanitize_name
+
     text = (text or "").strip()
     if not text:
         return None
+    try:
+        wing = sanitize_name(wing, "wing")
+    except ValueError:
+        logger.warning(
+            "file_conversation_exchange: invalid wing %r — filing under wing_general", wing
+        )
+        wing = "wing_general"
+    try:
+        room = sanitize_name(room, "room")
+    except ValueError:
+        logger.warning(
+            "file_conversation_exchange: invalid room %r — filing under conversations", room
+        )
+        room = "conversations"
     filed_at = datetime.now().isoformat()
     drawer_id = make_exchange_drawer_id(wing, room, source_file, filed_at, text)
     metadata = {
@@ -108,7 +132,8 @@ def file_conversation_exchange(
         "id_recipe": ID_RECIPE,
     }
     if extra_metadata:
-        metadata.update(extra_metadata)
+        for key, value in extra_metadata.items():
+            metadata.setdefault(key, value)
     collection.upsert(ids=[drawer_id], documents=[text], metadatas=[metadata])
     return drawer_id
 

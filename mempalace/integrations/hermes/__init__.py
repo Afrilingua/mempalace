@@ -78,10 +78,8 @@ def _match_wing_by_keywords(text: str, wing_config: Dict[str, Any]) -> str:
     Word boundaries matter — bare substring matching routes turns mentioning
     ``said`` into a wing whose keyword is ``ai``. Fall back to ``wing_general``.
 
-    Lives at module scope so ``backfill.py`` can use exactly the same matching
-    logic the live provider uses (it cannot import from this file as a
-    relative import — it's run by ``importlib.util.spec_from_file_location``).
-    The duplicate below in ``backfill.py`` must be kept in sync.
+    Lives at module scope so ``backfill.py`` can import and delegate to it —
+    one routing implementation shared by live and historical ingest.
     """
     if not wing_config:
         return "wing_general"
@@ -89,7 +87,10 @@ def _match_wing_by_keywords(text: str, wing_config: Dict[str, Any]) -> str:
     for wing_name, wing_def in wing_config.items():
         keywords = wing_def.get("keywords", []) if isinstance(wing_def, dict) else []
         for kw in keywords:
-            if not kw:
+            # The isinstance guard keeps a hand-edited wing_config.json
+            # (numbers / nulls in a keyword list) from raising inside
+            # _file_turn's try/except and silently dropping every turn.
+            if not kw or not isinstance(kw, str):
                 continue
             pattern = r"\b" + re.escape(kw.lower()) + r"\b"
             if re.search(pattern, text_lower):
@@ -1244,7 +1245,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         can surface that to the model.
         """
         cap = self.STATUS_SCAN_LIMIT
-        kwargs: Dict[str, Any] = {"include": ["metadatas"], "limit": cap}
+        # Fetch one row beyond the cap: it's the only way to tell "exactly
+        # cap rows, view is complete" from "more than cap rows, view is
+        # partial" — comparing against ``col.count()`` can't answer that
+        # for the ``where``-filtered calls (chroma's count() is unfiltered).
+        kwargs: Dict[str, Any] = {"include": ["metadatas"], "limit": cap + 1}
         if where:
             kwargs["where"] = where
         try:
@@ -1254,8 +1259,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             # ``get``; fall back to the full scan path.
             result = col.get(include=["metadatas"], **({"where": where} if where else {}))
         metas = result.get("metadatas") or []
-        truncated = len(metas) >= cap
-        return metas, truncated
+        truncated = len(metas) > cap
+        return metas[:cap], truncated
 
     def _tool_status(self) -> Dict[str, Any]:
         with self._collection_lock:
@@ -1266,7 +1271,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         metas, truncated = self._scan_metadatas(col)
         wings: Dict[str, int] = {}
         for m in metas:
-            w = m.get("wing", "unknown")
+            # Legacy palaces / raw writers can leave None metadata entries.
+            w = (m or {}).get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
         out: Dict[str, Any] = {
             "total_drawers": total,
@@ -1289,7 +1295,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         metas, truncated = self._scan_metadatas(col)
         wings: Dict[str, int] = {}
         for m in metas:
-            w = m.get("wing", "unknown")
+            w = (m or {}).get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
         out: Dict[str, Any] = {"wings": wings}
         if truncated:
@@ -1311,7 +1317,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         metas, truncated = self._scan_metadatas(col, where={"wing": wing})
         rooms: Dict[str, int] = {}
         for m in metas:
-            r = m.get("room", "unknown")
+            r = (m or {}).get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
         out: Dict[str, Any] = {"wing": wing, "rooms": rooms}
         if truncated:

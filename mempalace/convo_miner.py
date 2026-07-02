@@ -19,7 +19,12 @@ from collections import defaultdict
 from typing import Optional
 
 from .collision_scan import assert_no_collisions
-from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
+from .ids import (
+    ID_RECIPE,
+    make_convo_drawer_id,
+    make_convo_sentinel_id,
+    make_exchange_drawer_id,
+)
 from .normalize import normalize
 from .entities import entities_metadata
 from .palace import (
@@ -55,6 +60,57 @@ def _detect_hall_cached(content: str) -> str:
         if score > 0:
             scores[hall] = score
     return max(scores, key=scores.get) if scores else "general"
+
+
+def file_conversation_exchange(
+    collection,
+    *,
+    wing: str,
+    room: str,
+    text: str,
+    source_file: str,
+    agent: str,
+    authored_at: Optional[str] = None,
+    extra_metadata: Optional[dict] = None,
+) -> Optional[str]:
+    """File one verbatim conversation exchange as a single drawer.
+
+    Canonical write path for live agent integrations (e.g. Hermes) and
+    their backfills — both must route here so routing, normalization,
+    and metadata conventions stay identical between live and historical
+    ingest. Builds the same metadata the convo miner writes so hallway
+    traversal, entity search, and since/before date filters see
+    integration drawers exactly like mined ones.
+
+    ``extra_metadata`` lets callers append integration-specific fields
+    (e.g. ``source`` / ``session_id``) but cannot be used to *drop* the
+    canonical keys. Returns the drawer id, or None when ``text`` is
+    empty after stripping.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    filed_at = datetime.now().isoformat()
+    drawer_id = make_exchange_drawer_id(wing, room, source_file, filed_at, text)
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "hall": _detect_hall_cached(text),
+        "source_file": source_file,
+        "chunk_index": 0,
+        "added_by": agent,
+        "filed_at": filed_at,
+        "entities": entities_metadata(text),
+        "authored_at": authored_at if authored_at is not None else filed_at,
+        "ingest_mode": "convos",
+        "extract_mode": "exchange",
+        "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    collection.upsert(ids=[drawer_id], documents=[text], metadatas=[metadata])
+    return drawer_id
 
 
 # File types that might contain conversations

@@ -1462,6 +1462,7 @@ def cmd_replica(args):
                         args.peer,
                         args.token or "",
                         reconcile_deletes=not args.no_reconcile,
+                        pull_kg=not getattr(args, "no_kg", False),
                     )
                 ]
             else:
@@ -2814,6 +2815,11 @@ def main():
         "--no-reconcile",
         action="store_true",
         help="Skip deleting local copies whose upstream original is gone",
+    )
+    p_rep_pull.add_argument(
+        "--no-kg",
+        action="store_true",
+        help="Skip knowledge-graph rows (use when the peer replicates your own KG back)",
     )
     p_rep_pull.add_argument("--json", action="store_true", help="Machine-readable output")
 

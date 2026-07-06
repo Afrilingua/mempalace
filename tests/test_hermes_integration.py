@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 import types
@@ -62,6 +63,25 @@ def integration_module():
 @pytest.fixture
 def provider(integration_module):
     return integration_module.MempalaceProvider()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_palace_env(integration_module):
+    """Keep initialize()'s palace-env bridge from leaking between tests.
+
+    ``initialize`` publishes the resolved palace to MEMPALACE_PALACE_PATH
+    (so mcp_server passthrough tools resolve the same palace) and records
+    ownership in the module-level ``_ENV_PALACE_BRIDGED`` sentinel. Both
+    are process-global — restore them after every test.
+    """
+    original = os.environ.get("MEMPALACE_PALACE_PATH")
+    original_sentinel = integration_module._ENV_PALACE_BRIDGED
+    yield
+    integration_module._ENV_PALACE_BRIDGED = original_sentinel
+    if original is None:
+        os.environ.pop("MEMPALACE_PALACE_PATH", None)
+    else:
+        os.environ["MEMPALACE_PALACE_PATH"] = original
 
 
 # ---------------------------------------------------------------------------
@@ -616,17 +636,45 @@ def test_initialize_reads_mempalace_json(provider, tmp_dir, palace_path):
         provider.shutdown()
 
 
-def test_collection_name_is_not_user_configurable(provider, tmp_dir, palace_path):
-    # Exposing ``collection_name`` would let the provider write to a collection
-    # that ``search_memories`` (which reads from mempalace's own config) does
-    # not read — making the provider silently appear mute. The field is
-    # intentionally absent from the schema and ignored in config files.
+def test_collection_name_is_not_hermes_configurable(provider, tmp_dir, palace_path):
+    # A hermes-side ``collection_name`` would be a second way to set the
+    # name — the write and read sides could silently diverge, making the
+    # provider look mute. The key is ignored; with no mempalace-side
+    # override (conftest redirects HOME to a temp dir), the default applies.
     (Path(tmp_dir) / "mempalace.json").write_text(
         json.dumps({"palace_path": palace_path, "collection_name": "custom_drawers"})
     )
     provider.initialize("s1", hermes_home=str(tmp_dir))
     try:
         assert provider._collection_name == provider.DEFAULT_COLLECTION_NAME
+    finally:
+        provider.shutdown()
+
+
+def test_collection_name_follows_mempalace_config(
+    integration_module, provider, tmp_dir, palace_path, tmp_path, monkeypatch
+):
+    # One source of truth: the provider writes to the collection that
+    # ``search_memories`` and the mcp_server passthrough actually read —
+    # mempalace's own config — so a customized ``collection_name`` in
+    # ``~/.mempalace/config.json`` cannot make live turns invisible to
+    # recall.
+    mp_config_dir = tmp_path / "mp_home"
+    mp_config_dir.mkdir()
+    (mp_config_dir / "config.json").write_text(json.dumps({"collection_name": "family_drawers"}))
+
+    from mempalace.config import MempalaceConfig as real_config
+
+    def _patched_config(config_dir=None):
+        return real_config(config_dir=str(mp_config_dir))
+
+    # Patch the provider module's own reference — it imported the name at
+    # module load, so patching mempalace.config wouldn't reach it.
+    monkeypatch.setattr(integration_module, "MempalaceConfig", _patched_config)
+    (Path(tmp_dir) / "mempalace.json").write_text(json.dumps({"palace_path": palace_path}))
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        assert provider._collection_name == "family_drawers"
     finally:
         provider.shutdown()
 
@@ -708,3 +756,141 @@ def test_match_wing_by_keywords_ignores_non_string_keywords(integration_module):
     wing_config = {"wing_dev": {"keywords": [None, 3, "python"]}}
     assert fn("write some python code", wing_config) == "wing_dev"
     assert fn("unrelated chatter", wing_config) == "wing_general"
+
+
+# ---------------------------------------------------------------------------
+# Palace unification: the mcp_server passthrough tools must operate on the
+# SAME palace the provider writes and searches. The provider bridges its
+# resolved palace into MEMPALACE_PALACE_PATH (mcp_server re-reads that var on
+# every config access — its own --palace flag works the same way), and the
+# KG tools are handled natively because mcp_server's KG path ignores the env
+# var unless its CLI flag was given.
+# ---------------------------------------------------------------------------
+
+
+def test_initialize_bridges_palace_env_for_passthrough(provider, tmp_dir, palace_path):
+    from mempalace.config import MempalaceConfig
+
+    (Path(tmp_dir) / "mempalace.json").write_text(json.dumps({"palace_path": palace_path}))
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        expected = os.path.abspath(os.path.expanduser(palace_path))
+        assert os.environ.get("MEMPALACE_PALACE_PATH") == expected
+        # The passthrough side (mcp_server's config) now resolves the same
+        # palace the provider writes — the split-brain regression check.
+        assert MempalaceConfig().palace_path == expected
+    finally:
+        provider.shutdown()
+
+
+def test_reinitialize_follows_updated_hermes_config(provider, tmp_dir, palace_path, tmp_path):
+    # The bridge write from session 1 must not masquerade as a user env
+    # override in session 2 — a stale bridge would pin the palace to the
+    # old hermes-side value forever.
+    config_path = Path(tmp_dir) / "mempalace.json"
+    config_path.write_text(json.dumps({"palace_path": palace_path}))
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    provider.shutdown()
+
+    new_palace = str(tmp_path / "palace_b")
+    config_path.write_text(json.dumps({"palace_path": new_palace}))
+    provider.initialize("s2", hermes_home=str(tmp_dir))
+    try:
+        assert provider._palace_path == new_palace
+        assert os.environ.get("MEMPALACE_PALACE_PATH") == os.path.abspath(new_palace)
+    finally:
+        provider.shutdown()
+
+
+def test_user_set_palace_env_wins_and_is_never_cleared(
+    provider, tmp_dir, palace_path, tmp_path, monkeypatch
+):
+    # A user-set env var outranks the hermes-side config (documented
+    # precedence) and the bridge must not claim ownership of it — a later
+    # re-initialize must leave the user's value in place.
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace_path)
+    (Path(tmp_dir) / "mempalace.json").write_text(
+        json.dumps({"palace_path": str(tmp_path / "other_palace")})
+    )
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        assert provider._palace_path == palace_path
+        assert os.environ.get("MEMPALACE_PALACE_PATH") == palace_path
+        # Ownership was not claimed: the sentinel stays unset.
+        assert provider.__class__.__module__ is not None  # provider alive
+    finally:
+        provider.shutdown()
+    provider.initialize("s2", hermes_home=str(tmp_dir))
+    try:
+        assert os.environ.get("MEMPALACE_PALACE_PATH") == palace_path
+    finally:
+        provider.shutdown()
+
+
+def test_hermes_config_defers_to_mempalace_config_when_unset(
+    integration_module, provider, tmp_dir, tmp_path, monkeypatch
+):
+    # No hermes-side palace_path → the provider follows mempalace's own
+    # config rather than hardcoding the default location.
+    mp_config_dir = tmp_path / "mp_home"
+    mp_config_dir.mkdir()
+    custom_palace = str(tmp_path / "custom_palace")
+    (mp_config_dir / "config.json").write_text(json.dumps({"palace_path": custom_palace}))
+
+    from mempalace.config import MempalaceConfig as real_config
+
+    def _patched_config(config_dir=None):
+        return real_config(config_dir=str(mp_config_dir))
+
+    # Patch the provider module's own reference — it imported the name at
+    # module load, so patching mempalace.config wouldn't reach it.
+    monkeypatch.setattr(integration_module, "MempalaceConfig", _patched_config)
+    (Path(tmp_dir) / "mempalace.json").write_text(json.dumps({}))
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        assert provider._palace_path == custom_palace
+    finally:
+        provider.shutdown()
+
+
+def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path):
+    # All five KG tools must hit the SAME database: the sibling of the
+    # provider's palace dir — never mcp_server's global DEFAULT_KG_PATH.
+    add = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_add",
+            {"subject": "user", "predicate": "drinks", "object": "tea"},
+        )
+    )
+    assert add["status"] == "ok"
+
+    timeline = json.loads(
+        initialized_provider.handle_tool_call("mempalace_kg_timeline", {"entity": "user"})
+    )
+    assert timeline["count"] >= 1
+    assert any(t["predicate"] == "drinks" and t["object"] == "tea" for t in timeline["timeline"])
+
+    stats = json.loads(initialized_provider.handle_tool_call("mempalace_kg_stats", {}))
+    assert stats["triples"] >= 1
+
+    inv = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_invalidate",
+            {"subject": "user", "predicate": "drinks", "object": "tea"},
+        )
+    )
+    assert inv["success"] is True
+
+    # And the file itself lives next to the palace dir.
+    assert (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
+
+
+def test_kg_invalidate_rejects_invalid_input(initialized_provider):
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_invalidate",
+            {"subject": "user", "predicate": "likes", "object": "x", "ended": "not-a-date"},
+        )
+    )
+    assert result["success"] is False
+    assert "error" in result

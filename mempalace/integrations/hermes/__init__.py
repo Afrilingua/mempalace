@@ -31,17 +31,31 @@ Design notes
 * Configuration precedence: ``$HERMES_HOME/mempalace.json`` is read
   first, then env vars override (``MEMPALACE_PALACE_PATH``,
   ``MEMPALACE_IDENTITY_PATH``, ``MEMPALACE_WING``). An empty env var
-  is ignored — ``export MEMPALACE_WING=`` is intent to unset. Defaults
-  fill in anything still missing. ``collection_name`` is intentionally
-  not user-configurable here: the provider writes through
-  ``self._collection_name`` while ``search_memories`` (used by
-  ``prefetch`` and ``_tool_search``) reads its own configured collection
-  name from ``~/.mempalace/config.json``, and exposing two ways to set
-  it would let the two diverge silently.
+  is ignored — ``export MEMPALACE_WING=`` is intent to unset. A palace
+  still unset after that defers to mempalace's own config
+  (``~/.mempalace/config.json``) before falling back to the default
+  location. The resolved palace is then published to
+  ``MEMPALACE_PALACE_PATH`` (see ``_bridge_palace_env``) so the
+  ``mempalace.mcp_server`` passthrough tools operate on the same palace
+  as live filing and search — never a config-file-vs-provider split.
+  ``collection_name`` follows mempalace's own config for the same
+  reason: it is what ``search_memories`` (used by ``prefetch`` and
+  ``_tool_search``) and the mcp_server passthrough read, so live writes
+  land in the collection recall actually searches. It is intentionally
+  not configurable on the Hermes side — a second knob would let the
+  write and read sides diverge silently again.
 
 * ``~/.mempalace/identity.txt`` (L0) and ``~/.mempalace/wing_config.json``
   are loaded if present but never created here. Run
   ``mempalace init <project-dir>`` to generate them.
+
+* All palace state (ChromaDB, knowledge graph, diary, identity) lives
+  under ``~/.mempalace/`` by design — the palace is the user's central
+  memory shared across agents, not per-agent Hermes state. This means
+  ``hermes backup`` (which archives only ``$HERMES_HOME``) does NOT
+  cover it; users must back up ``~/.mempalace/`` separately. Hermes'
+  ``MemoryProvider`` ABC currently offers no hook for contributing
+  external paths to its backup.
 """
 
 from __future__ import annotations
@@ -53,11 +67,17 @@ import queue
 import re
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mempalace.backends.chroma import ChromaBackend
+from mempalace.config import (
+    MempalaceConfig,
+    sanitize_iso_temporal,
+    sanitize_kg_value,
+    sanitize_name,
+)
 from mempalace.convo_miner import file_conversation_exchange
 from mempalace.knowledge_graph import KnowledgeGraph
 from mempalace.layers import MemoryStack
@@ -77,6 +97,47 @@ except ImportError:  # pragma: no cover - Hermes not installed
 
 
 logger = logging.getLogger("mempalace.hermes")
+
+
+# The palace path this provider last bridged into ``MEMPALACE_PALACE_PATH``
+# (None when the variable is user-set or unset). ``initialize`` must be able
+# to tell its own bridge write apart from user intent: a stale bridge from a
+# previous session would otherwise override a freshly edited hermes-side
+# config forever, because both this provider's ``_load_config`` and
+# ``MempalaceConfig`` give the env var top precedence.
+_ENV_PALACE_BRIDGED: Optional[str] = None
+
+
+def _clear_stale_palace_bridge() -> None:
+    """Drop our own previous bridge write so config re-resolution is fresh.
+
+    Only removes the env var when it still holds exactly the value we set —
+    a user-set value (even one set after our bridge) never matches the
+    recorded sentinel and is left untouched.
+    """
+    global _ENV_PALACE_BRIDGED
+    if _ENV_PALACE_BRIDGED and os.environ.get("MEMPALACE_PALACE_PATH") == _ENV_PALACE_BRIDGED:
+        del os.environ["MEMPALACE_PALACE_PATH"]
+    _ENV_PALACE_BRIDGED = None
+
+
+def _bridge_palace_env(palace_path: str) -> None:
+    """Publish the provider's resolved palace to ``MEMPALACE_PALACE_PATH``.
+
+    ``mempalace.mcp_server`` resolves its palace from this variable on every
+    config access (its ``--palace`` flag works by setting exactly this
+    variable), so bridging it makes the passthrough tools operate on the
+    same palace the provider writes and searches. When the variable already
+    points at the same palace (user-set), ownership is NOT claimed, so a
+    later ``_clear_stale_palace_bridge`` leaves the user's value alone.
+    """
+    global _ENV_PALACE_BRIDGED
+    bridged = os.path.abspath(os.path.expanduser(palace_path))
+    current = os.environ.get("MEMPALACE_PALACE_PATH")
+    if current and os.path.abspath(os.path.expanduser(current)) == bridged:
+        return
+    os.environ["MEMPALACE_PALACE_PATH"] = bridged
+    _ENV_PALACE_BRIDGED = bridged
 
 
 def _match_wing_by_keywords(text: str, wing_config: Dict[str, Any]) -> str:
@@ -563,17 +624,29 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._session_id = session_id or ""
             self._hermes_home = str(kwargs.get("hermes_home", "") or "")
 
+            # A bridge write from a previous initialize must not masquerade
+            # as a user-set env override during re-resolution.
+            _clear_stale_palace_bridge()
             self._config = self._load_config()
-            self._palace_path = str(
-                Path(self._config.get("palace_path", self.DEFAULT_PALACE_PATH)).expanduser()
-            )
-            # Collection name is intentionally **not** configurable. ``_file_turn``
-            # writes through ``self._collection``; ``prefetch`` / ``_tool_search``
-            # go through ``search_memories``, which reads its own configured
-            # collection name from ``~/.mempalace/config.json``. Exposing two
-            # ways to set the name invites write-here, read-there mismatches
-            # that silently make the provider look mute.
-            self._collection_name = self.DEFAULT_COLLECTION_NAME
+            # No hermes-side palace configured → defer to mempalace's own
+            # config (env var > ~/.mempalace/config.json > default) so this
+            # provider agrees with `mempalace init`-managed setups instead
+            # of hardcoding the default location.
+            mempalace_config = MempalaceConfig()
+            configured = self._config.get("palace_path") or mempalace_config.palace_path
+            self._palace_path = str(Path(configured).expanduser())
+            # Publish the resolved palace so the mcp_server passthrough
+            # tools (drawer CRUD, duplicate check, tunnels, taxonomy)
+            # read and write the SAME palace live filing and search use.
+            _bridge_palace_env(self._palace_path)
+            # Collection name follows mempalace's own config — the same
+            # source ``search_memories`` (prefetch / _tool_search) and the
+            # mcp_server passthrough read — so live writes land in the
+            # collection recall actually searches. Intentionally NOT
+            # configurable on the Hermes side: a second knob would let the
+            # write and read sides diverge silently, making the provider
+            # look mute.
+            self._collection_name = mempalace_config.collection_name
 
             self._load_wing_config()
             self._load_identity()
@@ -841,18 +914,33 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                         obj=args.get("object", ""),
                     )
                 )
+            if tool_name == "mempalace_kg_invalidate":
+                return json.dumps(
+                    self._tool_kg_invalidate(
+                        subject=args.get("subject", ""),
+                        predicate=args.get("predicate", ""),
+                        obj=args.get("object", ""),
+                        ended=args.get("ended"),
+                    )
+                )
+            if tool_name == "mempalace_kg_timeline":
+                return json.dumps(self._tool_kg_timeline(args.get("entity")))
+            if tool_name == "mempalace_kg_stats":
+                return json.dumps(self._tool_kg_stats())
             if tool_name == "mempalace_diary_write":
                 return json.dumps(self._tool_diary_write(args.get("entry", "")))
             if tool_name == "mempalace_diary_read":
                 return json.dumps(self._tool_diary_read(int(args.get("n", 10))))
 
             # Tools that delegate directly to ``mempalace.mcp_server``'s
-            # public ``tool_*`` entry points. These share mempalace's own
-            # config for palace_path resolution rather than this plugin's
-            # ``self._palace_path`` — a known asymmetry that the original
-            # eight tools above don't share. In the common case (default
-            # palace at ``~/.mempalace/palace``) both resolve to the same
-            # place.
+            # public ``tool_*`` entry points. mcp_server resolves its palace
+            # from ``MEMPALACE_PALACE_PATH`` on every config access, and
+            # ``initialize`` bridges this provider's resolved palace into
+            # that variable (see ``_bridge_palace_env``) — so passthrough
+            # reads and writes land in the same palace as live filing and
+            # search. KG tools are NOT passed through: mcp_server resolves
+            # its KG from ``DEFAULT_KG_PATH`` unless its own ``--palace``
+            # CLI flag was given, which no env bridge can influence.
             # New tools (everything that has a matching ``tool_*`` in
             # mempalace.mcp_server) dispatch by name derivation. One
             # mempalace asymmetry to remap: ``mempalace_traverse`` maps to
@@ -887,9 +975,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             "mempalace_list_drawers",
             "mempalace_get_drawer",
             "mempalace_check_duplicate",
-            "mempalace_kg_invalidate",
-            "mempalace_kg_timeline",
-            "mempalace_kg_stats",
             "mempalace_get_taxonomy",
             "mempalace_get_aaak_spec",
             "mempalace_traverse",
@@ -966,6 +1051,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         print("MemPalace provider installed. To finish setup:")
         print("  1. mempalace init <your-project-dir>     # generates ~/.mempalace/")
         print("  2. (optional) edit ~/.mempalace/identity.txt to seed L0 wake-up context")
+        print()
+        print("Note: palace data lives under ~/.mempalace/, outside $HERMES_HOME.")
+        print("`hermes backup` does not include it — back up ~/.mempalace/ separately.")
         print()
 
     # ----- Shutdown --------------------------------------------------------
@@ -1082,10 +1170,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             logger.debug("MemPalace _file_turn error: %s", exc)
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
-        db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
         kg: Optional[KnowledgeGraph] = None
         try:
-            kg = KnowledgeGraph(db_path=db_path)
+            kg = KnowledgeGraph(db_path=self._kg_db_path())
             kg.add_triple(
                 subject="user",
                 predicate="asserted",
@@ -1242,11 +1329,19 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             # via the truncated/scanned pair.
         return out
 
+    def _kg_db_path(self) -> str:
+        """The provider's knowledge-graph DB — sibling of the palace dir.
+
+        Single source of truth for every KG access in this plugin; the KG
+        tools must never fall back to mempalace's global ``DEFAULT_KG_PATH``
+        or they would read a different graph than the one live turns feed.
+        """
+        return str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
+
     def _tool_kg_query(self, entity: str, since: Optional[str] = None) -> Dict[str, Any]:
         if not entity:
             return {"error": "Missing required parameter: entity"}
-        db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
-        kg = KnowledgeGraph(db_path=db_path)
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
             relations = kg.query_entity(entity, as_of=since or "")
         finally:
@@ -1259,8 +1354,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     def _tool_kg_add(self, subject: str, predicate: str, obj: str) -> Dict[str, Any]:
         if not (subject and predicate and obj):
             return {"error": "subject, predicate, object are all required"}
-        db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
-        kg = KnowledgeGraph(db_path=db_path)
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
             kg.add_triple(subject=subject, predicate=predicate, obj=obj)
         finally:
@@ -1269,6 +1363,63 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             except Exception:
                 pass
         return {"status": "ok", "triple": [subject, predicate, obj]}
+
+    def _tool_kg_invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        ended: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        # Same validation semantics as mcp_server.tool_kg_invalidate, but
+        # against the provider's own KG (see _kg_db_path).
+        try:
+            subject = sanitize_kg_value(subject, "subject")
+            predicate = sanitize_name(predicate, "predicate")
+            obj = sanitize_kg_value(obj, "object")
+            ended = sanitize_iso_temporal(ended, "ended")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        resolved_ended = ended or date.today().isoformat()
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        try:
+            kg.invalidate(subject, predicate, obj, ended=resolved_ended)
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
+        return {
+            "success": True,
+            "fact": f"{subject} → {predicate} → {obj}",
+            "ended": resolved_ended,
+        }
+
+    def _tool_kg_timeline(self, entity: Optional[str] = None) -> Dict[str, Any]:
+        if entity is not None:
+            try:
+                entity = sanitize_kg_value(entity, "entity")
+            except ValueError as exc:
+                return {"error": str(exc)}
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        try:
+            results = kg.timeline(entity) if entity else kg.timeline()
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
+        return {"entity": entity or "all", "timeline": results, "count": len(results)}
+
+    def _tool_kg_stats(self) -> Dict[str, Any]:
+        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        try:
+            return kg.stats()
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
 
     def _tool_diary_write(self, entry: str) -> Dict[str, Any]:
         if not entry:

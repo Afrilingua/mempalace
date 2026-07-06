@@ -17,6 +17,13 @@ Design notes
 * Per-turn writes go through a bounded background queue. The agent loop
   never blocks on ChromaDB or SQLite.
 
+* ``sync_turn`` is the **sole** filing path. ``on_session_end`` and
+  ``on_pre_compress`` intentionally file nothing: re-filing the raw
+  message list duplicates every turn ``sync_turn`` already stored —
+  ``filed_at`` is hashed into the drawer id, so upserts cannot collapse
+  the copies. Any future safety net here must first scan what is
+  already filed and add only what is missing.
+
 * The provider is **inactive** under ``agent_context in {"cron", "flush"}``
   or ``platform == "cron"``. Cron-context turns are system-generated and
   would otherwise corrupt the user's representation.
@@ -716,23 +723,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._turn_count = turn_number
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # Skip when the provider never came up — enqueueing to a queue whose
-        # worker never started would silently fill the bounded buffer with
-        # tasks that can never drain.
         if self._cron_skipped or not self._initialized:
             return
-        try:
-            self._worker_queue.put_nowait(
-                (
-                    "session_end",
-                    {"messages": list(messages or []), "session_id": self._session_id},
-                )
-            )
-        except queue.Full:
-            logger.warning(
-                "MemPalace queue full at session_end — %d messages will not be filed",
-                len(messages or []),
-            )
+        # Intentionally no filing here. ``sync_turn`` has already filed every
+        # completed turn, and re-filing the message list mints duplicate
+        # drawers: ``filed_at`` is part of the drawer-id hash, so the upsert
+        # cannot collapse the re-file into the original.
         # Regenerate the AAAK wake-up cache for the next session.
         threading.Thread(
             target=self._refresh_wake_up_cache,
@@ -756,33 +752,14 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._turn_count = 0
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """File the messages about to be discarded and signal verbatim persistence.
+        """Intentionally a no-op that returns no hint.
 
-        The hint is **only** returned when the worker can actually persist the
-        payload — if the backend never came up or the queue is saturated, we
-        say nothing so the summarizer falls back to its default conservative
-        discarding rather than acting on a false promise.
+        Blind-filing the compression window duplicates every turn
+        ``sync_turn`` already filed. Returning ``""`` keeps the
+        summarizer on its default conservative discarding — a hint must
+        never promise persistence this provider hasn't performed.
         """
-        if self._cron_skipped or not self._initialized:
-            return ""
-        try:
-            self._worker_queue.put_nowait(
-                (
-                    "pre_compress",
-                    {"messages": list(messages or []), "session_id": self._session_id},
-                )
-            )
-        except queue.Full:
-            logger.warning(
-                "MemPalace queue full at pre_compress — %d messages will not be filed",
-                len(messages or []),
-            )
-            return ""
-        return (
-            "MemPalace has filed every message in this window verbatim. "
-            "Compressed content remains searchable via the `mempalace_search` "
-            "tool — the summarizer can be aggressive about discarding raw turns."
-        )
+        return ""
 
     def on_memory_write(
         self,
@@ -1104,32 +1081,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         except Exception as exc:
             logger.debug("MemPalace _file_turn error: %s", exc)
 
-    def _mine_session(self, payload: Dict[str, Any]) -> None:
-        messages = payload.get("messages", []) or []
-        session_id = payload.get("session_id", "") or ""
-        try:
-            for idx, msg in enumerate(messages):
-                if msg.get("role") != "user":
-                    continue
-                # Same content normalization ``sync_turn`` and ``pre_compress``
-                # use — list-shaped Anthropic content must not be persisted as
-                # its ``repr``.
-                content = _normalize_content(msg.get("content"))
-                if not content:
-                    continue
-                assistant_content = ""
-                if idx + 1 < len(messages) and messages[idx + 1].get("role") == "assistant":
-                    assistant_content = _normalize_content(messages[idx + 1].get("content"))
-                self._file_turn(
-                    {
-                        "user": content,
-                        "assistant": assistant_content,
-                        "session_id": session_id,
-                    }
-                )
-        except Exception as exc:
-            logger.debug("MemPalace _mine_session error: %s", exc)
-
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
         db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
         kg: Optional[KnowledgeGraph] = None
@@ -1163,44 +1114,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             try:
                 if task == "file_turn":
                     self._file_turn(payload)
-                elif task == "session_end":
-                    self._mine_session(payload)
-                elif task == "pre_compress":
-                    # Pair adjacent (user, assistant) messages into turns and
-                    # file each pair. Filing only role==user would silently
-                    # drop assistant content the ``on_pre_compress`` hint
-                    # promised the summarizer was searchable.
-                    msgs = payload.get("messages", []) or []
-                    session_id = payload.get("session_id", "") or ""
-                    i = 0
-                    while i < len(msgs):
-                        msg = msgs[i]
-                        if msg.get("role") != "user":
-                            # Lone non-user message (orphan tool result, etc.)
-                            # — file under user= empty so we don't lose it.
-                            self._file_turn(
-                                {
-                                    "user": "",
-                                    "assistant": _normalize_content(msg.get("content")),
-                                    "session_id": session_id,
-                                }
-                            )
-                            i += 1
-                            continue
-                        user_content = _normalize_content(msg.get("content"))
-                        assistant_content = ""
-                        if i + 1 < len(msgs) and msgs[i + 1].get("role") == "assistant":
-                            assistant_content = _normalize_content(msgs[i + 1].get("content"))
-                            i += 2
-                        else:
-                            i += 1
-                        self._file_turn(
-                            {
-                                "user": user_content,
-                                "assistant": assistant_content,
-                                "session_id": session_id,
-                            }
-                        )
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:

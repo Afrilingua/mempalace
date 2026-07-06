@@ -264,21 +264,27 @@ def test_on_turn_start_tracks_turn_number(provider):
 
 
 # ---------------------------------------------------------------------------
-# on_pre_compress: contract is (a) file the discarded messages, (b) return a
-# string to inject into the compression summary prompt.
+# on_session_end / on_pre_compress: sync_turn is the sole filing path — these
+# hooks must neither enqueue filing work nor promise persistence. Re-filing
+# the raw message list mints duplicate drawers (filed_at is hashed into the
+# drawer id, so upserts cannot collapse the copies).
 # ---------------------------------------------------------------------------
 
 
-def test_on_pre_compress_returns_string_hint_only_when_ready(provider):
-    # Before initialize: no hint (provider can't actually persist anything).
+def test_on_pre_compress_returns_no_hint_and_files_nothing(provider):
     provider._cron_skipped = False
-    assert provider.on_pre_compress([{"role": "user", "content": "hi"}]) == ""
-
-    # Simulate post-initialize ready state. We don't need a real backend for
-    # this assertion — just the readiness flag the hint gates on.
     provider._initialized = True
-    hint = provider.on_pre_compress([{"role": "user", "content": "hi"}])
-    assert isinstance(hint, str) and "mempalace_search" in hint
+    pre = provider._worker_queue.qsize()
+    assert provider.on_pre_compress([{"role": "user", "content": "hi"}]) == ""
+    assert provider._worker_queue.qsize() == pre
+
+
+def test_on_session_end_files_nothing_when_initialized(provider):
+    provider._cron_skipped = False
+    provider._initialized = True
+    pre = provider._worker_queue.qsize()
+    provider.on_session_end([{"role": "user", "content": "hi"}])
+    assert provider._worker_queue.qsize() == pre
 
 
 def test_on_pre_compress_under_cron_returns_empty_string(provider, tmp_path):

@@ -894,3 +894,41 @@ def test_kg_invalidate_rejects_invalid_input(initialized_provider):
     )
     assert result["success"] is False
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# on_memory_write: Hermes' memory tool defaults to target="memory" (the
+# agent's own notes); only target="user" carries facts about the user. Both
+# must mirror into the knowledge graph, under distinct subjects.
+# ---------------------------------------------------------------------------
+
+
+def test_on_memory_write_mirrors_both_targets(initialized_provider, palace_path):
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    initialized_provider.on_memory_write("add", "user", "lives in Boston")
+    initialized_provider.on_memory_write("add", "memory", "repo uses uv for deps")
+    initialized_provider._worker_queue.join()
+
+    kg = KnowledgeGraph(db_path=str(Path(palace_path).parent / "knowledge_graph.sqlite3"))
+    try:
+        user_relations = kg.query_entity("user")
+        agent_relations = kg.query_entity("hermes")
+    finally:
+        kg.close()
+    assert any(
+        r.get("predicate") == "asserted" and r.get("object") == "lives in Boston"
+        for r in user_relations
+    )
+    assert any(
+        r.get("predicate") == "noted" and r.get("object") == "repo uses uv for deps"
+        for r in agent_relations
+    )
+
+
+def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
+    pre = initialized_provider._worker_queue.qsize()
+    initialized_provider.on_memory_write("add", "bogus", "x")
+    initialized_provider.on_memory_write("replace", "memory", "x")
+    initialized_provider.on_memory_write("remove", "user", "x")
+    assert initialized_provider._worker_queue.qsize() == pre

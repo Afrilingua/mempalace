@@ -841,11 +841,17 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # Hermes' memory tool has two targets: "user" (who the user is) and
+        # "memory" (the agent's own notes — environment facts, conventions,
+        # lessons). "memory" is the tool's DEFAULT when the model omits the
+        # field, so filtering to target == "user" would silently drop the
+        # majority of writes. Both mirror into the knowledge graph, under
+        # distinct subjects (see _mirror_mem_write).
         if (
             self._cron_skipped
             or not self._initialized  # worker isn't running; queueing leaks
             or action != "add"
-            or target != "user"
+            or target not in ("user", "memory")
             or not content
         ):
             return
@@ -853,7 +859,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._worker_queue.put_nowait(
                 (
                     "mem_write",
-                    {"content": content, "metadata": dict(metadata or {})},
+                    {
+                        "content": content,
+                        "target": target,
+                        "metadata": dict(metadata or {}),
+                    },
                 )
             )
         except queue.Full:
@@ -1170,12 +1180,20 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             logger.debug("MemPalace _file_turn error: %s", exc)
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
+        # target "user" carries facts about the user; target "memory" carries
+        # the agent's own notes. Distinct subjects keep the graph honest about
+        # WHO the fact describes — `kg_query("user")` must not surface tool
+        # quirks the agent noted about its environment.
+        if payload.get("target") == "memory":
+            subject, predicate = "hermes", "noted"
+        else:
+            subject, predicate = "user", "asserted"
         kg: Optional[KnowledgeGraph] = None
         try:
             kg = KnowledgeGraph(db_path=self._kg_db_path())
             kg.add_triple(
-                subject="user",
-                predicate="asserted",
+                subject=subject,
+                predicate=predicate,
                 obj=payload.get("content", ""),
             )
         except Exception as exc:

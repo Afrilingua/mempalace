@@ -273,6 +273,64 @@ def _metric_for_collection(col) -> str:
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
+def _vector_distance(
+    query_vector: list[float], candidate_vector: list[float], metric: str
+) -> float:
+    """Return a backend-style distance between two already-normalized vectors."""
+    if not query_vector or not candidate_vector or len(query_vector) != len(candidate_vector):
+        raise ValueError("embedding dimensions do not match")
+
+    if metric == "l2":
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector)))
+
+    dot = sum(a * b for a, b in zip(query_vector, candidate_vector))
+    if metric == "ip":
+        return -dot
+
+    q_norm = math.sqrt(sum(a * a for a in query_vector))
+    c_norm = math.sqrt(sum(b * b for b in candidate_vector))
+    if q_norm == 0.0 or c_norm == 0.0:
+        raise ValueError("zero-norm embedding")
+    return 1.0 - (dot / (q_norm * c_norm))
+
+
+def _lexical_hit_vector_distances(drawers_col, query: str, lexical_hits: list, metric: str) -> dict:
+    """Compute vector distances for lexical hits when stored embeddings are available."""
+    ids = [hit.id for hit in lexical_hits if getattr(hit, "id", None)]
+    if not ids:
+        return {}
+
+    try:
+        from .backends.embedding_wrapper import _embed_texts
+
+        query_vector = _embed_texts([query])[0]
+        stored = drawers_col.get(ids=ids, include=["embeddings"])
+    except Exception:
+        logger.debug(
+            "candidate_strategy=union: failed to load lexical hit embeddings", exc_info=True
+        )
+        return {}
+
+    stored_ids = getattr(stored, "ids", None) if not isinstance(stored, dict) else stored.get("ids")
+    embeddings = (
+        getattr(stored, "embeddings", None)
+        if not isinstance(stored, dict)
+        else stored.get("embeddings")
+    )
+    if not stored_ids or not embeddings:
+        return {}
+
+    distances = {}
+    for doc_id, candidate_vector in zip(stored_ids, embeddings):
+        try:
+            distances[doc_id] = _vector_distance(query_vector, candidate_vector, metric)
+        except Exception:
+            logger.debug(
+                "candidate_strategy=union: failed to score lexical hit %s", doc_id, exc_info=True
+            )
+    return distances
+
+
 def _hybrid_rank(
     results: list,
     query: str,
@@ -1099,18 +1157,12 @@ def _merge_bm25_union_candidates(
     contributing chunk M of the same file. Falls back to ``source_file``
     only when full-path/chunk metadata is absent.
 
-    BM25-only additions carry ``distance=None`` so ``_hybrid_rank`` scores
-    them on BM25 contribution alone.
-
-    When ``max_distance > 0.0`` (a strict vector-distance threshold is
-    set), BM25-only candidates are skipped entirely — they have no vector
-    distance to satisfy the threshold, and silently injecting them would
-    break the existing ``max_distance`` guarantee that hybrid results lie
-    within the requested vector-distance bound.
+    BM25-only additions carry ``distance=None`` unless a strict
+    ``max_distance`` threshold is set. Under a threshold, union mode loads
+    stored embeddings for lexical hits and computes their vector distance
+    before admitting them, preserving the same distance guarantee as the
+    vector-only path.
     """
-    if max_distance > 0.0:
-        return
-
     where = build_where_filter(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
@@ -1124,6 +1176,13 @@ def _merge_bm25_union_candidates(
         logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return
 
+    metric = _metric_for_collection(drawers_col)
+    lexical_distances = (
+        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
+        if max_distance > 0.0
+        else {}
+    )
+
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
@@ -1135,6 +1194,11 @@ def _merge_bm25_union_candidates(
         ):
             continue
         full_source = meta.get("source_file", "") or ""
+        distance = lexical_distances.get(hit.id)
+        if max_distance > 0.0:
+            if distance is None or distance > max_distance:
+                continue
+            distance = round(distance, 4)
         bm25_extra.append(
             {
                 "drawer_id": _result_drawer_id(meta, hit.id),
@@ -1145,9 +1209,13 @@ def _merge_bm25_union_candidates(
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
                 "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-                "similarity": None,
-                "distance": None,
-                "effective_distance": None,
+                "similarity": (
+                    None
+                    if distance is None
+                    else round(_distance_to_similarity(distance, metric), 3)
+                ),
+                "distance": distance,
+                "effective_distance": distance,
                 "closet_boost": 0.0,
                 "matched_via": "bm25_backend",
                 "bm25_score": round(float(hit.score), 3),
@@ -1171,8 +1239,6 @@ def _merge_bm25_union_candidates(
         key = _dedup_key(bh)
         if not key or key == "?" or key in seen:
             continue
-        bh["distance"] = None
-        bh["effective_distance"] = None
         bh["closet_boost"] = 0.0
         hits.append(bh)
         seen.add(key)
@@ -1657,8 +1723,8 @@ def search_memories(
               characterized.
 
               When ``max_distance > 0.0`` is also set, BM25-only candidates
-              are skipped — they have no vector distance and would silently
-              violate the requested distance threshold.
+              are admitted only if their stored embeddings can be loaded and
+              their computed vector distance satisfies that threshold.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /

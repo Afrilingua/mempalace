@@ -1747,6 +1747,35 @@ class TestSearchTool:
         result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
         assert len(result_strict["results"]) <= len(result_loose["results"])
 
+    def test_search_passes_candidate_strategy(self, monkeypatch, config, kg):
+        """MCP callers can opt into backend BM25/vector union candidate gathering."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["candidate_strategy"] = kwargs.get("candidate_strategy")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="rareterm", candidate_strategy="union")
+
+        assert "error" not in result
+        assert seen["candidate_strategy"] == "union"
+
+    def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **kw: pytest.fail())
+
+        result = mcp_server.tool_search(query="rareterm", candidate_strategy="bm25")
+
+        assert "error" in result
+        assert "candidate_strategy" in result["error"]
+
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -1808,11 +1837,11 @@ class TestSearchTool:
                 collection_name="custom_drawers",
             ),
         )
-        seen_collection_names = []
+        seen_calls = []
 
         def fake_search(*args, **kwargs):
-            seen_collection_names.append(kwargs.get("collection_name"))
-            if len(seen_collection_names) == 1:
+            seen_calls.append((kwargs.get("collection_name"), kwargs.get("candidate_strategy")))
+            if len(seen_calls) == 1:
                 return {
                     "error": "Search error: Error executing plan: Internal error: Error finding id"
                 }
@@ -1822,10 +1851,12 @@ class TestSearchTool:
         monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
         monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
 
-        result = mcp_server.tool_search(query="anything", wing="wing_api")
+        result = mcp_server.tool_search(
+            query="anything", wing="wing_api", candidate_strategy="union"
+        )
 
         assert "results" in result
-        assert seen_collection_names == ["custom_drawers", "custom_drawers"]
+        assert seen_calls == [("custom_drawers", "union"), ("custom_drawers", "union")]
 
     def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
         """Validation / unrelated errors must not trigger the retry path."""

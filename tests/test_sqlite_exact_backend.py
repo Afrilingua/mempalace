@@ -884,10 +884,12 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
         str(tmp_path),
         n_results=1,
         candidate_strategy="union",
+        max_distance=1.5,
     )
 
     assert result["results"][0]["source_file"] == "rare.md"
     assert result["results"][0]["matched_via"] == "bm25_backend"
+    assert result["results"][0]["distance"] <= 1.5
 
 
 def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_path):

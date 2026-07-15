@@ -4176,6 +4176,51 @@ class TestStructuredErrors:
             "_get_client should call _prepare_palace_for_open on reconnect"
         )
 
+    def test_get_client_resets_chroma_system_cache_on_reconnect(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """``_get_client`` must clear chromadb's path-keyed System/HNSW cache
+        (via ``_force_chroma_cache_reset``) *before* calling ``make_client`` on an
+        inode/mtime reconnect. Otherwise chromadb hands back the stale in-memory
+        HNSW segment, which persists its outdated index over a peer writer's
+        on-disk changes, driving the persisted count backwards (#2002)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        # Prime the cache.
+        mcp_server._get_collection()
+
+        # Simulate a peer writer touching chroma.sqlite3 on disk.
+        old_mtime = mcp_server._palace_db_mtime
+        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+
+        order: list[str] = []
+        real_reset = mcp_server._force_chroma_cache_reset
+        real_make = ChromaBackend.make_client
+
+        def spy_reset():
+            order.append("reset")
+            real_reset()
+
+        @staticmethod
+        def spy_make(path):
+            order.append("make_client")
+            return real_make(path)
+
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", spy_reset)
+        monkeypatch.setattr(ChromaBackend, "make_client", spy_make)
+
+        mcp_server._get_client()
+
+        assert order == ["reset", "make_client"], (
+            "_get_client must reset chromadb's system cache BEFORE reopening the "
+            "client on a staleness reconnect (#2002)"
+        )
+
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
         """A KG closed mid-handler must trigger a one-shot retry with a fresh
         instance — not surface a -32000 to the MCP client."""

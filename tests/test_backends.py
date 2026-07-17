@@ -1851,9 +1851,7 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
         "quarantine_invalid_hnsw_metadata",
         "quarantine_stale_hnsw",
     ):
-        monkeypatch.setattr(
-            f"mempalace.backends.chroma.{_name}", lambda path, *a, **k: []
-        )
+        monkeypatch.setattr(f"mempalace.backends.chroma.{_name}", lambda path, *a, **k: [])
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
 
@@ -1864,9 +1862,7 @@ def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatc
         events.append(("open", path))
         return DummyClient()
 
-    monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", _record_open
-    )
+    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", _record_open)
 
     from chromadb.api.client import SharedSystemClient
 

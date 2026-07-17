@@ -2707,12 +2707,16 @@ class TestDeleteBySource:
     def test_dry_run_reports_closet_match_count(self, monkeypatch, config, palace_path, kg):
         """Dry run surfaces the closet blast radius (#1722) without deleting."""
         self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
+        self._seed_closets(palace_path)
         from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace import get_closets_collection
 
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
         assert result["dry_run"] is True
         assert result["closet_match_count"] == 2
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed System
+        # cache (#2002), so a handle taken before the call is dead by now.
+        closets_col = get_closets_collection(palace_path, create=False)
         # Nothing removed — all three closets still present.
         assert len(closets_col.get(include=[])["ids"]) == 3
 
@@ -2731,13 +2735,17 @@ class TestDeleteBySource:
         """Deleting by source purges the matching closets too, so the AAAK
         index keeps no stale pointers at the now-deleted drawers (#1722)."""
         self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
+        self._seed_closets(palace_path)
         from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace import get_closets_collection
 
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
         assert result["success"] is True
         assert result["deleted"] == 2
         assert result["closets_deleted"] == 2
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed System
+        # cache (#2002), so a handle taken before the call is dead by now.
+        closets_col = get_closets_collection(palace_path, create=False)
         # The two benchmark closets are gone; the real-client closet survives.
         remaining = closets_col.get(include=["metadatas"])
         sources = {m["source_file"] for m in remaining["metadatas"]}

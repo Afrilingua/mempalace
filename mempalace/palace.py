@@ -1353,9 +1353,11 @@ def prefetch_mined_set(
     return mined
 
 
-def prefetch_content_hashes(collection, extract_mode: Optional[str] = None) -> dict[str, str]:
-    """Pre-fetch content_hash -> source_file for drawers already filed at the
-    current NORMALIZE_VERSION, in one bulk pass.
+def prefetch_content_hashes(
+    collection, extract_mode: Optional[str] = None
+) -> dict[tuple[str, str], str]:
+    """Pre-fetch (wing, content_hash) -> source_file for drawers already
+    filed at the current NORMALIZE_VERSION, in one bulk pass.
 
     Repeated exports from Claude/ChatGPT land under a new filename each run
     (timestamped bundle, regenerated slug, etc.) even when the conversation
@@ -1366,10 +1368,20 @@ def prefetch_content_hashes(collection, extract_mode: Optional[str] = None) -> d
     normalized transcript text, so the convo miner can recognize "this exact
     conversation is already filed under a different path" and skip it.
 
-    Only the first source_file seen for a given hash is kept — good enough
-    to detect and skip a repeat, the point is not to track every alias.
+    Keyed by (wing, content_hash) rather than content_hash alone — mining
+    the same transcript into a second wing is a deliberate re-file, not a
+    duplicate, and should produce real drawers in that wing rather than
+    just the registry sentinel.
+
+    A drawer's ``content_hash`` metadata may hold several comma-joined
+    SHA-256 hashes: a privacy-export bundle normalizes to one conversation
+    per drawer set, but the hash is computed per conversation so that a
+    re-export with one new conversation added doesn't change the hash of
+    the ones that didn't. Only the first source_file seen for a given
+    (wing, hash) pair is kept — good enough to detect and skip a repeat,
+    the point is not to track every alias.
     """
-    hashes: dict[str, str] = {}
+    hashes: dict[tuple[str, str], str] = {}
     try:
         total = collection.count()
         offset = 0
@@ -1377,15 +1389,20 @@ def prefetch_content_hashes(collection, extract_mode: Optional[str] = None) -> d
             batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
             for meta in batch["metadatas"]:
                 meta = meta or {}
-                content_hash = meta.get("content_hash")
+                content_hash_field = meta.get("content_hash")
                 src = meta.get("source_file")
-                if not content_hash or not src:
+                wing = meta.get("wing")
+                if not content_hash_field or not src or not wing:
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
                     continue
                 version = meta.get("normalize_version", 1)
-                if version >= NORMALIZE_VERSION and content_hash not in hashes:
-                    hashes[content_hash] = src
+                if version < NORMALIZE_VERSION:
+                    continue
+                for content_hash in content_hash_field.split(","):
+                    key = (wing, content_hash)
+                    if content_hash and key not in hashes:
+                        hashes[key] = src
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])

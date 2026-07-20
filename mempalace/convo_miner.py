@@ -21,7 +21,7 @@ from typing import Optional
 
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
-from .normalize import normalize
+from .normalize import normalize_conversations
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -630,35 +630,30 @@ def _is_ai_tool_path(path: Path) -> bool:
     return False
 
 
-def _skip_content_duplicate(
-    dry_run: bool,
-    collection,
-    filepath: Path,
-    content_hash: str,
+def _split_new_and_duplicate_conversations(
+    conversations: list,
     wing: str,
-    agent: str,
-    extract_mode: str,
+    source_file: str,
     mined_content_hashes: dict,
-    progress: str,
-) -> bool:
-    """Register and report a content-duplicate file, if this content_hash is
-    already filed under a different source_file. Returns True if skipped.
+) -> tuple:
+    """Hash each conversation and split them into (new, duplicate) lists.
 
-    Repeated exports from Claude/ChatGPT commonly land under a new filename
-    each run even when the conversation itself is unchanged, so the
-    source_file-keyed mtime skip never recognizes them. Registering the
-    duplicate here means the next run skips it via the cheap mtime check
-    instead of re-normalizing and re-hashing it.
+    A conversation is a duplicate when its hash is already registered under
+    a *different* source_file in the same wing — mining the same transcript
+    into a second wing is a deliberate re-file, not a repeat, so the lookup
+    is scoped to (wing, hash). Returns ([(hash, text), ...] new, [(hash,
+    dup_source_file), ...] duplicates).
     """
-    if dry_run:
-        return False
-    source_file = str(filepath)
-    dup_source = mined_content_hashes.get(content_hash)
-    if dup_source is None or dup_source == source_file:
-        return False
-    _register_file(collection, source_file, wing, agent, extract_mode, content_hash)
-    print(f"  = {progress} {filepath.name[:50]:50} duplicate of {Path(dup_source).name}")
-    return True
+    new_items = []
+    duplicates = []
+    for conversation in conversations:
+        content_hash = hashlib.sha256(conversation.strip().encode("utf-8")).hexdigest()
+        dup_source = mined_content_hashes.get((wing, content_hash))
+        if dup_source is None or dup_source == source_file:
+            new_items.append((content_hash, conversation))
+        else:
+            duplicates.append((content_hash, dup_source))
+    return new_items, duplicates
 
 
 def _is_unchanged_since_last_mine(source_file: str, mined_mtimes: dict) -> bool:
@@ -778,7 +773,7 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         print(f"  (hallways skipped: {exc})")
 
 
-def _normalize_convo_content(
+def _normalize_convo_conversations(
     filepath: Path,
     source_file: str,
     cfg_min_chunk_size: int,
@@ -787,24 +782,32 @@ def _normalize_convo_content(
     agent: str,
     extract_mode: str,
     dry_run: bool,
-) -> Optional[str]:
-    """Normalize a transcript file, registering it as filed when there's
-    nothing worth mining. Returns None when the caller should skip the file
-    (normalize failed, or normalized content is too short to chunk).
+) -> Optional[list]:
+    """Normalize a transcript file into its individual conversations,
+    registering it as filed when there's nothing worth mining. Returns None
+    when the caller should skip the file (normalize failed, or normalized
+    content is too short to chunk).
+
+    Kept as separate conversations rather than joined into one string so
+    dedup can hash and skip per conversation — a Claude.ai privacy export
+    bundles every conversation into a single file, and hashing the joined
+    bundle means one new conversation added to a re-export changes the
+    whole-file hash and hides the conversations that didn't change.
     """
     try:
-        content = normalize(str(filepath))
+        conversations = [c for c in normalize_conversations(str(filepath)) if c]
     except (OSError, ValueError):
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
 
-    if not content or len(content.strip()) < cfg_min_chunk_size:
+    total_len = sum(len(c.strip()) for c in conversations)
+    if not conversations or total_len < cfg_min_chunk_size:
         if not dry_run:
             _register_file(collection, source_file, wing, agent, extract_mode)
         return None
 
-    return content
+    return conversations
 
 
 def _mine_convos_impl(
@@ -894,7 +897,7 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
-        content = _normalize_convo_content(
+        conversations = _normalize_convo_conversations(
             filepath,
             source_file,
             cfg_min_chunk_size,
@@ -904,28 +907,32 @@ def _mine_convos_impl(
             extract_mode,
             dry_run,
         )
-        if content is None:
+        if conversations is None:
             continue
 
-        content_hash = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
-
-        # Same conversation, different path: this exact transcript is
-        # already filed under another source_file (e.g. a fresh Claude/ChatGPT
-        # export bundle re-exports conversations that haven't changed under
-        # new filenames). Skip it instead of filing a duplicate set of drawers.
-        if _skip_content_duplicate(
-            dry_run,
-            collection,
-            filepath,
-            content_hash,
-            wing,
-            agent,
-            extract_mode,
-            mined_content_hashes,
-            progress=f"[{i:4}/{len(files)}]",
-        ):
+        # Hash and dedup per conversation, not per file: a Claude/ChatGPT
+        # privacy export bundles every conversation into one file, so a
+        # re-export that adds one new conversation changes the whole-file
+        # hash and would hide the conversations that didn't change if we
+        # hashed the joined bundle. Conversations whose hash is already
+        # filed under a different source_file in this wing are dropped;
+        # the rest are re-joined and mined as usual.
+        new_items, duplicates = _split_new_and_duplicate_conversations(
+            conversations, wing, source_file, mined_content_hashes
+        )
+        if not new_items:
+            if not dry_run:
+                _register_file(collection, source_file, wing, agent, extract_mode)
+            dup_source = duplicates[0][1]
+            print(
+                f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
+                f"duplicate of {Path(dup_source).name}"
+            )
             files_skipped += 1
             continue
+
+        content = "\n\n".join(text for _, text in new_items)
+        content_hash = ",".join(h for h, _ in new_items)
 
         # Chunk — either exchange pairs or general extraction
         if extract_mode == "general":
@@ -994,7 +1001,8 @@ def _mine_convos_impl(
         for r, n in room_delta.items():
             room_counts[r] += n
 
-        mined_content_hashes[content_hash] = source_file
+        for h, _ in new_items:
+            mined_content_hashes[(wing, h)] = source_file
         total_drawers += drawers_added
         files_mined += 1
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")

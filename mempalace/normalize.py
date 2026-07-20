@@ -114,10 +114,10 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def normalize(filepath: str) -> str:
-    """
-    Load a file and normalize to transcript format if it's a chat export.
-    Plain text files pass through unchanged.
+def _read_transcript_file(filepath: str) -> str:
+    """Read a transcript source file with the same safety checks normalize()
+    and normalize_conversations() both need: no symlinks, regular files only,
+    size-capped, BOM-tolerant.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     if os.path.islink(filepath):
@@ -132,7 +132,7 @@ def normalize(filepath: str) -> str:
             raise IOError(f"File too large ({file_stat.st_size // (1024 * 1024)} MB): {filepath}")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            content = f.read()
+            return f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -141,6 +141,14 @@ def normalize(filepath: str) -> str:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def normalize(filepath: str) -> str:
+    """
+    Load a file and normalize to transcript format if it's a chat export.
+    Plain text files pass through unchanged.
+    """
+    content = _read_transcript_file(filepath)
 
     if not content.strip():
         return content
@@ -162,40 +170,88 @@ def normalize(filepath: str) -> str:
     return content
 
 
+def normalize_conversations(filepath: str) -> list:
+    """Like normalize(), but keeps each conversation in a bundle export as a
+    separate string instead of joining them into one.
+
+    A Claude.ai privacy export packs every conversation into a single JSON
+    file, and normalize() joins them with "\\n\\n".join(...) into one blob.
+    That collapses conversation boundaries, so content-hash dedup keyed on
+    the whole file breaks the moment the bundle is re-exported with one new
+    conversation added — the file-level hash changes even though none of
+    the existing conversations did. This returns the pieces un-joined so
+    callers can hash and dedup per conversation instead.
+
+    Non-bundle formats (a single Claude Code session, a ChatGPT export,
+    plain text, ...) always normalize to one conversation, so this returns
+    a one-element list for those — identical dedup granularity to before.
+    """
+    content = _read_transcript_file(filepath)
+
+    if not content.strip():
+        return []
+
+    lines = content.split("\n")
+    if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
+        return [content]
+
+    ext = Path(filepath).suffix.lower()
+    if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
+        split = _try_normalize_json_split(content)
+        if split:
+            return split
+
+    return [content]
+
+
 def _try_normalize_json(content: str) -> Optional[str]:
-    """Try all known JSON chat schemas."""
+    """Try all known JSON chat schemas, joining a multi-conversation bundle
+    into one string. See ``_try_normalize_json_split`` for the unjoined form.
+    """
+    split = _try_normalize_json_split(content)
+    if split is None:
+        return None
+    return "\n\n".join(split)
+
+
+def _try_normalize_json_split(content: str) -> Optional[list]:
+    """Try all known JSON chat schemas, returning each conversation found as
+    a separate list entry (bundle formats) or a single-element list.
+    """
 
     normalized = _try_claude_code_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_codex_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_gemini_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_pi_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         return None
 
-    for parser in (
-        _try_gemini_json,
-        _try_claude_ai_json,
-        _try_chatgpt_json,
-        _try_continue_json,
-        _try_slack_json,
-    ):
+    normalized = _try_gemini_json(data)
+    if normalized:
+        return [normalized]
+
+    split = _try_claude_ai_json_split(data)
+    if split:
+        return split
+
+    for parser in (_try_chatgpt_json, _try_continue_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
-            return normalized
+            return [normalized]
 
     return None
 
@@ -509,6 +565,16 @@ def _try_gemini_json(data) -> Optional[str]:
 
 def _try_claude_ai_json(data) -> Optional[str]:
     """Claude.ai JSON export: flat messages list or privacy export with chat_messages."""
+    split = _try_claude_ai_json_split(data)
+    if split is None:
+        return None
+    return "\n\n".join(split)
+
+
+def _try_claude_ai_json_split(data) -> Optional[list]:
+    """Same as ``_try_claude_ai_json`` but keeps each conversation in a
+    privacy export as its own list entry instead of joining them.
+    """
     if isinstance(data, dict):
         data = data.get("messages", data.get("chat_messages", []))
     if not isinstance(data, list):
@@ -526,13 +592,13 @@ def _try_claude_ai_json(data) -> Optional[str]:
             if len(messages) >= 2:
                 transcripts.append(_messages_to_transcript(messages))
         if transcripts:
-            return "\n\n".join(transcripts)
+            return transcripts
         return None
 
     # Flat messages list
     messages = _collect_claude_messages(data)
     if len(messages) >= 2:
-        return _messages_to_transcript(messages)
+        return [_messages_to_transcript(messages)]
     return None
 
 

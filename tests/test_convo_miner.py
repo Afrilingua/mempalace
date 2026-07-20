@@ -572,6 +572,44 @@ def test_mine_convos_grown_file_purges_stale_drawers_not_additive(capsys):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_convos_skips_same_content_under_new_filename(capsys):
+    """Re-exporting the same conversation from Claude/ChatGPT under a new
+    filename (fresh export bundle, regenerated slug, etc.) must not create
+    a duplicate set of drawers -- only the exact-new content should file."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        transcript = (
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        (Path(tmpdir) / "export_2026-01-01.txt").write_text(transcript)
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        count_after_first = col.count()
+        assert count_after_first >= 2
+
+        # Simulate a later export: the same conversation lands under a new
+        # filename, alongside one genuinely new conversation.
+        (Path(tmpdir) / "export_2026-02-01.txt").write_text(transcript)
+        (Path(tmpdir) / "export_2026-02-01_new.txt").write_text(
+            "> What's next?\nUNIQUE_SECOND_EXPORT_MARKER covers the new work.\n"
+        )
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "duplicate of export_2026-01-01.txt" in out
+
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get(include=["documents"])["documents"]
+        dup_hits = sum(1 for d in docs if "Migration ordering is the main one" in d)
+        assert dup_hits == 1, f"duplicate transcript re-filed: {dup_hits} copies"
+        assert any("UNIQUE_SECOND_EXPORT_MARKER" in d for d in docs)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_prefetch_mined_set_returns_stored_mtime():
     """prefetch_mined_set's dict carries each source_file's stored mtime,
     not just membership."""

@@ -1351,3 +1351,44 @@ def prefetch_mined_set(
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
     return mined
+
+
+def prefetch_content_hashes(collection, extract_mode: Optional[str] = None) -> dict[str, str]:
+    """Pre-fetch content_hash -> source_file for drawers already filed at the
+    current NORMALIZE_VERSION, in one bulk pass.
+
+    Repeated exports from Claude/ChatGPT land under a new filename each run
+    (timestamped bundle, regenerated slug, etc.) even when the conversation
+    itself hasn't changed. `prefetch_mined_set` only recognizes a file as
+    already-mined by its exact path, so the same conversation re-exported
+    under a new path always looked "new" and got re-mined as a duplicate
+    drawer. This does the same bulk scan but keyed on the SHA-256 of the
+    normalized transcript text, so the convo miner can recognize "this exact
+    conversation is already filed under a different path" and skip it.
+
+    Only the first source_file seen for a given hash is kept — good enough
+    to detect and skip a repeat, the point is not to track every alias.
+    """
+    hashes: dict[str, str] = {}
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                meta = meta or {}
+                content_hash = meta.get("content_hash")
+                src = meta.get("source_file")
+                if not content_hash or not src:
+                    continue
+                if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                version = meta.get("normalize_version", 1)
+                if version >= NORMALIZE_VERSION and content_hash not in hashes:
+                    hashes[content_hash] = src
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+    return hashes

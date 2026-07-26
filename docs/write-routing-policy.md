@@ -109,6 +109,33 @@ Invalid values fail with a source-specific error rather than silently falling
 back. This is important because silently turning a misspelled `require` into a
 direct write would violate the safety purpose of the policy.
 
+## Local backend single-writer safety
+
+File-backed backends such as `chroma`, `sqlite_exact`, and Milvus Lite support
+exactly one writable process per palace. Serializing individual calls is not
+enough because each long-lived process can retain SQLite/WAL, FTS, or vector
+index state between calls.
+
+- A writable daemon owns the palace writer lease for its full lifetime.
+- Writable MCP HTTP acquires that lease before binding and refuses startup if
+  another process owns it.
+- MCP stdio may coexist for reads, but mutating tools refuse while another
+  process owns the lease and become available after that owner exits.
+- Read-only MCP HTTP may coexist with the writer.
+- Direct CLI and hook writes must not run beside a writable daemon or MCP HTTP
+  owner. Route them through the daemon with `require` when the daemon owns the
+  palace.
+
+`MEMPALACE_MCP_ALLOW_PEER_WRITER` cannot bypass this protection for local
+file-backed or unknown plugin backends. It is retained only for explicitly
+remote service backends (`qdrant` and `pgvector`) that coordinate concurrent
+clients themselves.
+
+Do not delete or unlink a live palace lock to recover ownership. Stop the
+owning process cleanly; the operating system releases its lock automatically.
+If corruption is suspected, back up the palace and run integrity/repair
+operations offline, with no writable service running.
+
 ## Follow-up PRs
 
 Hook-triggered writes now consume this policy; see

@@ -235,6 +235,42 @@ def test_read_only_off_exposes_mutating_tools(http_server):
     assert "mempalace_add_drawer" in names
 
 
+def test_writable_http_refuses_startup_without_writer_lease(monkeypatch):
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(
+        mcp,
+        "_acquire_mcp_writer_lock",
+        lambda: (False, "another writer owns the palace"),
+    )
+    monkeypatch.setattr(
+        mcp,
+        "_serve_http",
+        lambda *args: pytest.fail("server must not bind without the writer lease"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 2
+
+
+def test_read_only_http_skips_writer_lease(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+    monkeypatch.setattr(
+        mcp,
+        "_acquire_mcp_writer_lock",
+        lambda: pytest.fail("read-only HTTP must not acquire the writer lease"),
+    )
+    monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_serve_http", lambda host, port: calls.append((host, port)))
+
+    mcp._run_http_loop()
+
+    assert calls == [(mcp._args.host, mcp._args.port)]
+
+
 @pytest.mark.parametrize(
     "disconnect_exc",
     [

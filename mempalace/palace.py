@@ -332,6 +332,21 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
     return selected
 
 
+_MULTI_PROCESS_WRITER_BACKENDS = frozenset({"pgvector", "qdrant"})
+
+
+def backend_requires_single_writer(backend_name: str) -> bool:
+    """Return whether a backend needs one process-lifetime writer owner.
+
+    Local file-backed backends cannot safely coordinate independent long-lived
+    clients by serializing only individual calls: each process may retain
+    SQLite/WAL, FTS, or vector-index state across operations. Unknown and
+    plugin backends are treated conservatively. Only backends whose storage
+    service is explicitly responsible for cross-process concurrency opt out.
+    """
+    return backend_name.strip().lower() not in _MULTI_PROCESS_WRITER_BACKENDS
+
+
 def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):
     """Return the resolved backend instance for ``palace_path``."""
     return get_backend(resolve_backend_name(palace_path, explicit=explicit))

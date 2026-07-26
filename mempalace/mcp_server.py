@@ -426,9 +426,6 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
     global _MCP_WRITER_LOCK_ERROR
 
-    if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
-        return True, ""
-
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
@@ -437,10 +434,25 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     # the server self-heals into the writer the moment the peer exits. A broken
     # lock *mechanism* (below) is still cached, since retrying it can't help.
     if _MCP_WRITER_LOCK_FAILED:
-        return True, _MCP_WRITER_LOCK_ERROR
+        return False, _MCP_WRITER_LOCK_ERROR
 
     try:
-        from .palace import MineAlreadyRunning, mine_palace_lock
+        from .palace import (
+            MineAlreadyRunning,
+            backend_requires_single_writer,
+            mine_palace_lock,
+            resolve_backend_name,
+        )
+
+        backend_name = resolve_backend_name(_config.palace_path)
+        if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+            if not backend_requires_single_writer(backend_name):
+                return True, ""
+            logger.warning(
+                "%s cannot bypass the single-writer requirement for local backend %r",
+                _MCP_ALLOW_PEER_WRITER_ENV,
+                backend_name,
+            )
 
         lock_cm = mine_palace_lock(_config.palace_path)
         lock_cm.__enter__()
@@ -455,11 +467,11 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
-            f"{_config.palace_path!r}: {exc!r}; continuing without "
-            "peer-writer protection"
+            f"{_config.palace_path!r}: {exc!r}; refusing mutating tools "
+            "because peer-writer protection could not be established"
         )
-        logger.warning(_MCP_WRITER_LOCK_ERROR)
-        return True, _MCP_WRITER_LOCK_ERROR
+        logger.error(_MCP_WRITER_LOCK_ERROR)
+        return False, _MCP_WRITER_LOCK_ERROR
 
     _MCP_WRITER_LOCK_CM = lock_cm
     import atexit
@@ -5498,6 +5510,16 @@ def _run_http_loop() -> None:
     # stdout->stderr guard in place means any accidental print from a dependency
     # still cannot masquerade as an HTTP response.
     logger.info("MemPalace MCP HTTP server starting...")
+
+    # A writable HTTP server is a long-lived storage client, so it must own the
+    # local palace before it binds. Refusing at startup avoids advertising a
+    # writable service that will only fail (or race) on its first mutation.
+    # Explicit read-only HTTP remains safe to run beside the one writer owner.
+    if not _READ_ONLY:
+        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        if not writer_ok:
+            logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
+            raise SystemExit(2)
 
     # The HTTP transport exists for long-lived deployments. Do the cheap
     # filesystem-only probe before binding, but never make the listener wait on

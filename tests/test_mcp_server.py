@@ -5072,12 +5072,61 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
     ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
 
-    assert ok_first is True
-    assert ok_second is True
+    assert ok_first is False
+    assert ok_second is False
     assert calls["count"] == 1
     assert mcp_server._MCP_WRITER_LOCK_FAILED is True
-    assert "continuing without peer-writer protection" in reason_first
+    assert "refusing mutating tools" in reason_first
     assert reason_second == reason_first
+
+
+def test_peer_writer_override_cannot_bypass_local_backend_lock(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def tracked_lock(palace_path):
+        calls["count"] += 1
+        return _DummyLock()
+
+    monkeypatch.setenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, "1")
+    monkeypatch.setattr(palace, "resolve_backend_name", lambda path: "sqlite_exact")
+    monkeypatch.setattr(palace, "mine_palace_lock", tracked_lock)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok is True
+    assert reason == ""
+    assert calls["count"] == 1
+
+
+def test_peer_writer_override_remains_available_for_remote_backend(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    monkeypatch.setenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, "1")
+    monkeypatch.setattr(palace, "resolve_backend_name", lambda path: "qdrant")
+    monkeypatch.setattr(
+        palace,
+        "mine_palace_lock",
+        lambda path: pytest.fail("remote backend should not take the local writer lease"),
+    )
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    assert mcp_server._acquire_mcp_writer_lock() == (True, "")
 
 
 def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):

@@ -468,6 +468,107 @@ _READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
 }
 
 
+# Stale-library write gate (#899).
+#
+# A long-lived MCP server imports mempalace and its storage backend once and
+# then serves from those in-memory modules for the whole life of the process.
+# Upgrading the package on disk mid-session (`pip install -U mempalace`,
+# `uv tool upgrade`, `pipx install --force`) cannot reach it: Python caches
+# modules in sys.modules and never reloads them. The server keeps accepting
+# writes, produced by code the user no longer has installed, and reports
+# success for every one of them.
+#
+# #457 is the same condition with the volume turned up: upgrading mempalace
+# tightened its ChromaDB pin and moved the installed ChromaDB across a
+# storage-format boundary (downwards, 1.5.6 to 0.6.3), the running server kept
+# serving the modules it had already loaded, and every tool call then failed
+# with `no such column: collections.schema_str` until the host was restarted. That one
+# announced itself. #899 reports the quiet variant, where the writes succeed in
+# a format the newly-installed library may not read back and nothing surfaces
+# until a fresh process opens the palace. Either way nothing told the running
+# server to stop first; `mempalace migrate` (#502) only recovers such a palace
+# after the fact.
+#
+# Watched distributions are the ones whose code writes the palace on this
+# machine: mempalace itself, plus chromadb when chromadb is the backend
+# actually serving. Its on-disk format has moved between releases, which is
+# what makes a superseded copy of it dangerous. The networked backends
+# (pgvector/qdrant/milvus) keep their format server-side, so a client-library
+# upgrade does not rewrite local files the same way, and they are deliberately
+# left out rather than gated on a guess.
+#
+# chromadb is a hard dependency rather than an extra, so it is installed even
+# for someone serving from pgvector, and watching it unconditionally would
+# refuse that person's writes over an upgrade to a library that touches nothing
+# they own. The backend is read once here, at import, from the same config the
+# server goes on to serve with. One that cannot be resolved counts as chroma:
+# watching a distribution that turns out not to matter costs a restart, while
+# not watching the one that does costs the silent corruption this exists to
+# prevent.
+#
+# The resolved versions are cached behind a stat-only fingerprint, so the common
+# case reads no metadata at all. That is not the same as free: building the
+# fingerprint lists every search root once and stats the watched metadata files
+# it finds there, and on a normal environment the listing is most of the cost.
+# It is paid only by mutating tools — the refusal checks the tool name before
+# anything else, so a read leaves the filesystem alone entirely. The one
+# exception among reads is mempalace_status, which pays it deliberately, being
+# the surface that reports this state.
+#
+# The cache is invalidated by that fingerprint and never by elapsed time,
+# because a time window is precisely the gap a post-upgrade write slips
+# through. The fingerprint covers what installers actually do: a renamed or
+# removed metadata directory, and a metadata file rewritten in place. It cannot
+# see a rewrite that leaves both the size and the recorded mtime untouched,
+# which needs the replacement to be the same length AND to land inside the
+# filesystem's timestamp granularity — nanoseconds on ext4, but roughly 15 ms
+# on Windows and two seconds on FAT. An upgrade arriving minutes into a session
+# clears that comfortably; an archive restore or a rewrite in the same tick as
+# the previous reading does not, and that case fails open, leaving the gate no
+# worse than its absence.
+# -32004 belongs to the diverged-index gate; this one takes the next free code
+# so a client can tell "restart the server" from "rebuild the index" without
+# parsing the message.
+_STALE_LIBRARY_ERROR_CODE = -32005
+
+
+def _stale_library_watched_dists() -> tuple:
+    """Distributions worth comparing, given the backend this server serves with."""
+    watched = ["mempalace"]
+    try:
+        backend = str(_config.backend).strip().lower()
+    except Exception:
+        # Config trouble is not a reason to narrow the check.
+        logger.debug("stale-library backend could not be resolved", exc_info=True)
+        backend = "chroma"
+    if backend == "chroma":
+        watched.append("chromadb")
+    return tuple(watched)
+
+
+_STALE_LIBRARY_WATCHED_DISTS = _stale_library_watched_dists()
+_MCP_ALLOW_STALE_LIBRARY_ENV = "MEMPALACE_MCP_ALLOW_STALE_LIBRARY"
+# A distribution version is PEP 440 text. This metadata is a file on disk that
+# the server does not own, and its value is quoted back to the client, so its
+# shape is checked before it is echoed anywhere.
+_VERSION_TEXT_RE = re.compile(r"\A[A-Za-z0-9._+!-]{1,64}\Z")
+# Reported in place of a version when a distribution that was installed at
+# startup is no longer installed at all. Not a valid PEP 440 version, so it can
+# never collide with a real one.
+_UNINSTALLED = "not installed"
+_stale_library_cache_lock = threading.Lock()
+_stale_library_cache: dict = {"signature": None, "versions": {}, "errors": {}}
+# What has already been announced to the log, so a persistent condition is
+# reported once rather than on every mutating call. These have their own lock
+# because they are not part of the cached reading and outlive it: the cache is
+# dropped whenever a reading fails, while what was last logged has to survive
+# exactly that. Putting them behind the cache lock would also make the log
+# bookkeeping contend for it on every mutating call.
+_stale_library_log_lock = threading.Lock()
+_stale_library_reported_errors: dict = {}
+_stale_library_reported_drift: list = []
+
+
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -4957,6 +5058,521 @@ def _mcp_diverged_index_refusal(req_id, tool_name: str):
     }
 
 
+def _excluded_working_directory() -> str:
+    """The working directory to keep out of the metadata search, resolved once.
+
+    Read at import and never again. The value has to be identical for the
+    startup baseline and every later reading, or the set of watched directories
+    would shift under a server that never moved: a rename or a redeploy of the
+    checkout changes what ``os.getcwd()`` answers, and a directory that was
+    excluded at startup would quietly start counting. Resolving symlinks keeps
+    the comparison honest against a path spelled differently on either side.
+    """
+    try:
+        return os.path.realpath(os.getcwd())
+    except OSError:
+        # The working directory can be gone underneath a long-lived process.
+        # Nothing to exclude then, and no reason to stop answering.
+        return ""
+
+
+_DIST_PATH_EXCLUDED_CWD = _excluded_working_directory()
+
+
+def _dist_search_path() -> list[str]:
+    """``sys.path`` entries this server will trust to answer "what is installed".
+
+    The working directory is excluded. Under the documented launch
+    ``python -m mempalace.mcp_server`` (website/guide/mcp-integration.md) the
+    interpreter puts the MCP host's own working directory first on sys.path, so
+    a plain ``importlib.metadata.version()`` would resolve against whatever
+    project the user happens to have open. Any repository carrying a top-level
+    ``mempalace.egg-info/`` would then dictate this server's write policy — and
+    it would win again on every restart, so the gate's own "restart the server"
+    remedy could not clear it. Distribution metadata is an installation fact,
+    not a property of the directory the host was started in.
+
+    This is narrower than what the import system itself would resolve, and
+    deliberately so, but it introduces no asymmetry: the startup baseline and
+    every later reading come from this same path, so a directory left out here
+    is simply not watched and can never produce a mismatch on its own. Running
+    from a source tree is the case that narrowing costs, and it is already
+    outside what installed metadata can describe.
+    """
+    cwd = _DIST_PATH_EXCLUDED_CWD
+    search: list[str] = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        if "\x00" in entry:
+            # No filesystem accepts this; the platforms disagree only about
+            # where it is refused. POSIX raises in the realpath below and the
+            # entry drops out there, while Windows resolves it and leaves every
+            # later call to fail on it instead — os.stat and os.listdir reject
+            # it in the argument conversion, which raises ValueError rather
+            # than the OSError those callers hold, so a single junk entry would
+            # take the whole reading down and switch the gate off. Dropped here
+            # so both platforms go on to search the same list.
+            continue
+        try:
+            resolved = os.path.realpath(entry)
+        except (OSError, ValueError):
+            continue
+        if cwd and resolved == cwd:
+            continue
+        search.append(entry)
+    return search
+
+
+def _stat_fingerprint(path: str) -> tuple:
+    try:
+        stat_result = os.stat(path)
+        return (path, stat_result.st_mtime_ns, stat_result.st_ino, stat_result.st_size)
+    except OSError:
+        # Missing is a state too: a dist-info that disappears must read as a
+        # change, not as "same as last time".
+        return (path, None, None, None)
+
+
+def _watched_metadata_files(root: str) -> list[str]:
+    """Metadata files under ``root`` belonging to the watched distributions.
+
+    Installers name these directories after the normalized distribution name,
+    and both watched names are already lowercase single words, so matching the
+    prefix is enough here without pulling in full PEP 503 normalization.
+    """
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+
+    found = []
+    for dist in _STALE_LIBRARY_WATCHED_DISTS:
+        prefix = f"{dist}-"
+        for entry in entries:
+            lowered = entry.lower()
+            if lowered == f"{dist}.egg-info":
+                found.append(os.path.join(root, entry, "PKG-INFO"))
+                continue
+            if not lowered.startswith(prefix):
+                continue
+            # `name-version.dist-info`, `name-version.egg-info` and
+            # `name-version-pyX.Y.egg-info` are all layouts importlib.metadata
+            # resolves, so all three have to be watched or an upgrade in the
+            # unwatched one moves nothing this fingerprint can see. A
+            # normalized PEP 440 version always starts with a digit; requiring
+            # one is defence in depth rather than load-bearing, since PEP 427
+            # escaping already spells a sibling like `mempalace-remote` as
+            # `mempalace_remote-...` and that fails the prefix outright.
+            remainder = lowered[len(prefix) :]
+            if not remainder[:1].isdigit():
+                continue
+            if lowered.endswith(".dist-info"):
+                found.append(os.path.join(root, entry, "METADATA"))
+            elif lowered.endswith(".egg-info"):
+                found.append(os.path.join(root, entry, "PKG-INFO"))
+    return sorted(found)
+
+
+def _dist_search_signature(search_path: list[str]) -> tuple:
+    """Stat-only fingerprint used to decide whether the metadata must be reread.
+
+    Two things are watched, because an upgrade can show up as either. A normal
+    ``pip``/``uv`` upgrade removes one ``*.dist-info`` directory and creates
+    another, which moves the containing directory's mtime; but a metadata file
+    rewritten in place leaves that mtime untouched, so the metadata files
+    themselves are fingerprinted too. Watching only the directories left the
+    cache blind to the in-place case, and a cache that cannot see a change is
+    the same silent failure this gate exists to prevent.
+    """
+    signature = []
+    for entry in search_path:
+        signature.append(_stat_fingerprint(entry))
+        for metadata_file in _watched_metadata_files(entry):
+            signature.append(_stat_fingerprint(metadata_file))
+    return tuple(signature)
+
+
+def _unlistable_search_entries(search_path: list[str]) -> list[str]:
+    """Search roots that are there but refuse to be listed.
+
+    ``importlib.metadata`` scans a root with ``with suppress(Exception):
+    os.listdir(...)`` and falls through to an empty listing, so a permission
+    error or a file-descriptor exhaustion on site-packages arrives as "there
+    are no distributions here" — the same answer a genuine uninstall gives.
+    Read literally, that would make this gate refuse every write on a wholly
+    healthy install, and ``EMFILE`` is an ordinary peak-load condition for a
+    threaded server rather than a hypothetical one. Probing the roots directly
+    is the only way to tell the two apart, because the fault is swallowed
+    before any of it reaches us.
+    """
+    blocked = []
+    for entry in search_path:
+        try:
+            os.listdir(entry)
+        except (FileNotFoundError, NotADirectoryError):
+            # A sys.path entry that does not exist, or a zip/file rather than a
+            # directory, is ordinary; importlib reads those its own way.
+            continue
+        except OSError:
+            blocked.append(entry)
+    return blocked
+
+
+def _log_stale_library_errors(errors: dict[str, str]) -> None:
+    """Report metadata faults when they appear or change, not on every call.
+
+    A failed reading is deliberately never memoized, so this path runs again on
+    every mutating call for as long as the fault lasts. Logging it each time
+    would turn one persistent permission problem into a flood into the MCP
+    host's stderr, and file-descriptor exhaustion reaches this same branch, so
+    the flood would peak exactly when the server can least afford it.
+    """
+    global _stale_library_reported_errors
+
+    with _stale_library_log_lock:
+        if errors == _stale_library_reported_errors:
+            return
+        _stale_library_reported_errors = dict(errors)
+
+    for dist, reason in sorted(errors.items()):
+        logger.warning("stale-library gate inactive for %s: %s", dist, reason)
+
+
+def _log_stale_library_drift(drift: list, described: str) -> None:
+    """Announce a refusal when the drift appears or changes, not per call.
+
+    A client that retries a rejected write — an agent will — would otherwise get
+    one line per attempt for a condition that only clears on restart, which is
+    the same flood ``_log_stale_library_errors`` exists to avoid. The neighbours
+    (``_mcp_peer_writer_refusal``, ``_mcp_sqlite_integrity_refusal``) log nothing
+    at all on refusal; this logs once, because unlike theirs this condition has
+    no other place an operator would notice it.
+    """
+    global _stale_library_reported_drift
+
+    with _stale_library_log_lock:
+        if drift == _stale_library_reported_drift:
+            return
+        _stale_library_reported_drift = [dict(entry) for entry in drift]
+
+    logger.warning(
+        "Refusing writes: this server is running code that is no longer installed (%s)", described
+    )
+
+
+def _read_installed_dist_versions(search_path: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Read the watched distributions' versions from ``search_path``.
+
+    Returns ``(versions, errors)``. Three states, not two, and the caller has to
+    keep them apart: a distribution that is simply not installed is absent from
+    both maps, which reads as uninstalled and is the strongest form of drift
+    there is; one whose metadata could not be read is recorded in ``errors`` and
+    left uncompared. Collapsing the second into the first would refuse every
+    write over a filesystem fault, on an install where nothing is stale.
+
+    ``importlib.metadata`` gives us no help telling them apart: it suppresses
+    the failure at both levels it reads, the file (``read_text``) and the
+    directory (``FastPath.children``), so a fault arrives as an empty version or
+    as no distribution at all. Both are recovered here rather than trusted.
+    """
+    from importlib.metadata import DistributionFinder, MetadataPathFinder
+
+    versions: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    finder = MetadataPathFinder()
+    # importlib.metadata memoizes each search root's directory listing against
+    # that root's mtime (``FastPath.search`` -> ``self.lookup(self.mtime)``), and
+    # that mtime is read in whole-ish seconds rather than the nanoseconds the
+    # fingerprint above compares. A removal and a creation that both land inside
+    # one timestamp tick therefore leave the memo answering from the listing
+    # taken before them, naming the dist-info the upgrade has already deleted.
+    # Its version then reads as empty, which this function records as unreadable
+    # and the caller leaves uncompared — the gate switching itself off for that
+    # distribution, permanently, since nothing here writes to the root to move
+    # its mtime again. That is the exact upgrade this gate exists to catch, so
+    # the memo is dropped instead of trusted. It costs one relisting per real
+    # change: this function is only reached when the fingerprint has already
+    # moved.
+    #
+    # Called on the instance rather than the class: before 3.11 it is not a
+    # classmethod, so ``MetadataPathFinder.invalidate_caches()`` is a TypeError
+    # on the 3.9 in CI.
+    try:
+        finder.invalidate_caches()
+    except Exception:
+        # Best effort by construction. Dropping a cache sharpens the reading; it
+        # is never what the reading depends on. A finder that cannot do it is
+        # still asked for the versions below, and still allowed to fail there,
+        # where the three states are told apart.
+        logger.debug("stale-library metadata cache could not be invalidated", exc_info=True)
+    # Probed only if something turns up missing: it costs a listing of every
+    # search root, and on a healthy installation nothing reaches that branch.
+    blocked: "list[str] | None" = None
+
+    for dist in _STALE_LIBRARY_WATCHED_DISTS:
+        try:
+            context = DistributionFinder.Context(name=dist, path=list(search_path))
+            found = next(iter(finder.find_distributions(context)), None)
+            raw = "" if found is None else str(found.version or "")
+        except Exception:
+            # Fail open — an unreadable metadata directory must not take the
+            # server down — but never silently: with the version unknown this
+            # gate cannot protect that distribution at all, and an operator has
+            # to be able to see that from mempalace_status. The reason is kept
+            # generic because it is quoted back to the client, and an OSError
+            # carries the full path it failed on; the detail goes to the log.
+            errors[dist] = "installed metadata could not be read"
+            logger.debug("stale-library metadata read failed for %s", dist, exc_info=True)
+            continue
+
+        if found is None:
+            if blocked is None:
+                blocked = _unlistable_search_entries(search_path)
+            if blocked:
+                # Nothing was found, but a search root would not open, and an
+                # unopenable root looks exactly like an empty one from here.
+                # Reporting this as uninstalled is what would refuse writes on
+                # a healthy install, so it is left uncompared instead.
+                errors[dist] = "distribution search path unreadable"
+                continue
+            # Genuinely absent from a path we could read end to end.
+            continue
+        if not raw:
+            # Present, but its version could not be read. importlib.metadata
+            # swallows PermissionError, FileNotFoundError, IsADirectoryError,
+            # NotADirectoryError and KeyError inside read_text, so a metadata
+            # file that is unreadable, missing or truncated arrives here as an
+            # empty version rather than as an exception.
+            errors[dist] = "version unreadable in installed metadata"
+            continue
+        if not _VERSION_TEXT_RE.match(raw):
+            errors[dist] = "malformed version metadata"
+            continue
+        versions[dist] = raw
+
+    return versions, errors
+
+
+def _installed_dist_state() -> tuple[dict[str, str], dict[str, str]]:
+    """``(versions, errors)`` for the watched distributions, read together.
+
+    One reader call, one cache generation. Reading the versions and the errors
+    separately let a caller pair a version map from one generation with an error
+    map from another, and both mixtures are wrong: one invents drift on an
+    installation where nothing changed, the other hides real drift behind an
+    error recorded a moment later.
+
+    A reading that produced errors is never memoized. The fingerprint is built
+    from stat data, and a permission change moves none of it, so caching a
+    failed reading would keep the gate answering from that failure long after
+    the cause was repaired. The cost of that is a full reread per call for as
+    long as a fault lasts, which is why the logging of it is deduplicated.
+    """
+    search_path = _dist_search_path()
+    signature = _dist_search_signature(search_path)
+
+    with _stale_library_cache_lock:
+        if _stale_library_cache["signature"] == signature:
+            return dict(_stale_library_cache["versions"]), dict(_stale_library_cache["errors"])
+
+    versions, errors = _read_installed_dist_versions(search_path)
+    _log_stale_library_errors(errors)
+
+    with _stale_library_cache_lock:
+        if errors:
+            # Left empty rather than filled with this reading: a slot keyed on a
+            # signature of None is never matched again, so storing the maps here
+            # would be a write nothing can read.
+            _stale_library_cache.update(signature=None, versions={}, errors={})
+        else:
+            _stale_library_cache.update(signature=signature, versions=versions, errors=errors)
+    return dict(versions), dict(errors)
+
+
+# Baseline: what was installed at the moment this module was imported, which is
+# the moment the code being served was loaded. Every watched distribution is
+# already in sys.modules by now — mempalace by definition, chromadb through the
+# unconditional `from chromadb.errors import NotFoundError as _ChromaNotFoundError`
+# above — so this snapshot describes the code actually running.
+#
+# Both sides of the comparison are therefore read the same way, from the same
+# metadata, and that is what keeps the gate honest. Comparing a live
+# `module.__version__` against installed metadata would instead drift apart on
+# its own: an editable checkout (`uv sync --extra dev`, the setup CONTRIBUTING
+# documents) moves version.py on every `git pull` while the recorded metadata
+# stays put, and chromadb hardcodes its own `__version__` literal, which a
+# repackaged build (conda, distro, `1.5.7+corp1`) can spell differently from
+# its metadata. Either would refuse every write on an installation where
+# nothing whatsoever is stale.
+#
+# Preserved across importlib.reload via globals(), like _logging_configured
+# above: a reload re-executes this module body but leaves sys.modules alone, so
+# the chromadb this server is serving is still the one loaded at startup.
+# Recomputing the baseline there would adopt the newly-installed version as
+# "what we are serving" and disarm the gate for the library the reload did not
+# actually replace.
+def _initial_dist_state() -> tuple[dict[str, str], dict[str, str]]:
+    """The baseline reading, which must never stop this module from importing.
+
+    Every other call into the gate happens inside a request and fails open
+    there. This one happens at import: an exception escaping it would abort the
+    import and the server would not start at all, which is a far worse outcome
+    than a gate that stays switched off for the life of the process.
+    """
+    try:
+        return _installed_dist_state()
+    except Exception:
+        logger.warning(
+            "stale-library baseline could not be read; the gate is inactive", exc_info=True
+        )
+        return {}, {}
+
+
+_STARTUP_DIST_STATE: tuple = globals().get("_STARTUP_DIST_STATE") or _initial_dist_state()
+_STARTUP_DIST_VERSIONS: dict[str, str] = _STARTUP_DIST_STATE[0]
+# Watched distributions whose metadata could not be read at import have no
+# baseline and can never be compared. That is the gate silently off for them,
+# so it is kept and reported rather than discarded.
+_STARTUP_DIST_ERRORS: dict[str, str] = _STARTUP_DIST_STATE[1]
+
+
+def _stale_library_report() -> tuple[list[dict], dict[str, str]]:
+    """``(drift, unreadable)``: what the gate found, from one metadata reading.
+
+    ``drift`` lists the watched distributions whose installed version moved
+    since startup; ``unreadable`` those whose metadata could not be read and
+    which are therefore not being compared at all. Both come out of a single
+    ``_installed_dist_state()`` call because they are two halves of one answer:
+    reading them separately would let a refusal be decided against one cache
+    generation and explained by another, which is how a status report ends up
+    naming a package as both drifted and uncompared.
+
+    Nothing is latched: rolling an install back to the version this process
+    started with leaves nothing stale, and a metadata read that lands
+    mid-upgrade (files half replaced) corrects itself on the next call instead
+    of wedging the server.
+
+    Never raises. This runs in request preflight, ahead of the dispatcher's own
+    error handling, and an exception here would leave the client waiting on a
+    reply that is never written.
+    """
+    try:
+        installed, unreadable = _installed_dist_state()
+        drift = []
+        for dist, startup_version in sorted(_STARTUP_DIST_VERSIONS.items()):
+            if dist in unreadable:
+                # The version could not be read at all, which is not evidence
+                # that the distribution went away. Refusing writes on a
+                # transient metadata failure would turn a filesystem hiccup
+                # into an outage, so this stays open and reports the gap
+                # through mempalace_status instead.
+                continue
+            # Absent now, present at startup, is the strongest form of this:
+            # the code being served is not merely a different version, it is a
+            # version that is no longer installed at all. `pipx install
+            # --force` and `uv tool upgrade` rebuild the environment rather
+            # than rewriting metadata in place, so this is the shape the common
+            # upgrade paths actually take. A distribution that was already
+            # absent at startup never enters this loop and stays uncompared.
+            current = installed.get(dist, _UNINSTALLED)
+            if current != startup_version:
+                drift.append({"package": dist, "serving": startup_version, "installed": current})
+        return drift, unreadable
+    except Exception:
+        # Fail open rather than refuse every write on a bug in the gate itself.
+        logger.warning("stale-library check failed; allowing the call", exc_info=True)
+        return [], {}
+
+
+def _stale_library_payload() -> dict:
+    """``mempalace_status`` view of the gate, so the state is diagnosable."""
+    drift, errors = _stale_library_report()
+    payload = {
+        "stale": bool(drift),
+        "serving": dict(_STARTUP_DIST_VERSIONS),
+        "packages": drift,
+    }
+    # Everything the gate is NOT covering, in one place. A distribution with no
+    # baseline is the quietest case of all: it was never resolvable when this
+    # process started, so nothing about it is compared and nothing about it
+    # would otherwise appear here — leaving "stale: false" to be read as
+    # "checked and fine" when it means "not checked at all".
+    inactive = dict(errors)
+    for dist in _STALE_LIBRARY_WATCHED_DISTS:
+        if dist not in _STARTUP_DIST_VERSIONS:
+            inactive.setdefault(
+                dist,
+                _STARTUP_DIST_ERRORS.get(
+                    dist, "no baseline: not resolved when this server started"
+                ),
+            )
+    if inactive:
+        payload["unreadable"] = inactive
+    if drift and _truthy_env(_MCP_ALLOW_STALE_LIBRARY_ENV):
+        payload["gate_disabled_by"] = _MCP_ALLOW_STALE_LIBRARY_ENV
+    return payload
+
+
+def _mcp_stale_library_refusal(req_id, tool_name: str):
+    """Refuse mutating tools once the served code is no longer what is installed (#899).
+
+    Reads stay available on purpose: the palace itself is intact at this point,
+    and a user who has just been told to restart still needs ``status`` and
+    ``search`` to see what state their memory is in. Only the writes are
+    stopped, because those are what a superseded library would persist in a
+    format the newly-installed one may not read back.
+
+    Restarting the server is the only remedy — ``mempalace_reconnect`` reopens
+    the database but cannot reload Python modules — so the hint says so.
+    """
+    if tool_name not in _MUTATING_TOOLS:
+        return None
+
+    if _truthy_env(_MCP_ALLOW_STALE_LIBRARY_ENV):
+        return None
+
+    drift, _unreadable = _stale_library_report()
+    if not drift:
+        return None
+
+    described = ", ".join(
+        f"{entry['package']} {entry['serving']} -> {entry['installed']}" for entry in drift
+    )
+    _log_stale_library_drift(drift, described)
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _STALE_LIBRARY_ERROR_CODE,
+            "message": (
+                "Server is running a library version that is no longer installed "
+                f"({described}); refusing writes until it is restarted"
+            ),
+            "data": {
+                "tool": tool_name,
+                "packages": drift,
+                "action_required": "restart_mcp_server",
+                # Named as a field, not only in the prose below, so a client can
+                # find it without parsing English. The peer-writer gate spells
+                # the same idea the same way.
+                "override_env": _MCP_ALLOW_STALE_LIBRARY_ENV,
+                "hint": (
+                    "The package was upgraded after this server started, so it is "
+                    "still serving the previous code. Restart the MCP server (or the "
+                    "host application that spawned it) to pick up the installed "
+                    "version. mempalace_reconnect reopens the palace but cannot "
+                    "reload Python modules, so it will not clear this. An operator "
+                    "who wants writes to continue across upgrades can set "
+                    f"{_MCP_ALLOW_STALE_LIBRARY_ENV}=1 in the server's environment "
+                    "before it starts."
+                ),
+            },
+        },
+    }
+
+
 def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     """Run MCP request preflight gates outside handle_request complexity."""
 
@@ -4964,9 +5580,23 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     if read_only_error is not None:
         return read_only_error
 
+    # Corruption outranks staleness: a malformed palace is the more severe and
+    # more actionable condition, and reporting the stale library first would
+    # replace the -32002 message that tells the user to repair it.
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
+
+    # Staleness outranks a diverged index: the diverged gate's remedy is to run
+    # `mempalace repair rebuild-index`, which would execute the INSTALLED code
+    # against a palace this server is still writing with the superseded one.
+    # Restarting has to come first, and it also un-gates the index check for
+    # free — the probe re-runs per call. Ordering this way also skips the
+    # diverged gate's _refresh_vector_disabled_flag() read on a call that is
+    # refused either way.
+    stale_library_error = _mcp_stale_library_refusal(req_id, tool_name)
+    if stale_library_error is not None:
+        return stale_library_error
 
     diverged_index_error = _mcp_diverged_index_refusal(req_id, tool_name)
     if diverged_index_error is not None:
@@ -4980,6 +5610,7 @@ def _decorate_mcp_tool_result(tool_name: str, result):
 
     if tool_name == "mempalace_status" and isinstance(result, dict):
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
+        result.setdefault("library_versions", _stale_library_payload())
 
     return result
 

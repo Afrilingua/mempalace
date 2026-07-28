@@ -186,14 +186,47 @@ def _paginate_ids(col, where=None):
         except Exception:
             try:
                 r = col.get(where=where, include=[], limit=page)
-                new_ids = [i for i in r["ids"] if i not in set(ids)]
-                if not new_ids:
-                    break
-                ids.extend(new_ids)
-                offset += len(new_ids)
-                continue
             except Exception:
                 break
+            new_ids = [i for i in r["ids"] if i not in set(ids)]
+            if not new_ids:
+                # Offset is broken and the no-offset fallback always
+                # re-fetches the same first `page` results, so it can never
+                # advance past that boundary. Landing exactly on that
+                # boundary (len(ids) >= page) is ambiguous from the fetched
+                # page alone: it could mean "collection has exactly `page`
+                # ids, genuinely complete" or "collection has more and we
+                # are truncating" -- those two states are indistinguishable
+                # without an authoritative count. Disambiguate against the
+                # collection's own count() (same pattern already used by
+                # _verify_collection_count in this file; shares its known
+                # native-crash-surface caveat on a corrupted collection,
+                # which is out of scope for this fix -- see the deferred
+                # HNSW-preflight-sweep work).
+                # This raise is intentionally OUTSIDE the narrow try/except
+                # above so it propagates instead of being swallowed as a
+                # get()-failure.
+                if len(ids) >= page and len(r["ids"] or []) >= page:
+                    try:
+                        total = col.count()
+                    except Exception:
+                        total = None
+                    if total is None or total > len(ids):
+                        raise RuntimeError(
+                            f"_paginate_ids: offset-based pagination failed "
+                            f"and the no-offset fallback cannot advance past "
+                            f"the first {page} results ({len(ids)} collected, "
+                            f"collection reports "
+                            f"{total if total is not None else 'an unreadable'} "
+                            f"total). Refusing to return a silently truncated "
+                            f"ID list -- investigate the collection, or use a "
+                            f"repair mode that does not depend on offset "
+                            f"paging (e.g. --mode from-sqlite)."
+                        )
+                break
+            ids.extend(new_ids)
+            offset += len(new_ids)
+            continue
         n = len(r["ids"]) if r["ids"] else 0
         if n == 0:
             break
@@ -311,11 +344,71 @@ def _rebuild_collection_via_temp(
             pass
         return rebuilt
     except Exception as exc:
-        try:
-            _delete_collection_if_exists(backend, palace_path, temp_name)
-        except Exception:
-            pass
-        raise RebuildCollectionError(str(exc), live_replaced=live_replaced) from exc
+        if not live_replaced:
+            # The live collection was never touched -- the temp build is a
+            # discardable in-progress copy, safe to clean up on failure.
+            try:
+                _delete_collection_if_exists(backend, palace_path, temp_name)
+            except Exception:
+                pass
+            raise RebuildCollectionError(str(exc), live_replaced=live_replaced) from exc
+        # The live collection was already deleted (line 294) before this
+        # failure. `temp_name` is now the ONLY intact, verified copy of the
+        # data left on disk -- never delete it here (#8). Point the operator
+        # at it instead of destroying the one thing that can still recover.
+        raise RebuildCollectionError(
+            f"{exc}. The live collection '{collection_name}' was already "
+            f"replaced and the re-upload into it failed. The fully-verified "
+            f"pre-swap copy survives under '{temp_name}' -- do NOT delete it. "
+            f"Recover by removing the broken '{collection_name}' collection "
+            f"and promoting '{temp_name}' in its place.",
+            live_replaced=live_replaced,
+        ) from exc
+
+
+def _promote_temp_collection(
+    backend,
+    palace_path: str,
+    temp_name: str,
+    collection_name: str,
+    expected: int,
+    batch_size: int,
+    progress=print,
+) -> int:
+    """Recover a failed live-swap by promoting the verified temp copy.
+
+    `_rebuild_collection_via_temp` fully verifies `temp_name` before it ever
+    touches the live collection. If the post-swap re-upload into a fresh live
+    collection then fails, the honest recovery is to copy directly from that
+    verified temp copy -- NOT to restore a pre-rebuild sqlite3 file backup,
+    whose on-disk HNSW segment directories were already destroyed by the
+    live-collection delete and would leave the palace referencing segment
+    UUIDs that no longer exist on disk (#8).
+    """
+    temp_col = backend.get_collection(palace_path, temp_name)
+    ids, docs, metas = _extract_drawers(temp_col, expected, batch_size)
+    _delete_collection_if_exists(backend, palace_path, collection_name)
+    new_col = backend.create_collection(palace_path, collection_name)
+    promoted = 0
+    for i in range(0, len(ids), batch_size):
+        new_col.upsert(
+            documents=docs[i : i + batch_size],
+            ids=ids[i : i + batch_size],
+            metadatas=metas[i : i + batch_size],
+        )
+        promoted += len(ids[i : i + batch_size])
+        progress(f"  Promoted {promoted}/{expected} drawers from verified temp copy...")
+    _verify_collection_count(new_col, expected, "promoted temp collection")
+    # Promotion has already fully succeeded and verified at this point --
+    # cleaning up the now-redundant temp copy is best-effort, matching the
+    # identical post-success cleanup in _rebuild_collection_via_temp above.
+    # A failure here (e.g. a transient Windows file lock) must not turn a
+    # successful recovery into a reported failure.
+    try:
+        _delete_collection_if_exists(backend, palace_path, temp_name)
+    except Exception:
+        pass
+    return promoted
 
 
 def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str] = None):
@@ -1078,18 +1171,35 @@ def rebuild_index(
     except RebuildCollectionError as e:
         progress(f"\n  ERROR during rebuild: {e}")
         progress("  Rebuild aborted before completion.")
-        if e.live_replaced and os.path.exists(backup_path):
-            progress(f"  Restoring from backup: {backup_path}")
+        if e.live_replaced:
+            # Restoring the pre-rebuild chroma.sqlite3 file here would be
+            # misleading: the live collection's on-disk HNSW segment
+            # directories were already destroyed by the delete that
+            # preceded this failure, so a sqlite-only restore leaves the
+            # palace referencing segment UUIDs that no longer exist (#8).
+            # The verified good copy is the temp collection instead --
+            # promote it directly.
+            temp_name = f"{collection_name}__repair_tmp"
+            progress(f"  Attempting recovery: promoting verified copy from '{temp_name}'...")
             try:
                 _close_chroma_handles(palace_path, backend=backend)
-                _delete_collection_if_exists(backend, palace_path, collection_name)
-                _copy_file_no_follow(backup_path, sqlite_path, replace=True)
-                progress("  Backup restored. Palace is back to pre-repair state.")
-            except Exception as restore_error:
-                progress(f"  Backup restore failed: {restore_error}")
-                progress(f"  Manual restore required from: {backup_path}")
-        elif e.live_replaced:
-            progress("  No backup available. Re-mine from source files to recover.")
+                _promote_temp_collection(
+                    backend,
+                    palace_path,
+                    temp_name,
+                    collection_name,
+                    len(all_ids),
+                    batch_size,
+                    progress=progress,
+                )
+                progress("  Recovery succeeded: live collection restored from the verified temp copy.")
+            except Exception as promote_error:
+                progress(f"  Automatic recovery failed: {promote_error}")
+                progress(
+                    f"  The verified pre-swap copy still survives under '{temp_name}' -- "
+                    f"do NOT delete it. Recover manually by promoting it, or re-mine "
+                    f"from source files."
+                )
         else:
             print("  Live collection was not replaced; leaving the original palace untouched.")
         raise

@@ -1192,7 +1192,9 @@ def rebuild_index(
                     batch_size,
                     progress=progress,
                 )
-                progress("  Recovery succeeded: live collection restored from the verified temp copy.")
+                progress(
+                    "  Recovery succeeded: live collection restored from the verified temp copy."
+                )
             except Exception as promote_error:
                 progress(f"  Automatic recovery failed: {promote_error}")
                 progress(

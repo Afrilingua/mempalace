@@ -1067,9 +1067,14 @@ def test_rebuild_collection_via_temp_preserves_temp_when_live_replaced_and_reupl
     assert "live upsert failed" in str(excinfo.value)
     assert excinfo.value.live_replaced is True
     # The temp collection must never be deleted once it is the only good copy.
-    assert call("/palace", "mempalace_drawers__repair_tmp") not in mock_backend.delete_collection.call_args_list[1:]
+    assert (
+        call("/palace", "mempalace_drawers__repair_tmp")
+        not in mock_backend.delete_collection.call_args_list[1:]
+    )
     assert mock_backend.delete_collection.call_args_list == [
-        call("/palace", "mempalace_drawers__repair_tmp"),  # pre-existing stale temp, cleaned before staging
+        call(
+            "/palace", "mempalace_drawers__repair_tmp"
+        ),  # pre-existing stale temp, cleaned before staging
         call("/palace", "mempalace_drawers"),  # the actual live-collection swap
     ]
     # The error must point the operator at the surviving good copy.

@@ -1750,6 +1750,51 @@ def test_extract_via_sqlite_missing_palace_yields_nothing(tmp_path):
     assert list(repair.extract_via_sqlite(str(empty), "mempalace_drawers")) == []
 
 
+def test_extract_via_sqlite_yields_rows_with_zero_metadata_rows(tmp_path):
+    """A drawer whose embedding has ZERO rows in ``embedding_metadata``
+    (no ``chroma:document``, no other key) must still be yielded, not
+    silently dropped.
+
+    This is the same "sparse historical write" condition ``_extract_drawers``
+    already sanitizes for the collection-layer rebuild path (see the
+    ``sanitized_metas`` comment above, and #1458) — current chromadb
+    validates against empty metadata on write, so this only happens to
+    rows already sitting in an older palace. Modeled here by seeding a
+    real chromadb collection, then stripping one drawer's metadata rows
+    directly via SQLite, mirroring how such a row actually looks on disk.
+
+    An INNER JOIN driven from ``embedding_metadata`` can never see a row
+    with zero metadata rows: it must be driven from ``embeddings`` instead.
+    """
+    rows = [
+        ("drawer_ok", "normal document", {"wing": "w"}),
+        ("drawer_sparse", "will lose all its metadata rows", {"wing": "w"}),
+    ]
+    _seed_palace(tmp_path, "mempalace_drawers", rows)
+
+    sqlite_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        emb_row = conn.execute(
+            "SELECT id FROM embeddings WHERE embedding_id = ?", ("drawer_sparse",)
+        ).fetchone()
+        assert emb_row is not None, "seed helper didn't create the expected embedding row"
+        conn.execute("DELETE FROM embedding_metadata WHERE id = ?", (emb_row[0],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    extracted = list(repair.extract_via_sqlite(str(tmp_path), "mempalace_drawers"))
+    ids = {emb_id for emb_id, _doc, _meta in extracted}
+
+    assert "drawer_sparse" in ids, (
+        "extract_via_sqlite silently dropped a drawer with zero "
+        "embedding_metadata rows — the INNER JOIN starting at "
+        "embedding_metadata structurally excludes it"
+    )
+    assert "drawer_ok" in ids
+
+
 def test_rebuild_from_sqlite_roundtrips_via_real_chromadb(tmp_path):
     """End-to-end: seed source palace, rebuild into a fresh dest, then
     open dest with a fresh ChromaBackend and verify ``count()`` and

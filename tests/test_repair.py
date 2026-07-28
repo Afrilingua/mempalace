@@ -79,7 +79,7 @@ def test_paginate_ids_offset_exception_fallback():
 
 
 def test_paginate_ids_offset_broken_over_page_size_raises_instead_of_truncating():
-    """#12: when offset is broken, the no-offset fallback is structurally
+    """When offset is broken, the no-offset fallback is structurally
     stuck at the first `page` (1000) results, and the collection's own
     count() confirms there really are MORE ids than that (a genuinely
     truncated case) -- silently returning a truncated ID list is worse than
@@ -854,7 +854,7 @@ def test_rebuild_index_stage_failure_leaves_live_collection_untouched(
 @patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_copy, tmp_path):
-    """#8: when the live swap fails after the delete, recovery must PROMOTE
+    """When the live swap fails after the delete, recovery must PROMOTE
     the verified temp copy (not restore a sqlite-only file backup, whose
     on-disk HNSW segments are already gone)."""
     sqlite_path = tmp_path / "chroma.sqlite3"
@@ -962,7 +962,7 @@ def test_rebuild_index_live_delete_missing_still_restores_backup(
 def test_rebuild_index_restore_failure_preserves_original_error(
     mock_backend_cls, mock_copy, tmp_path, capsys
 ):
-    """#8: if even the temp-promotion recovery fails, the ORIGINAL rebuild
+    """If even the temp-promotion recovery fails, the ORIGINAL rebuild
     error must still be what's raised, and the message must point the
     operator at the still-surviving verified temp copy -- never silently
     lose track of it."""
@@ -1040,7 +1040,7 @@ def test_rebuild_collection_via_temp_keeps_original_error_when_cleanup_fails(
 def test_rebuild_collection_via_temp_preserves_temp_when_live_replaced_and_reupload_fails(
     mock_backend_cls,
 ):
-    """#8: once the live collection is deleted (live_replaced=True), the
+    """Once the live collection is deleted (live_replaced=True), the
     verified temp copy is the ONLY intact data left. A failure re-uploading
     into the fresh live collection must NOT delete the temp copy -- it must
     survive so the operator can recover from it."""
@@ -1077,7 +1077,7 @@ def test_rebuild_collection_via_temp_preserves_temp_when_live_replaced_and_reupl
 
 
 def test_promote_temp_collection_reads_from_temp_not_broken_live():
-    """Direct unit test for #8's recovery helper. Two mutations a future
+    """Direct unit test for the temp-promotion recovery helper. Two mutations a future
     refactor could introduce would silently corrupt recovered data and must
     be caught here, not only via a weaker 'was upsert called at all' check:
     (1) reading the source from the wrong collection name, (2) swapping the

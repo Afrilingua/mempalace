@@ -354,7 +354,7 @@ def _rebuild_collection_via_temp(
             raise RebuildCollectionError(str(exc), live_replaced=live_replaced) from exc
         # The live collection was already deleted (line 294) before this
         # failure. `temp_name` is now the ONLY intact, verified copy of the
-        # data left on disk -- never delete it here (#8). Point the operator
+        # data left on disk -- never delete it here. Point the operator
         # at it instead of destroying the one thing that can still recover.
         raise RebuildCollectionError(
             f"{exc}. The live collection '{collection_name}' was already "
@@ -383,7 +383,7 @@ def _promote_temp_collection(
     verified temp copy -- NOT to restore a pre-rebuild sqlite3 file backup,
     whose on-disk HNSW segment directories were already destroyed by the
     live-collection delete and would leave the palace referencing segment
-    UUIDs that no longer exist on disk (#8).
+    UUIDs that no longer exist on disk.
     """
     temp_col = backend.get_collection(palace_path, temp_name)
     ids, docs, metas = _extract_drawers(temp_col, expected, batch_size)
@@ -1176,7 +1176,7 @@ def rebuild_index(
             # misleading: the live collection's on-disk HNSW segment
             # directories were already destroyed by the delete that
             # preceded this failure, so a sqlite-only restore leaves the
-            # palace referencing segment UUIDs that no longer exist (#8).
+            # palace referencing segment UUIDs that no longer exist.
             # The verified good copy is the temp collection instead --
             # promote it directly.
             temp_name = f"{collection_name}__repair_tmp"

@@ -177,6 +177,20 @@ def _install_mock_backend(mock_backend_cls, collection):
     return mock_backend
 
 
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_scan_palace_aborts_on_hnsw_divergence(mock_backend_cls, mock_capacity, tmp_path):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222) -- a try/except cannot save it. scan_palace must never reach
+    ChromaBackend().get_collection()/count() when hnsw_capacity_status
+    reports divergence (#91)."""
+    mock_capacity.return_value = {"diverged": True, "message": "test divergence"}
+    good, bad = repair.scan_palace(palace_path=str(tmp_path))
+    assert good == set()
+    assert bad == set()
+    mock_backend_cls.assert_not_called()
+
+
 @patch("mempalace.repair.ChromaBackend")
 def test_scan_palace_no_ids(mock_backend_cls, tmp_path):
     mock_col = MagicMock()
@@ -248,6 +262,18 @@ def test_scan_palace_with_wing_filter(mock_backend_cls, tmp_path):
 
 
 # ── prune_corrupt ─────────────────────────────────────────────────────
+
+
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_prune_corrupt_aborts_on_hnsw_divergence(mock_backend_cls, mock_capacity, tmp_path):
+    """Same guard as scan_palace: a failed purge attempt against a
+    diverged segment must never reach count()/delete() (#91)."""
+    bad_file = tmp_path / "corrupt_ids.txt"
+    bad_file.write_text("bad1\n")
+    mock_capacity.return_value = {"diverged": True, "message": "test divergence"}
+    repair.prune_corrupt(palace_path=str(tmp_path), confirm=True)
+    mock_backend_cls.assert_not_called()
 
 
 @patch("mempalace.repair.ChromaBackend")
@@ -385,6 +411,71 @@ def test_rebuild_index_success(mock_backend_cls, mock_copy, tmp_path):
     mock_temp_col.upsert.assert_called_once()
     mock_new_col.upsert.assert_called_once()
     mock_new_col.add.assert_not_called()
+
+
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_aborts_on_hnsw_divergence_preflight(
+    mock_backend_cls, mock_capacity, tmp_path
+):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222); rebuild_index's legacy path -- the one the CLI's rebuild-index
+    subcommand dispatches straight to -- must preflight divergence before
+    ever opening the collection, not just wrap count() in except Exception
+    (#10)."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+    mock_capacity.return_value = {"diverged": True, "message": "test divergence"}
+    msgs: list[str] = []
+    repair.rebuild_index(palace_path=str(tmp_path), progress=msgs.append)
+    mock_backend_cls.assert_not_called()
+    assert "diverged" in "\n".join(msgs).lower()
+
+
+@patch("mempalace.repair._copy_file_no_follow")
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_warns_when_closets_still_diverged(
+    mock_backend_cls, mock_capacity, mock_copy, tmp_path, capsys
+):
+    """rebuild_index only ever rebuilds the drawers collection passed to
+    it; if closets is still diverged afterward, the printed summary must
+    say so instead of an unqualified 'Repair complete', since closets is
+    just as capable of crashing reads via the same #1222 mechanism (#13)."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    # First call: drawers preflight (not diverged, rebuild proceeds).
+    # Second call: post-rebuild closets check (still diverged).
+    mock_capacity.side_effect = [
+        {"diverged": False, "message": ""},
+        {"diverged": True, "message": "closets still diverged"},
+    ]
+
+    repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "Repair complete" in out
+    assert "closets" in out.lower()
+    assert "closets still diverged" in out
 
 
 @patch("mempalace.repair._copy_file_no_follow")

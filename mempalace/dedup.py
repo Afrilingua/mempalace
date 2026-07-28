@@ -50,12 +50,29 @@ def _get_palace_path():
         return os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
 
 
-def get_source_groups(col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None, wing=None):
+def get_source_groups(
+    col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None, wing=None, palace_path=None
+):
     """Group drawers by source_file, return groups with min_count+ entries.
 
     If wing is specified, only considers drawers in that wing. This catches
     cross-wing duplicates when the same source was mined into multiple wings.
+
+    ``palace_path``, when passed, preflights HNSW divergence before count():
+    a diverged segment can hit the #1222 SIGSEGV/panic class, which a
+    try/except around count() cannot catch. Omitted by existing callers
+    that don't have a palace_path handy (e.g. tests) -- the check is simply
+    skipped in that case, matching this function's pre-existing behavior.
     """
+    if palace_path is not None:
+        from .backends.chroma import hnsw_capacity_status
+
+        capacity_info = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+        if capacity_info.get("diverged"):
+            print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+            print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
+            return {}
+
     total = col.count()
     groups = defaultdict(list)
 
@@ -134,7 +151,7 @@ def show_stats(palace_path=None):
     palace_path = palace_path or _get_palace_path()
     col = get_collection(palace_path, COLLECTION_NAME)
 
-    groups = get_source_groups(col)
+    groups = get_source_groups(col, palace_path=palace_path)
 
     total_drawers = sum(len(ids) for ids in groups.values())
     print(f"\n  Sources with {MIN_DRAWERS_TO_CHECK}+ drawers: {len(groups)}")
@@ -174,7 +191,7 @@ def dedup_palace(
 
     if wing:
         print(f"  Wing: {wing}")
-    groups = get_source_groups(col, min_count, source_pattern, wing=wing)
+    groups = get_source_groups(col, min_count, source_pattern, wing=wing, palace_path=palace_path)
     print(f"\n  Sources to check: {len(groups)}")
 
     t0 = time.time()

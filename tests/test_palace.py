@@ -5,7 +5,11 @@ import chromadb
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
-from mempalace.palace import _metadata_matches_extract_mode, _open_collection_or_explain, get_collection
+from mempalace.palace import (
+    _metadata_matches_extract_mode,
+    _open_collection_or_explain,
+    get_collection,
+)
 
 
 def _capture():

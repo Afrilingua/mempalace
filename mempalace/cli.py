@@ -1114,6 +1114,7 @@ def cmd_repair(args):
         _close_chroma_handles,
         _extract_drawers,
         _post_rebuild_cleanup,
+        _promote_temp_collection,
         _rebuild_collection_via_temp,
         check_extraction_safety,
         index_read_recovery_guidance,
@@ -1307,19 +1308,27 @@ def cmd_repair(args):
     except RebuildCollectionError as e:
         print(f"  Repair failed: {e}")
         if getattr(e, "live_replaced", False):
-            print("  Live collection was already replaced; restoring from backup...")
+            temp_name = f"{collection_name}__repair_tmp"
+            print(f"  Attempting recovery: promoting verified copy from '{temp_name}'...")
             try:
                 _close_chroma_handles(palace_path, backend=backend)
-                if os.path.exists(palace_path):
-                    shutil.rmtree(palace_path)
-                shutil.copytree(backup_path, palace_path)
-                print(f"  Restore complete from backup: {backup_path}")
-            except Exception as restore_error:
-                print(f"  Automatic restore failed: {restore_error}")
-                print("  Manual recovery required:")
-                print(f"    1. Remove or rename the broken directory: {palace_path}")
-                print(f"    2. Restore the backup directory to: {palace_path}")
-                print(f"       Backup location: {backup_path}")
+                _promote_temp_collection(
+                    backend,
+                    palace_path,
+                    temp_name,
+                    collection_name,
+                    len(all_ids),
+                    batch_size,
+                    progress=print,
+                )
+                print("  Recovery succeeded: live collection restored from the verified temp copy.")
+            except Exception as promote_error:
+                print(f"  Automatic recovery failed: {promote_error}")
+                print(
+                    f"  The verified pre-swap copy still survives under '{temp_name}' -- do NOT "
+                    f"delete it. Recover manually by promoting it, or restore the full-directory "
+                    f"backup at: {backup_path}"
+                )
         sys.exit(1)
 
     # The bulk delete + re-upsert cycle above leaves the FTS5 inverted index

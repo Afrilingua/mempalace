@@ -1168,6 +1168,8 @@ def test_cmd_repair_uses_configured_collection(mock_config_cls, tmp_path, capsys
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp_path, capsys):
+    """When the live swap fails after the delete, recovery must PROMOTE the
+    verified temp copy instead of restoring a sqlite-only file backup."""
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
@@ -1183,21 +1185,30 @@ def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp
     }
     mock_temp_col = MagicMock()
     mock_temp_col.count.return_value = 2
+    mock_promoted_col = MagicMock()
+    mock_promoted_col.count.return_value = 2
     mock_backend = _mock_backend_for(col=mock_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, RuntimeError("live build failed")]
+    mock_backend.create_collection.side_effect = [
+        mock_temp_col,
+        RuntimeError("live build failed"),
+        mock_promoted_col,
+    ]
     with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
         with pytest.raises(SystemExit) as excinfo:
             cmd_repair(args)
     out = capsys.readouterr().out
     assert excinfo.value.code == 1
     assert "Repair failed" in out
-    assert "restoring from backup" in out
+    assert "Attempting recovery: promoting verified copy" in out
+    assert "Recovery succeeded" in out
     mock_backend.close_palace.assert_called_once_with(str(palace_dir))
     assert mock_backend.delete_collection.call_args_list == [
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
-        call(str(palace_dir), "mempalace_drawers"),
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),  # pre-clean stale temp
+        call(str(palace_dir), "mempalace_drawers"),  # live delete before re-upload
+        call(str(palace_dir), "mempalace_drawers"),  # delete broken live before promotion
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),  # temp cleaned after promotion
     ]
+    assert mock_promoted_col.upsert.called
 
 
 def _repair_backend_mocks(mock_config_cls, palace_dir, create_collection_results=None):

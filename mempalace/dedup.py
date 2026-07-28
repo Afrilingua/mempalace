@@ -183,6 +183,19 @@ def dedup_palace(
 
     col = get_collection(palace_path, COLLECTION_NAME)
 
+    # Preflight HNSW divergence before this function's own count() print --
+    # get_source_groups's palace_path guard (added alongside this one) only
+    # covers its own internal count(), not this earlier one. count() on a
+    # diverged segment can hard-crash the process (#1222); a try/except
+    # cannot catch that, so it must never be reached at all when diverged.
+    from .backends.chroma import hnsw_capacity_status
+
+    capacity_info = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
+        return
+
     print(f"  Palace: {palace_path}")
     print(f"  Drawers: {col.count():,}")
     print(f"  Threshold: {threshold}")

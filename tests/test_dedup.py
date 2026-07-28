@@ -259,6 +259,26 @@ def test_dedup_palace_dry_run(mock_get_collection, mock_groups, mock_dedup_group
     mock_dedup_group.assert_called_once()
 
 
+@patch("mempalace.dedup.get_source_groups")
+@patch("mempalace.dedup.get_collection")
+def test_dedup_palace_aborts_on_hnsw_divergence(mock_get_collection, mock_groups, tmp_path):
+    """dedup_palace's OWN count() print (a few lines before it calls
+    get_source_groups) is a separate call site from #92 -- count() on a
+    diverged segment can hard-crash the process, so this print must never
+    be reached either when hnsw_capacity_status reports divergence."""
+    mock_col = MagicMock()
+    mock_col.count.side_effect = AssertionError("count() must not be called when diverged")
+    _install_mock_collection(mock_get_collection, mock_col)
+
+    with patch(
+        "mempalace.backends.chroma.hnsw_capacity_status",
+        return_value={"diverged": True, "message": "test divergence"},
+    ):
+        dedup.dedup_palace(palace_path=str(tmp_path), dry_run=True)
+
+    mock_groups.assert_not_called()
+
+
 @patch("mempalace.dedup.dedup_source_group")
 @patch("mempalace.dedup.get_source_groups")
 @patch("mempalace.dedup.get_collection")

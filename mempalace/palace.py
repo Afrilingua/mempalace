@@ -1214,10 +1214,26 @@ mine_global_lock = mine_palace_lock
 
 
 def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> bool:
+    """Scope a drawer to a convo-miner extraction mode.
+
+    A missing ``extract_mode`` is treated as a legacy exchange-mode row
+    ONLY when the drawer is otherwise convo_miner's own (no ``ingest_mode``
+    at all -- pre-``ingest_mode``-schema convo drawers -- or the convo
+    miner's own ``"convos"`` tag). A drawer from a different producer that
+    never set ``extract_mode`` because it was never meant to carry one --
+    e.g. the sweeper's ``ingest_mode="sweep"`` rows -- must not match: the
+    legacy-compat rule otherwise scoops every sweeper drawer for a shared
+    transcript into convo_miner's default "exchange" purge/idempotency
+    scope and silently deletes them on the very next re-mine (#104).
+    """
     if extract_mode is None:
         return True
     stored_mode = meta.get("extract_mode")
-    return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
+    if stored_mode == extract_mode:
+        return True
+    if stored_mode is not None:
+        return False
+    return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
 def file_already_mined(

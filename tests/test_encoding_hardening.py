@@ -75,7 +75,9 @@ class TestDialectConfigEncoding:
         _write_utf8_bytes(cfg, {"entities": {}, "skip_names": [UMLAUT_NAME]})
 
         loaded = Dialect.from_config(str(cfg))
-        assert UMLAUT_NAME in loaded.skip_names, (
+        # skip_names are normalized to lowercase on load; assert the umlaut
+        # survived the READ (u -> ü), independent of that casing.
+        assert UMLAUT_NAME.lower() in loaded.skip_names, (
             f"skip_name umlaut mangled on read: {loaded.skip_names!r}"
         )
 

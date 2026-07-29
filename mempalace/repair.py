@@ -186,8 +186,23 @@ def _paginate_ids(col, where=None):
         except Exception:
             try:
                 r = col.get(where=where, include=[], limit=page)
-            except Exception:
-                break
+            except Exception as fallback_exc:
+                # Both the offset request AND the no-offset fallback failed.
+                # Whatever is in ``ids`` so far is a partial (or empty) prefix
+                # of the collection, not a complete listing. Returning it
+                # would make scan_palace/rebuild act on a truncated palace as
+                # though it were whole (or, on the first page, print "Nothing
+                # to scan." for a palace we never actually read). The whole
+                # point of this path is to fail loudly rather than silently
+                # truncate, so raise instead of breaking.
+                raise RuntimeError(
+                    f"_paginate_ids: both offset-based pagination and the "
+                    f"no-offset fallback failed after collecting {len(ids)} "
+                    f"ids. Refusing to return a silently truncated ID list -- "
+                    f"investigate the collection, or use a repair mode that "
+                    f"does not depend on offset paging (e.g. --mode "
+                    f"from-sqlite). Underlying error: {fallback_exc}"
+                ) from fallback_exc
             new_ids = [i for i in r["ids"] if i not in set(ids)]
             if not new_ids:
                 # Offset is broken and the no-offset fallback always
@@ -203,10 +218,18 @@ def _paginate_ids(col, where=None):
                 # native-crash-surface caveat on a corrupted collection,
                 # which is out of scope for this fix -- see the deferred
                 # HNSW-preflight-sweep work).
+                #
+                # ``col.count()`` is collection-wide and takes no ``where``
+                # argument, so it is only authoritative when this call is
+                # UNFILTERED. With a ``where`` filter, a global count > the
+                # collected rows does NOT prove the filtered set is truncated
+                # (the extra rows may belong to other wings), so we cannot use
+                # it as proof and treat filtered completeness as unknown
+                # rather than raising a false-positive truncation error.
                 # This raise is intentionally OUTSIDE the narrow try/except
                 # above so it propagates instead of being swallowed as a
                 # get()-failure.
-                if len(ids) >= page and len(r["ids"] or []) >= page:
+                if where is None and len(ids) >= page and len(r["ids"] or []) >= page:
                     try:
                         total = col.count()
                     except Exception:

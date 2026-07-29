@@ -147,6 +147,62 @@ def test_paginate_ids_offset_broken_under_page_size_still_breaks_cleanly():
     assert ids == ["id1", "id2"]
 
 
+# ── _paginate_ids: double-failure + filtered-count (PR #2086 review) ───
+# fatkobra's CHANGES_REQUESTED on PR #2086: the truncation-detection fix
+# left two loud-failure gaps. The whole point of the fix is to refuse to
+# act on an incomplete palace, so both gaps must raise, not return a
+# partial/empty list, and the global count() must never be used as proof
+# of truncation for a *filtered* (where=) result.
+
+
+def test_paginate_ids_double_failure_after_progress_raises_not_partial():
+    """Offset get() fails, then the no-offset fallback ALSO fails, after at
+    least one page was already collected. The function must NOT return the
+    partial first page as if it were complete -- it must raise so callers
+    (scan_palace, rebuild) never treat a truncated palace as whole."""
+    col = MagicMock()
+    first_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        {"ids": first_page},  # page 1 lands normally via offset path
+        Exception("offset bug"),  # page 2 offset request fails
+        Exception("fallback also down"),  # no-offset fallback ALSO fails
+    ]
+    with pytest.raises(RuntimeError):
+        repair._paginate_ids(col)
+
+
+def test_paginate_ids_double_failure_on_first_page_raises_not_empty():
+    """Both the offset request and its no-offset fallback fail on the very
+    first page. Returning [] here is a silent lie -- scan_palace would print
+    'Nothing to scan.' on a palace it never actually read. Must raise."""
+    col = MagicMock()
+    col.get.side_effect = [
+        Exception("offset bug"),  # first offset request fails
+        Exception("fallback also down"),  # no-offset fallback fails too
+    ]
+    with pytest.raises(RuntimeError):
+        repair._paginate_ids(col)
+
+
+def test_paginate_ids_filtered_exactly_page_size_does_not_use_global_count():
+    """A wing filter selects exactly 1000 rows; the collection holds more in
+    OTHER wings. Offset is broken but the fallback returns the complete 1000
+    filtered rows. The global count() (1500) is NOT authoritative for the
+    filtered set, so it must not be treated as proof of truncation -- the
+    function must return the complete 1000 filtered rows without raising."""
+    col = MagicMock()
+    filtered_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        Exception("offset bug"),
+        {"ids": filtered_page},
+        Exception("offset bug"),
+        {"ids": filtered_page},  # same 1000 filtered ids -- fallback stuck
+    ]
+    col.count.return_value = 1500  # collection-wide, NOT the filtered total
+    ids = repair._paginate_ids(col, where={"wing": "w"})
+    assert len(ids) == 1000
+
+
 # ── _extract_drawers ──────────────────────────────────────────────────
 
 

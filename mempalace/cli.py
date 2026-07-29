@@ -2154,7 +2154,7 @@ def main():
     p_serve.add_argument(
         "--read-only",
         action="store_true",
-        help="Expose recall only: mutating tools are hidden and refused",
+        help="Expose recall only: tools that change state are hidden and refused",
     )
     p_serve.add_argument(
         "--allow-insecure",

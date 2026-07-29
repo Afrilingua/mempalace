@@ -5031,6 +5031,85 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     assert '"ok": true' in response["result"]["content"][0]["text"]
 
 
+def test_read_only_refuses_exactly_the_refused_set(monkeypatch):
+    """Ask the gate which tools it refuses instead of restating the set.
+
+    Comparing against the whole TOOLS registry also catches a stale name: a tool
+    renamed or removed while the set still lists it would gate nothing, and the
+    two sides would stop matching.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+
+    refused = {
+        name for name in mcp_server.TOOLS if mcp_server._mcp_read_only_refusal(1, name) is not None
+    }
+    assert refused == set(mcp_server._READ_ONLY_REFUSED_TOOLS)
+    assert "mempalace_hook_settings" in refused
+    assert "mempalace_memories_filed_away" in refused
+    # Reconnect stays reachable on purpose: it is the only way a read-only
+    # server picks up an external writer's changes.
+    assert "mempalace_reconnect" not in refused
+
+    # The palace-write set the peer-writer lease arbitrates stays the narrower
+    # of the two; see test_peer_writer_guard_does_not_gate_hook_settings.
+    assert mcp_server._MUTATING_TOOLS < mcp_server._READ_ONLY_REFUSED_TOOLS
+    assert "mempalace_hook_settings" not in mcp_server._MUTATING_TOOLS
+
+
+def test_read_only_refuses_every_daemon_write_tool():
+    """Read-only must not be laxer than the daemon's own write classification.
+
+    service.WRITE_TOOLS is a security allowlist: execute_job lets the generic
+    mcp_tool escape hatch run write-classified tools only. A tool the daemon
+    calls a write while read-only serves it is the exact gap this fixes, and
+    mempalace_hook_settings was that tool.
+    """
+    from mempalace import mcp_server, service
+
+    assert service.WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
+    assert "mempalace_hook_settings" in service.WRITE_TOOLS
+
+
+def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):
+    """The read-only widening must not leak into the peer-writer path.
+
+    mempalace_hook_settings writes the config file and never the palace, so it
+    stays out of _MUTATING_TOOLS and the lease has no say over it. Read-only
+    refuses it through _READ_ONLY_REFUSED_TOOLS instead. Were it moved into
+    _MUTATING_TOOLS, a peer holding the lease would refuse it with -32001,
+    including the no-argument form that only reads the current settings.
+    """
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("hook_settings should not acquire the peer-writer lock")
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_hook_settings",
+        {
+            "description": "test config tool",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": lambda: {"ok": True},
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "mempalace_hook_settings", "arguments": {}},
+        }
+    )
+
+    assert '"ok": true' in response["result"]["content"][0]["text"]
+    assert "mempalace_hook_settings" not in mcp_server._MUTATING_TOOLS
+
+
 def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     from mempalace import mcp_server
 

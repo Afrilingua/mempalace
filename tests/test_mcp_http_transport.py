@@ -20,6 +20,7 @@ Design constraints
 import http.client
 import json
 import logging
+import os
 import socketserver
 import ssl
 import threading
@@ -201,7 +202,7 @@ def test_bearer_token_enforced_when_configured(monkeypatch):
 
 
 def test_read_only_hides_and_refuses_mutating_tools(http_server, monkeypatch):
-    """Read-only mode (#1877): mutating tools are hidden from tools/list AND
+    """Read-only mode (#1877): the refused tools are hidden from tools/list AND
     refused at dispatch with -32003, while read tools still work."""
     monkeypatch.setattr(mcp, "_READ_ONLY", True)
     port, _ = http_server
@@ -211,7 +212,7 @@ def test_read_only_hides_and_refuses_mutating_tools(http_server, monkeypatch):
     names = {t["name"] for t in json.loads(body)["result"]["tools"]}
     assert "mempalace_search" in names  # read tool stays
     assert "mempalace_add_drawer" not in names  # mutating tool hidden
-    assert names.isdisjoint(mcp._MUTATING_TOOLS)
+    assert names.isdisjoint(mcp._READ_ONLY_REFUSED_TOOLS)
 
     status, body = _post(
         port,
@@ -233,6 +234,118 @@ def test_read_only_off_exposes_mutating_tools(http_server):
     status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     names = {t["name"] for t in json.loads(body)["result"]["tools"]}
     assert "mempalace_add_drawer" in names
+
+
+def _hook_settings_call(req_id):
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "tools/call",
+        "params": {
+            "name": "mempalace_hook_settings",
+            "arguments": {"silent_save": False, "desktop_toast": True},
+        },
+    }
+
+
+def test_read_only_refuses_the_hook_settings_config_write(http_server, monkeypatch, tmp_path):
+    """mempalace_hook_settings writes the server's ~/.mempalace/config.json.
+
+    It touches no palace state, so it is correctly absent from _MUTATING_TOOLS,
+    the palace-write set the peer-writer lease arbitrates. Read-only gated on
+    that set, which let a read-only server persist a config change on behalf of
+    a client that is supposed to have no write access at all.
+
+    The first half is the control: it proves the write really does land here, so
+    the "unchanged" assertion in the second half cannot pass vacuously.
+    """
+    home = tmp_path / "home"
+    (home / ".mempalace").mkdir(parents=True)
+    cfg_file = home / ".mempalace" / "config.json"
+    cfg_file.write_text(
+        json.dumps({"hooks": {"silent_save": True, "desktop_toast": False}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOMEDRIVE", os.path.splitdrive(str(home))[0] or "C:")
+    monkeypatch.setenv("HOMEPATH", os.path.splitdrive(str(home))[1] or str(home))
+    pristine = cfg_file.read_bytes()
+
+    port, _ = http_server
+
+    # Control: the gate is off, so the very same call rewrites config.json.
+    # _READ_ONLY is resolved at import from the environment, so pin it rather
+    # than inherit whatever the suite was started with.
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    status, body = _post(port, "/mcp", _hook_settings_call(1))
+    assert status == 200
+    # The handler reports its own failures inside `result` as {"success": false},
+    # not as a JSON-RPC error, so check the payload rather than just the envelope.
+    payload = json.loads(body)
+    assert "error" not in payload
+    assert json.loads(payload["result"]["content"][0]["text"])["success"] is True
+    assert cfg_file.read_bytes() != pristine
+    cfg_file.write_bytes(pristine)
+
+    # Gate on: hidden from tools/list, refused at dispatch, file left alone.
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    names = {t["name"] for t in json.loads(body)["result"]["tools"]}
+    assert "mempalace_hook_settings" not in names
+
+    status, body = _post(port, "/mcp", _hook_settings_call(3))
+    assert status == 200
+    assert json.loads(body)["error"]["code"] == -32003
+    assert cfg_file.read_bytes() == pristine
+
+
+def test_read_only_refuses_the_checkpoint_ack_delete(http_server, monkeypatch, tmp_path):
+    """mempalace_memories_filed_away unlinks the Stop hook's checkpoint ack file.
+
+    Consuming that file is the contract of the tool, but it is still a delete of
+    state that outlives the process, done for a client with no write access. Same
+    two-phase shape as the config test: the control proves the delete lands, so
+    the survival assertion afterwards cannot pass vacuously.
+    """
+    home = tmp_path / "home"
+    state_dir = home / ".mempalace" / "hook_state"
+    state_dir.mkdir(parents=True)
+    ack = state_dir / "last_checkpoint"
+    ack.write_text(json.dumps({"msgs": 7, "ts": "2026-01-01T00:00:00"}), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOMEDRIVE", os.path.splitdrive(str(home))[0] or "C:")
+    monkeypatch.setenv("HOMEPATH", os.path.splitdrive(str(home))[1] or str(home))
+
+    port, _ = http_server
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "mempalace_memories_filed_away", "arguments": {}},
+    }
+
+    # Control: the gate is off, so the call consumes the ack file.
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    status, body = _post(port, "/mcp", call)
+    assert status == 200
+    assert json.loads(json.loads(body)["result"]["content"][0]["text"])["count"] == 7
+    assert not ack.exists()
+
+    # Gate on: refused, and a fresh ack file survives untouched.
+    ack.write_text(json.dumps({"msgs": 7, "ts": "2026-01-01T00:00:00"}), encoding="utf-8")
+    pristine = ack.read_bytes()
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    names = {t["name"] for t in json.loads(body)["result"]["tools"]}
+    assert "mempalace_memories_filed_away" not in names
+
+    status, body = _post(port, "/mcp", dict(call, id=3))
+    assert status == 200
+    assert json.loads(body)["error"]["code"] == -32003
+    assert ack.read_bytes() == pristine
 
 
 @pytest.mark.parametrize(

@@ -290,8 +290,8 @@ def _parse_args():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Serve a read-only tool surface: the mutating tools are hidden from "
-        "tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
+        help="Serve a read-only tool surface: the tools that change state are hidden "
+        "from tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
     )
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -313,10 +313,12 @@ if _args.backend:
 
 _config = MempalaceConfig()
 
-# Read-only server mode: when on, the mutating tools are hidden from tools/list
-# and refused at dispatch (-32003). Resolved once at startup from --read-only or
-# MEMPALACE_MCP_READ_ONLY. Computed inline (not via _truthy_env, defined below)
-# so it is available to the request path regardless of import order.
+# Read-only server mode: when on, the tools in _READ_ONLY_REFUSED_TOOLS (defined
+# below) are hidden from tools/list and refused at dispatch (-32003). That is a
+# wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved once at
+# startup from --read-only or MEMPALACE_MCP_READ_ONLY. Computed inline (not via
+# _truthy_env, defined below) so it is available to the request path regardless
+# of import order.
 _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
     "MEMPALACE_MCP_READ_ONLY", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -401,6 +403,42 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_diary_write",
     }
 )
+
+# Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
+#
+# _MUTATING_TOOLS is the *palace-write* set: _mcp_peer_writer_refusal consults it
+# to decide which calls need this process to hold the palace mine lock. A tool
+# that never touches Chroma or the knowledge graph has to stay out of that set,
+# or a server that lost the lease to a peer would start refusing calls the lease
+# has no say over.
+#
+# Two tools are exactly that shape, and read-only has to name both because it is
+# a capability boundary rather than a lock: it exists so a shared server can
+# serve recall to a client that must not change server state.
+#
+#   mempalace_hook_settings, given an argument, writes the server's
+#   ~/.mempalace/config.json through MempalaceConfig.set_hook_setting.
+#   service.WRITE_TOOLS already classifies it as a write, which the daemon uses
+#   as an allowlist, so read-only was the odd one out.
+#
+#   mempalace_memories_filed_away unlinks ~/.mempalace/hook_state/last_checkpoint
+#   on both of its branches. Consuming the file is the contract of the tool, but
+#   it is still a delete of state that outlives the process, on behalf of a
+#   client with no write access. (service.classify_tool calls this one "read",
+#   which is wrong for the same reason.)
+#
+# mempalace_reconnect is deliberately NOT here even though it is not write-free:
+# it clears ChromaBackend._quarantined_paths, so the reopen that follows can let
+# quarantine_stale_hnsw rename a segment directory. It is the only way to pick up
+# an external writer's changes, and _SQLITE_INTEGRITY_ALLOWED_TOOLS already keeps
+# it reachable for recovery, so gating it would strand a read-only server on a
+# stale index. This set means "refuse what a client asked to change", not
+# "nothing past here touches the disk" -- opening the palace or the knowledge
+# graph materialises files on its own, which no name-based gate can express.
+_READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
+    "mempalace_hook_settings",
+    "mempalace_memories_filed_away",
+}
 
 
 def _truthy_env(name: str) -> bool:
@@ -4672,15 +4710,19 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
 
 
 def _mcp_read_only_refusal(req_id, tool_name: str):
-    """Refuse mutating tools when the server runs in read-only mode (#1877).
+    """Refuse state-changing tools when the server runs in read-only mode (#1877).
 
     Read-only is an operator-set server mode (``--read-only`` /
     ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
     it is an unconditional gate so a shared team server can expose recall
     without write access. Enforced at dispatch, not merely hidden from
     tools/list, so a client that calls a mutating tool by name is still refused.
+
+    Gates on ``_READ_ONLY_REFUSED_TOOLS``, not ``_MUTATING_TOOLS``: a tool can
+    write outside the palace database, which the peer-writer lease has no reason
+    to arbitrate but read-only still has to refuse.
     """
-    if not _READ_ONLY or tool_name not in _MUTATING_TOOLS:
+    if not _READ_ONLY or tool_name not in _READ_ONLY_REFUSED_TOOLS:
         return None
 
     return {
@@ -4752,8 +4794,9 @@ def handle_request(request):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
     elif method == "tools/list":
-        # In read-only mode, hide the mutating tools so clients don't advertise
+        # In read-only mode, hide the refused tools so clients don't advertise
         # write capabilities they can't use (dispatch also refuses them, #1877).
+        # Same set on both sides, or a tool would be listed and then rejected.
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -4761,7 +4804,7 @@ def handle_request(request):
                 "tools": [
                     {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
-                    if not (_READ_ONLY and n in _MUTATING_TOOLS)
+                    if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]
             },
         }

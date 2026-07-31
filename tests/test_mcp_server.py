@@ -9,6 +9,8 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import os
+from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import subprocess
 import sys
@@ -879,6 +881,63 @@ class TestReadTools:
         assert result["total_drawers"] == 1
         assert "hnsw_capacity" not in result
         assert result.get("vector_disabled") is not True
+
+    def test_read_only_sqlite_exact_real_read_does_not_mutate_storage(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A real MCP read must use sqlite_exact's read-only connection path,
+        not the normal schema/WAL initialization path."""
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace import mcp_server, palace
+        from mempalace.backends import PalaceRef
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        col = palace.get_collection(palace_path, create=True)
+        col.add(
+            ids=["drawer_read_only"],
+            documents=["verbatim read-only drawer"],
+            metadatas=[{"wing": "w", "room": "r"}],
+        )
+
+        backend = palace.get_backend_for_palace(palace_path)
+        palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+        backend.close_palace(palace_ref)
+
+        db_path = Path(palace_path) / "sqlite_exact.sqlite3"
+        with sqlite3.connect(db_path) as conn:
+            before_schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            before_meta = conn.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+        before_bytes = db_path.read_bytes()
+        before_mtime_ns = db_path.stat().st_mtime_ns
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_palace", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+
+        result = mcp_server.tool_list_drawers()
+
+        assert result["count"] == 1
+        assert result["drawers"][0]["drawer_id"] == "drawer_read_only"
+        read_only_handle = backend._read_only_clients[palace_path]
+        assert read_only_handle.read_only is True
+        assert read_only_handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+        backend.close_palace(palace_ref)
+        with sqlite3.connect(db_path) as conn:
+            after_schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            after_meta = conn.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+        assert after_schema_version == before_schema_version
+        assert after_meta == before_meta
+        assert db_path.read_bytes() == before_bytes
+        assert db_path.stat().st_mtime_ns == before_mtime_ns
 
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
         from mempalace.backends import GetResult

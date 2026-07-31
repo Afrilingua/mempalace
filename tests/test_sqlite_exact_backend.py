@@ -1,5 +1,8 @@
 import math
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -389,6 +392,63 @@ def test_sqlite_exact_close_palace_marks_existing_collections_closed(tmp_path):
     assert not col.health().ok
     with pytest.raises(Exception):
         col.count()
+
+
+def test_sqlite_exact_read_only_open_skips_schema_init_and_refuses_writes(tmp_path):
+    backend, col = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col.add(ids=["a"], documents=["doc"], metadatas=[{}], embeddings=[[1, 0]])
+    backend.close_palace(palace)
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    before = db_path.read_bytes()
+    read_only = backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+
+    assert read_only.count() == 1
+    assert read_only._handle.read_only is True
+    assert read_only._handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+    with pytest.raises(sqlite3.OperationalError):
+        read_only.add(ids=["b"], documents=["blocked"], metadatas=[{}], embeddings=[[1, 0]])
+
+    backend.close_palace(palace)
+    assert db_path.read_bytes() == before
+
+
+def test_sqlite_exact_direct_write_contends_with_palace_owner(tmp_path, monkeypatch):
+    from mempalace.palace import MineAlreadyRunning
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    backend, col = _collection(tmp_path)
+    holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        with pytest.raises(MineAlreadyRunning):
+            col.add(ids=["blocked"], documents=["doc"], metadatas=[{}], embeddings=[[1, 0]])
+    finally:
+        if holder.stdin is not None:
+            holder.stdin.close()
+        holder.wait(timeout=10)
+        backend.close()
 
 
 def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):

@@ -122,9 +122,14 @@ index state between calls.
 - MCP stdio may coexist for reads, but mutating tools refuse while another
   process owns the lease and become available after that owner exits.
 - Read-only MCP HTTP may coexist with the writer.
+- Read-only `sqlite_exact` clients use a `mode=ro`, `query_only` connection
+  and skip schema, WAL, FTS, migration, and metadata initialization.
 - Direct CLI and hook writes must not run beside a writable daemon or MCP HTTP
   owner. Route them through the daemon with `require` when the daemon owns the
   palace.
+- Direct `sqlite_exact` collection mutations contend for the same palace lease,
+  and full LLM closet regeneration owns it before opening collections or
+  calling the configured model.
 
 `MEMPALACE_MCP_ALLOW_PEER_WRITER` cannot bypass this protection for local
 file-backed or unknown plugin backends. It is retained only for explicitly

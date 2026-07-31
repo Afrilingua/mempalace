@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -247,9 +248,18 @@ def _validate_write_batch(
 
 
 class _SQLiteExactHandle:
-    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        lock: threading.RLock,
+        palace_path: str,
+        *,
+        read_only: bool = False,
+    ):
         self.conn = conn
         self.lock = lock
+        self.palace_path = palace_path
+        self.read_only = read_only
         self.closed = False
 
 
@@ -264,19 +274,29 @@ class SQLiteExactCollection(BaseCollection):
             raise BackendClosedError("SQLiteExactCollection has been closed")
 
     @contextlib.contextmanager
-    def _cursor(self):
-        with self._handle.lock:
-            self._ensure_open()
-            cur = self._handle.conn.cursor()
-            try:
-                yield cur
-            except Exception:
-                self._handle.conn.rollback()
-                raise
-            else:
-                self._handle.conn.commit()
-            finally:
-                cur.close()
+    def _write_lock(self):
+        # Late import avoids a palace.py -> backend -> palace.py cycle.
+        from ..palace import mine_palace_lock
+
+        with mine_palace_lock(self._handle.palace_path):
+            yield
+
+    @contextlib.contextmanager
+    def _cursor(self, *, write: bool = False):
+        ownership = self._write_lock() if write else contextlib.nullcontext()
+        with ownership:
+            with self._handle.lock:
+                self._ensure_open()
+                cur = self._handle.conn.cursor()
+                try:
+                    yield cur
+                except Exception:
+                    self._handle.conn.rollback()
+                    raise
+                else:
+                    self._handle.conn.commit()
+                finally:
+                    cur.close()
 
     def _collection_id(self, cur) -> int:
         row = cur.execute(
@@ -345,7 +365,7 @@ class SQLiteExactCollection(BaseCollection):
     def set_embedder_identity(self, identity) -> None:
         if not identity or not identity.model_name:
             return
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             cur.execute(
                 "INSERT INTO meta(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -375,7 +395,7 @@ class SQLiteExactCollection(BaseCollection):
             raise ValueError("sqlite_exact requires explicit embeddings")
         metadatas = metadatas or [{} for _ in ids]
         now = _utcnow()
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             prepared = []
             for doc_id, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
@@ -413,7 +433,7 @@ class SQLiteExactCollection(BaseCollection):
             raise ValueError("sqlite_exact requires explicit embeddings")
         metadatas = metadatas or [{} for _ in ids]
         now = _utcnow()
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             prepared = []
             for doc_id, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
@@ -457,7 +477,7 @@ class SQLiteExactCollection(BaseCollection):
         ):
             if value is not None and len(value) != n:
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             updates = []
             for idx, doc_id in enumerate(ids):
@@ -653,7 +673,7 @@ class SQLiteExactCollection(BaseCollection):
         )
 
     def delete(self, *, ids=None, where=None):
-        with self._cursor() as cur:
+        with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             if ids is None:
                 rows = self._rows(cur, where=where)
@@ -797,7 +817,7 @@ class SQLiteExactCollection(BaseCollection):
             )
         if kind == "analyze":
             # Refresh planner stats. Concurrent runs serialize on the handle lock.
-            with self._cursor() as cur:
+            with self._cursor(write=True) as cur:
                 cur.execute("ANALYZE")
             return MaintenanceResult(kind="analyze", status="ran")
 
@@ -806,16 +826,17 @@ class SQLiteExactCollection(BaseCollection):
         # concurrent runs in-process; SQLite's own write lock serializes across
         # processes.
         before = self.maintenance_state()
-        with self._handle.lock:
-            self._ensure_open()
-            conn = self._handle.conn
-            prev_isolation = conn.isolation_level
-            try:
-                conn.commit()
-                conn.isolation_level = None
-                conn.execute("VACUUM")
-            finally:
-                conn.isolation_level = prev_isolation
+        with self._write_lock():
+            with self._handle.lock:
+                self._ensure_open()
+                conn = self._handle.conn
+                prev_isolation = conn.isolation_level
+                try:
+                    conn.commit()
+                    conn.isolation_level = None
+                    conn.execute("VACUUM")
+                finally:
+                    conn.isolation_level = prev_isolation
         after = self.maintenance_state()
         reclaimed = max(0, before.get("page_count", 0) - after.get("page_count", 0))
         return MaintenanceResult(
@@ -848,6 +869,7 @@ class SQLiteExactBackend(BaseBackend):
 
     def __init__(self):
         self._clients: dict[str, _SQLiteExactHandle] = {}
+        self._read_only_clients: dict[str, _SQLiteExactHandle] = {}
         self._clients_lock = threading.RLock()
         self._closed = False
 
@@ -855,9 +877,11 @@ class SQLiteExactBackend(BaseBackend):
     def _db_path(palace_path: str) -> str:
         return os.path.join(palace_path, _DB_FILENAME)
 
-    def _connect(self, palace_path: str, create: bool):
+    def _connect(self, palace_path: str, create: bool, *, read_only: bool = False):
         if self._closed:
             raise BackendClosedError("SQLiteExactBackend has been closed")
+        if create and read_only:
+            raise ValueError("sqlite_exact read-only connections cannot create a palace")
         db_path = self._db_path(palace_path)
         if not create and not os.path.isfile(db_path):
             raise PalaceNotFoundError(db_path)
@@ -877,20 +901,44 @@ class SQLiteExactBackend(BaseBackend):
         with self._clients_lock:
             if self._closed:
                 raise BackendClosedError("SQLiteExactBackend has been closed")
-            cached = self._clients.get(palace_path)
+            clients = self._read_only_clients if read_only else self._clients
+            cached = clients.get(palace_path)
             if cached is not None and not cached.closed:
                 return cached
-            conn = sqlite3.connect(db_path, check_same_thread=False)
+            if read_only:
+                db_uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+                conn = sqlite3.connect(
+                    db_uri,
+                    uri=True,
+                    check_same_thread=False,
+                )
+            else:
+                conn = sqlite3.connect(db_path, check_same_thread=False)
             try:
                 conn.row_factory = sqlite3.Row
                 lock = threading.RLock()
-                handle = _SQLiteExactHandle(conn, lock)
+                handle = _SQLiteExactHandle(
+                    conn,
+                    lock,
+                    palace_path,
+                    read_only=read_only,
+                )
                 with handle.lock:
-                    self._init_schema(conn)
+                    if read_only:
+                        # ``mode=ro`` prevents filesystem writes. ``query_only``
+                        # adds a second connection-local guard so a future
+                        # refactor cannot accidentally introduce a temp/schema
+                        # write through a read-only MCP collection.
+                        conn.execute("PRAGMA query_only=ON")
+                    else:
+                        from ..palace import mine_palace_lock
+
+                        with mine_palace_lock(palace_path):
+                            self._init_schema(conn)
             except BaseException:
                 conn.close()
                 raise
-            self._clients[palace_path] = handle
+            clients[palace_path] = handle
             return handle
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
@@ -955,13 +1003,13 @@ class SQLiteExactBackend(BaseBackend):
         *args,
         **kwargs,
     ) -> SQLiteExactCollection:
-        palace, collection_name, create = self._normalize_args(args, kwargs)
+        palace, collection_name, create, read_only = self._normalize_args(args, kwargs)
         palace_path = palace.local_path
         if palace_path is None:
             raise PalaceNotFoundError("SQLiteExactBackend requires PalaceRef.local_path")
         if not create and not os.path.isdir(palace_path):
             raise PalaceNotFoundError(palace_path)
-        handle = self._connect(palace_path, create=create)
+        handle = self._connect(palace_path, create=create, read_only=read_only)
         with handle.lock:
             row = handle.conn.execute(
                 "SELECT id FROM collections WHERE name = ?",
@@ -970,11 +1018,14 @@ class SQLiteExactBackend(BaseBackend):
             if row is None:
                 if not create:
                     raise CollectionNotInitializedError(collection_name)
-                handle.conn.execute(
-                    "INSERT INTO collections(name, created_at) VALUES (?, ?)",
-                    (collection_name, _utcnow()),
-                )
-                handle.conn.commit()
+                from ..palace import mine_palace_lock
+
+                with mine_palace_lock(palace_path):
+                    handle.conn.execute(
+                        "INSERT INTO collections(name, created_at) VALUES (?, ?)",
+                        (collection_name, _utcnow()),
+                    )
+                    handle.conn.commit()
         return SQLiteExactCollection(handle, collection_name)
 
     @staticmethod
@@ -985,10 +1036,11 @@ class SQLiteExactBackend(BaseBackend):
                 raise TypeError("palace= must be a PalaceRef instance")
             collection_name = kwargs.pop("collection_name")
             create = bool(kwargs.pop("create", False))
-            kwargs.pop("options", None)
+            options = kwargs.pop("options", None) or {}
+            read_only = bool(options.get("read_only", False))
             if args or kwargs:
                 raise TypeError("unexpected arguments to get_collection")
-            return palace, collection_name, create
+            return palace, collection_name, create, read_only
         if args:
             palace_path = args[0]
             rest = list(args[1:])
@@ -996,18 +1048,32 @@ class SQLiteExactBackend(BaseBackend):
             if collection_name is None:
                 raise TypeError("collection_name is required")
             create = kwargs.pop("create", False)
+            options = kwargs.pop("options", None) or {}
+            read_only = bool(options.get("read_only", False))
             if rest:
                 create = rest.pop(0)
             if rest or kwargs:
                 raise TypeError("unexpected arguments to get_collection")
-            return PalaceRef(id=palace_path, local_path=palace_path), collection_name, bool(create)
+            return (
+                PalaceRef(id=palace_path, local_path=palace_path),
+                collection_name,
+                bool(create),
+                read_only,
+            )
         if "palace_path" in kwargs:
             palace_path = kwargs.pop("palace_path")
             collection_name = kwargs.pop("collection_name")
             create = bool(kwargs.pop("create", False))
+            options = kwargs.pop("options", None) or {}
+            read_only = bool(options.get("read_only", False))
             if kwargs:
                 raise TypeError("unexpected arguments to get_collection")
-            return PalaceRef(id=palace_path, local_path=palace_path), collection_name, create
+            return (
+                PalaceRef(id=palace_path, local_path=palace_path),
+                collection_name,
+                create,
+                read_only,
+            )
         raise TypeError("get_collection requires palace= or a positional palace_path")
 
     def close_palace(self, palace: PalaceRef | str) -> None:
@@ -1015,11 +1081,15 @@ class SQLiteExactBackend(BaseBackend):
         if path is None:
             return
         with self._clients_lock:
-            cached = self._clients.pop(path, None)
-        if cached is not None:
-            with cached.lock:
-                cached.closed = True
-                cached.conn.close()
+            cached_handles = [
+                self._clients.pop(path, None),
+                self._read_only_clients.pop(path, None),
+            ]
+        for cached in cached_handles:
+            if cached is not None:
+                with cached.lock:
+                    cached.closed = True
+                    cached.conn.close()
 
     def close(self) -> None:
         # Flip _closed under the registry lock so a concurrent _connect either
@@ -1028,8 +1098,9 @@ class SQLiteExactBackend(BaseBackend):
         # Unlocked readers of _closed elsewhere are advisory fast-fails; the
         # locked recheck in _connect is the authoritative gate.
         with self._clients_lock:
-            handles = list(self._clients.values())
+            handles = list(self._clients.values()) + list(self._read_only_clients.values())
             self._clients.clear()
+            self._read_only_clients.clear()
             self._closed = True
         for handle in handles:
             with handle.lock:

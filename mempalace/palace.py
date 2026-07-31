@@ -165,9 +165,14 @@ def get_collection(
     collection_name: Optional[str] = None,
     create: bool = True,
     backend: Optional[str] = None,
+    read_only: bool = False,
     _skip_identity_check: bool = False,
 ):
     """Get the palace collection through the backend layer.
+
+    ``read_only=True`` asks local backends to open storage without schema
+    initialization, migrations, or metadata writes. Backends that support a
+    genuine read-only mode receive it through the backend ``options`` mapping.
 
     ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
     ``set-embedder`` override path can open a palace whose recorded model
@@ -179,20 +184,26 @@ def get_collection(
         collection_name = get_configured_collection_name()
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+    backend_options = {"read_only": True} if read_only else None
+    preferred_kwargs = {
+        "palace": palace_ref,
+        "collection_name": collection_name,
+        "create": create,
+    }
+    if backend_options is not None:
+        preferred_kwargs["options"] = backend_options
     try:
-        collection = backend_obj.get_collection(
-            palace=palace_ref,
-            collection_name=collection_name,
-            create=create,
-        )
+        collection = backend_obj.get_collection(**preferred_kwargs)
     except TypeError as exc:
         if "unexpected keyword argument 'palace'" not in str(exc):
             raise
-        collection = backend_obj.get_collection(
-            palace_path,
-            collection_name=collection_name,
-            create=create,
-        )
+        legacy_kwargs = {
+            "collection_name": collection_name,
+            "create": create,
+        }
+        if backend_options is not None:
+            legacy_kwargs["options"] = backend_options
+        collection = backend_obj.get_collection(palace_path, **legacy_kwargs)
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:

@@ -648,6 +648,40 @@ def _restore_server_process_state(previous_env: dict[str, str | None], previous_
     os.umask(previous_umask)
 
 
+def _close_writer_lease_after_worker(
+    writer_lease: contextlib.ExitStack,
+    worker: threading.Thread,
+) -> None:
+    """Retain writer ownership until a timed-out daemon worker really exits.
+
+    The normal daemon process may terminate first, in which case the operating
+    system releases the file lock. When ``run_server`` is embedded in a larger
+    process, this reaper prevents the server thread from exposing the palace to
+    another writer while the old worker is still finishing a mutation.
+    """
+
+    def _wait_and_close() -> None:
+        worker.join()
+        writer_lease.close()
+
+    threading.Thread(
+        target=_wait_and_close,
+        name="mempalace-daemon-writer-lease-reaper",
+        daemon=True,
+    ).start()
+
+
+def _close_or_defer_writer_lease(
+    writer_lease: contextlib.ExitStack,
+    runtime: "DaemonRuntime | None",
+) -> None:
+    worker = runtime.worker_thread if runtime is not None else None
+    if worker is not None and worker.is_alive():
+        _close_writer_lease_after_worker(writer_lease, worker)
+    else:
+        writer_lease.close()
+
+
 def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
@@ -841,7 +875,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             finally:
                 _drain_and_cleanup(runtime, palace_path, previous_env)
     finally:
-        writer_lease.close()
+        _close_or_defer_writer_lease(writer_lease, runtime)
         _restore_server_process_state(previous_env, prev_umask)
 
 

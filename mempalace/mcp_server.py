@@ -1044,6 +1044,11 @@ def _get_collection(create=False):
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    # Operator read-only mode must never bootstrap a collection. In
+    # particular, sqlite_exact's normal create/open path initializes WAL,
+    # schema, FTS metadata, and commits before the first read.
+    if _READ_ONLY:
+        create = False
     try:
         backend_name = _selected_backend_name()
     except (BackendMismatchError, KeyError) as exc:
@@ -1081,6 +1086,7 @@ def _get_collection(create=False):
                         collection_name=_config.collection_name,
                         create=create,
                         backend=backend_name,
+                        read_only=_READ_ONLY,
                     )
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path

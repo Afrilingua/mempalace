@@ -271,6 +271,68 @@ def test_read_only_http_skips_writer_lease(monkeypatch):
     assert calls == [(mcp._args.host, mcp._args.port)]
 
 
+def test_writable_http_releases_writer_lease_when_serving_ends(monkeypatch):
+    events = []
+
+    class DummyLease:
+        def __exit__(self, *exc):
+            events.append("lease-exit")
+            return False
+
+    lease = DummyLease()
+
+    def acquire_writer():
+        mcp._MCP_WRITER_LOCK_CM = lease
+        return True, ""
+
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", acquire_writer)
+    monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: events.append("discard"))
+    monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_serve_http", lambda host, port: events.append("serve"))
+
+    mcp._run_http_loop()
+
+    assert events == ["serve", "discard", "lease-exit"]
+    assert mcp._MCP_WRITER_LOCK_CM is None
+
+
+def test_writable_http_releases_writer_lease_after_bind_failure(monkeypatch):
+    events = []
+
+    class DummyLease:
+        def __exit__(self, *exc):
+            events.append("lease-exit")
+            return False
+
+    lease = DummyLease()
+
+    def acquire_writer():
+        mcp._MCP_WRITER_LOCK_CM = lease
+        return True, ""
+
+    def fail_bind(host, port):
+        events.append("bind-failed")
+        raise SystemExit(1)
+
+    monkeypatch.setattr(mcp, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp, "_acquire_mcp_writer_lock", acquire_writer)
+    monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: events.append("discard"))
+    monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_serve_http", fail_bind)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mcp._run_http_loop()
+
+    assert exc_info.value.code == 1
+    assert events == ["bind-failed", "discard", "lease-exit"]
+    assert mcp._MCP_WRITER_LOCK_CM is None
+
+
 @pytest.mark.parametrize(
     "disconnect_exc",
     [

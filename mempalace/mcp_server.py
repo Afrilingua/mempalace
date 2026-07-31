@@ -380,6 +380,7 @@ _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
+_MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
 _MUTATING_TOOLS = frozenset(
@@ -406,6 +407,78 @@ def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _discard_mcp_storage_handles() -> None:
+    """Close cached storage handles before changing writer-lease state.
+
+    A stdio reader can hold a genuine read-only ``sqlite_exact`` collection
+    while another process owns the palace. Once this process promotes to
+    writer, that cached collection must not keep routing the mutating request
+    through its ``query_only`` connection. The inverse matters for embedded
+    HTTP: close writable handles before releasing the lifetime lease so no
+    storage client survives beyond the ownership interval.
+    """
+
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time
+
+    cached_client = _client_cache
+    try:
+        from .palace import get_backend_for_palace
+
+        backend = get_backend_for_palace(_config.palace_path)
+        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
+    except Exception:
+        logger.debug("Failed to close cached backend while changing MCP ownership", exc_info=True)
+
+    if cached_client is not None:
+        try:
+            close = getattr(cached_client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug(
+                "Failed to close MCP-local client while changing ownership",
+                exc_info=True,
+            )
+
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
+    _palace_db_inode = 0
+    _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+
+
+def _release_mcp_writer_lock() -> None:
+    """Close writable handles and release this process's palace lease."""
+
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
+
+    lock_cm = _MCP_WRITER_LOCK_CM
+    if lock_cm is None:
+        return
+
+    try:
+        _discard_mcp_storage_handles()
+    finally:
+        # Clear first so the atexit callback and embedded hosts can call this
+        # repeatedly without exiting the same context manager twice.
+        _MCP_WRITER_LOCK_CM = None
+        _MCP_WRITER_READ_ONLY = False
+        lock_cm.__exit__(None, None, None)
+
+
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
@@ -424,7 +497,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
@@ -476,7 +549,13 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_LOCK_CM = lock_cm
     import atexit
 
-    atexit.register(lambda: lock_cm.__exit__(None, None, None))
+    if not _MCP_WRITER_ATEXIT_REGISTERED:
+        atexit.register(_release_mcp_writer_lock)
+        _MCP_WRITER_ATEXIT_REGISTERED = True
+    # Reads performed before promotion may have cached a query-only SQLite
+    # collection. Drop it while ownership is held so the pending mutating
+    # request reopens a writable handle rather than failing on query_only.
+    _discard_mcp_storage_handles()
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
@@ -1066,6 +1145,18 @@ def _get_collection(create=False):
         return None
 
     if backend_name != "chroma":
+        # Normal stdio MCP remains capable of promotion to writer, but until
+        # it actually owns the palace it must not open sqlite_exact through
+        # the schema-initializing read/write path. This lets recall coexist
+        # with a daemon/HTTP writer. _acquire_mcp_writer_lock() discards this
+        # cached read-only collection before a promoted mutation is handled.
+        collection_read_only = _READ_ONLY or (
+            backend_name == "sqlite_exact"
+            and getattr(_args, "transport", "stdio") == "stdio"
+            and _MCP_WRITER_LOCK_CM is None
+        )
+        if collection_read_only:
+            create = False
         for attempt in range(2):
             try:
                 if (
@@ -1086,7 +1177,7 @@ def _get_collection(create=False):
                         collection_name=_config.collection_name,
                         create=create,
                         backend=backend_name,
-                        read_only=_READ_ONLY,
+                        read_only=collection_read_only,
                     )
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
@@ -5521,36 +5612,47 @@ def _run_http_loop() -> None:
     # local palace before it binds. Refusing at startup avoids advertising a
     # writable service that will only fail (or race) on its first mutation.
     # Explicit read-only HTTP remains safe to run beside the one writer owner.
+    owns_writer_lease = False
     if not _READ_ONLY:
         writer_ok, writer_reason = _acquire_mcp_writer_lock()
         if not writer_ok:
             logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
             raise SystemExit(2)
+        owns_writer_lease = True
 
-    # The HTTP transport exists for long-lived deployments. Do the cheap
-    # filesystem-only probe before binding, but never make the listener wait on
-    # optional embedder/HNSW warmup. Operators and tests should see /healthz as
-    # soon as the process is alive.
-    _refresh_vector_disabled_flag()
-    _start_idle_exit_watchdog()
+    try:
+        # The HTTP transport exists for long-lived deployments. Do the cheap
+        # filesystem-only probe before binding, but never make the listener wait on
+        # optional embedder/HNSW warmup. Operators and tests should see /healthz as
+        # soon as the process is alive.
+        _refresh_vector_disabled_flag()
+        _start_idle_exit_watchdog()
 
-    raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
-    if raw_warmup in _WARMUP_TRUTHY:
+        raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+        if raw_warmup in _WARMUP_TRUTHY:
 
-        def _warmup_with_lock():
+            def _warmup_with_lock():
+                with _HTTP_REQUEST_LOCK:
+                    _maybe_eager_warmup_embedder()
+
+            threading.Thread(
+                target=_warmup_with_lock,
+                name="mcp-http-eager-warmup",
+                daemon=True,
+            ).start()
+        elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
+            # Keep the same warning behavior as stdio mode for typo values.
+            _maybe_eager_warmup_embedder()
+
+        _serve_http(_args.host, _args.port)
+    finally:
+        if owns_writer_lease:
+            # _serve_http uses daemon request threads, so synchronize with the
+            # dispatch lock before closing storage and exposing the palace to
+            # another process. Response serialization happens after this lock
+            # and no longer touches the backend.
             with _HTTP_REQUEST_LOCK:
-                _maybe_eager_warmup_embedder()
-
-        threading.Thread(
-            target=_warmup_with_lock,
-            name="mcp-http-eager-warmup",
-            daemon=True,
-        ).start()
-    elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
-        # Keep the same warning behavior as stdio mode for typo values.
-        _maybe_eager_warmup_embedder()
-
-    _serve_http(_args.host, _args.port)
+                _release_mcp_writer_lock()
 
 
 def main():

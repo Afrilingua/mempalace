@@ -117,10 +117,11 @@ enough because each long-lived process can retain SQLite/WAL, FTS, or vector
 index state between calls.
 
 - A writable daemon owns the palace writer lease for its full lifetime.
-- Writable MCP HTTP acquires that lease before binding and refuses startup if
-  another process owns it.
-- MCP stdio may coexist for reads, but mutating tools refuse while another
-  process owns the lease and become available after that owner exits.
+- Writable MCP HTTP acquires that lease before binding, holds it through the
+  full serving lifetime, and releases it after active requests stop.
+- MCP stdio opens `sqlite_exact` read-only until it acquires the writer lease.
+  It may therefore coexist for reads; mutating tools refuse while another
+  process owns the lease and reopen writable storage after that owner exits.
 - Read-only MCP HTTP may coexist with the writer.
 - Read-only `sqlite_exact` clients use a `mode=ro`, `query_only` connection
   and skip schema, WAL, FTS, migration, and metadata initialization.

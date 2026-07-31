@@ -939,6 +939,93 @@ class TestReadTools:
         assert db_path.read_bytes() == before_bytes
         assert db_path.stat().st_mtime_ns == before_mtime_ns
 
+    def test_stdio_sqlite_exact_reads_with_peer_writer_then_reopens_on_promotion(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A writable-capable stdio server must recall through a read-only
+        handle while a peer owns the palace, then discard that handle when it
+        successfully promotes to writer."""
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace import mcp_server, palace
+        from mempalace.backends import PalaceRef
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        col = palace.get_collection(palace_path, create=True)
+        col.add(
+            ids=["drawer_peer_writer"],
+            documents=["verbatim recall beside peer writer"],
+            metadatas=[{"wing": "w", "room": "r"}],
+        )
+
+        backend = palace.get_backend_for_palace(palace_path)
+        palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+        backend.close_palace(palace_ref)
+
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, palace_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+
+            _patch_mcp_server(monkeypatch, config, kg)
+            monkeypatch.setattr(mcp_server._args, "transport", "stdio")
+            monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+            monkeypatch.setattr(mcp_server, "_collection_cache", None)
+            monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+            monkeypatch.setattr(mcp_server, "_collection_cache_palace", None)
+
+            result = mcp_server.tool_list_drawers()
+
+            assert result["count"] == 1
+            assert result["drawers"][0]["drawer_id"] == "drawer_peer_writer"
+            read_only_handle = backend._read_only_clients[palace_path]
+            assert read_only_handle.read_only is True
+            assert read_only_handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+            assert holder.stdin is not None
+            holder.stdin.close()
+            holder.wait(timeout=10)
+            assert holder.returncode == 0
+
+            writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
+            assert writer_ok is True
+            assert writer_reason == ""
+            assert read_only_handle.closed is True
+
+            promoted = mcp_server._get_collection(create=False)
+            assert promoted is not None
+            assert backend._clients[palace_path].read_only is False
+        finally:
+            if mcp_server._MCP_WRITER_LOCK_CM is not None:
+                mcp_server._release_mcp_writer_lock()
+            if holder.poll() is None:
+                if holder.stdin is not None:
+                    holder.stdin.close()
+                holder.wait(timeout=10)
+            backend.close_palace(palace_ref)
+
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
         from mempalace.backends import GetResult
 

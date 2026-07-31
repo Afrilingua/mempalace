@@ -491,9 +491,10 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     the original holder exits — the OS releases its flock on process death —
     the next mutating call transparently promotes this server to writer, with
     no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
-    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` is now only a
-    status flag; it no longer short-circuits the retry (that sticky latch used
-    to strand a server read-only for life even after the peer was long gone).
+    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` and
+    ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
+    neither short-circuits a later retry. Peer ownership and transient setup
+    failures can both be corrected without restarting the MCP host.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
@@ -502,12 +503,10 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
-    # NB: deliberately NO sticky read-only short-circuit here. If a peer held
-    # the lease at startup we fall through and retry mine_palace_lock below, so
-    # the server self-heals into the writer the moment the peer exits. A broken
-    # lock *mechanism* (below) is still cached, since retrying it can't help.
-    if _MCP_WRITER_LOCK_FAILED:
-        return False, _MCP_WRITER_LOCK_ERROR
+    # Deliberately no sticky failure short-circuit here. A peer can exit, a
+    # backend mismatch can be corrected, and lock-directory permissions can be
+    # repaired while this long-lived stdio host remains alive. Each mutating
+    # request therefore gets a fresh ownership attempt.
 
     try:
         from .palace import (
@@ -540,8 +539,9 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
-            f"{_config.palace_path!r}: {exc!r}; refusing mutating tools "
-            "because peer-writer protection could not be established"
+            f"{_config.palace_path!r}: {exc!r}; refusing this mutating tool "
+            "because peer-writer protection could not be established; a later "
+            "mutating request will retry ownership"
         )
         logger.error(_MCP_WRITER_LOCK_ERROR)
         return False, _MCP_WRITER_LOCK_ERROR

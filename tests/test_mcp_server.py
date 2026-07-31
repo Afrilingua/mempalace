@@ -5198,17 +5198,27 @@ def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     assert mcp_server.tool_status()["total_drawers"] == 0
 
 
-def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
+def test_peer_writer_lock_setup_failure_retries_and_recovers(monkeypatch):
     from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
     calls = {"count": 0}
 
-    def broken_mine_palace_lock(palace_path):
+    def flaky_mine_palace_lock(palace_path):
         calls["count"] += 1
-        raise RuntimeError(f"permission denied for {palace_path}")
+        if calls["count"] == 1:
+            raise RuntimeError(f"permission denied for {palace_path}")
+        return _DummyLock()
 
     monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
-    monkeypatch.setattr(palace, "mine_palace_lock", broken_mine_palace_lock)
+    monkeypatch.setattr(palace, "mine_palace_lock", flaky_mine_palace_lock)
+    monkeypatch.setattr(mcp_server, "_discard_mcp_storage_handles", lambda: None)
 
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
@@ -5219,11 +5229,13 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
 
     assert ok_first is False
-    assert ok_second is False
-    assert calls["count"] == 1
-    assert mcp_server._MCP_WRITER_LOCK_FAILED is True
-    assert "refusing mutating tools" in reason_first
-    assert reason_second == reason_first
+    assert "later mutating request will retry ownership" in reason_first
+    assert ok_second is True
+    assert reason_second == ""
+    assert calls["count"] == 2
+    assert mcp_server._MCP_WRITER_LOCK_FAILED is False
+    assert mcp_server._MCP_WRITER_LOCK_CM is not None
+    mcp_server._release_mcp_writer_lock()
 
 
 def test_peer_writer_override_cannot_bypass_local_backend_lock(monkeypatch):

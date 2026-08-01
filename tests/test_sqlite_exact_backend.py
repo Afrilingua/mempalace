@@ -451,6 +451,137 @@ with mine_palace_lock(sys.argv[1]):
         backend.close()
 
 
+@pytest.mark.parametrize("operation", ["add", "vacuum"])
+def test_sqlite_exact_waiting_thread_reacquires_palace_lease(tmp_path, monkeypatch, operation):
+    """A thread queued on the handle must not inherit stale re-entrant credit.
+
+    Thread A owns both the handle and palace locks. Thread B reaches the handle
+    while A still owns the palace, then pauses immediately after the handle is
+    released. An external process acquires the palace before B continues. B
+    must contend again and refuse both ordinary writes and VACUUM.
+    """
+    from mempalace.palace import MineAlreadyRunning
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    backend, col = _collection(tmp_path)
+    col.add(ids=["seed"], documents=["seed"], metadatas=[{}], embeddings=[[1, 0]])
+
+    release_a = threading.Event()
+    a_ready = threading.Event()
+    b_handle_attempted = threading.Event()
+    b_has_handle = threading.Event()
+    allow_b = threading.Event()
+    writer_ref = {"thread": None}
+
+    class CoordinatedRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._writer_coordinated = False
+
+        def __enter__(self):
+            is_writer = threading.current_thread() is writer_ref["thread"]
+            if is_writer and not self._writer_coordinated:
+                self._writer_coordinated = True
+                b_handle_attempted.set()
+            self._lock.acquire()
+            if is_writer and self._writer_coordinated and not b_has_handle.is_set():
+                b_has_handle.set()
+                if not allow_b.wait(10):
+                    self._lock.release()
+                    raise AssertionError("timed out waiting to resume writer B")
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+            return False
+
+    col._handle.lock = CoordinatedRLock()
+    errors = {}
+
+    def owner_a():
+        try:
+            with col._cursor(write=True):
+                a_ready.set()
+                if not release_a.wait(10):
+                    raise AssertionError("timed out waiting to release writer A")
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors["a"] = exc
+
+    if operation == "vacuum":
+        monkeypatch.setattr(
+            col,
+            "maintenance_state",
+            lambda: {"row_count": 1, "page_count": 1, "freelist_pages": 0},
+        )
+
+    def writer_b():
+        try:
+            if operation == "add":
+                col.add(
+                    ids=["writer-b"],
+                    documents=["must not be written"],
+                    metadatas=[{}],
+                    embeddings=[[0, 1]],
+                )
+            else:
+                col.run_maintenance("compact")
+        except BaseException as exc:
+            errors["b"] = exc
+
+    thread_a = threading.Thread(target=owner_a, name="sqlite-owner-a", daemon=True)
+    thread_b = threading.Thread(target=writer_b, name="sqlite-writer-b", daemon=True)
+    writer_ref["thread"] = thread_b
+    holder = None
+    try:
+        thread_a.start()
+        assert a_ready.wait(10), "writer A did not acquire both locks"
+
+        thread_b.start()
+        assert b_handle_attempted.wait(10), "writer B did not reach the handle lock"
+
+        release_a.set()
+        assert b_has_handle.wait(10), "writer B did not acquire the released handle"
+        thread_a.join(timeout=10)
+        assert not thread_a.is_alive(), "writer A did not release the palace lease"
+        assert "a" not in errors
+
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, str(tmp_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+
+        allow_b.set()
+        thread_b.join(timeout=10)
+        assert not thread_b.is_alive(), "writer B did not finish contention"
+        assert isinstance(errors.get("b"), MineAlreadyRunning)
+
+        if operation == "add":
+            assert col.get(ids=["writer-b"]).ids == []
+    finally:
+        release_a.set()
+        allow_b.set()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+        if holder is not None:
+            if holder.stdin is not None:
+                holder.stdin.close()
+            holder.wait(timeout=10)
+        backend.close()
+
+
 def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace.palace import get_collection

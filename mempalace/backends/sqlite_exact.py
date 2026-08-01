@@ -275,28 +275,37 @@ class SQLiteExactCollection(BaseCollection):
 
     @contextlib.contextmanager
     def _write_lock(self):
+        """Serialize this handle before taking process-wide writer ownership.
+
+        ``mine_palace_lock`` grants cross-thread re-entrant access whenever
+        this process already owns the palace. Taking it before ``handle.lock``
+        lets a waiting thread consume that re-entrant credit, outlive the
+        thread that owns the OS lease, and then mutate after the lease has been
+        released. The handle mutex must therefore be the outer context.
+        """
         # Late import avoids a palace.py -> backend -> palace.py cycle.
         from ..palace import mine_palace_lock
 
-        with mine_palace_lock(self._handle.palace_path):
-            yield
+        with self._handle.lock:
+            self._ensure_open()
+            with mine_palace_lock(self._handle.palace_path):
+                yield
 
     @contextlib.contextmanager
     def _cursor(self, *, write: bool = False):
-        ownership = self._write_lock() if write else contextlib.nullcontext()
-        with ownership:
-            with self._handle.lock:
-                self._ensure_open()
-                cur = self._handle.conn.cursor()
-                try:
-                    yield cur
-                except Exception:
-                    self._handle.conn.rollback()
-                    raise
-                else:
-                    self._handle.conn.commit()
-                finally:
-                    cur.close()
+        serialization = self._write_lock() if write else self._handle.lock
+        with serialization:
+            self._ensure_open()
+            cur = self._handle.conn.cursor()
+            try:
+                yield cur
+            except Exception:
+                self._handle.conn.rollback()
+                raise
+            else:
+                self._handle.conn.commit()
+            finally:
+                cur.close()
 
     def _collection_id(self, cur) -> int:
         row = cur.execute(
@@ -822,21 +831,19 @@ class SQLiteExactCollection(BaseCollection):
             return MaintenanceResult(kind="analyze", status="ran")
 
         # compact → VACUUM. It cannot run inside a transaction, so flip the
-        # connection to autocommit for the duration. The handle lock serializes
-        # concurrent runs in-process; SQLite's own write lock serializes across
-        # processes.
+        # connection to autocommit for the duration. _write_lock takes the
+        # handle mutex before the palace lease so a waiting thread cannot
+        # retain stale process-reentrant ownership after another thread exits.
         before = self.maintenance_state()
         with self._write_lock():
-            with self._handle.lock:
-                self._ensure_open()
-                conn = self._handle.conn
-                prev_isolation = conn.isolation_level
-                try:
-                    conn.commit()
-                    conn.isolation_level = None
-                    conn.execute("VACUUM")
-                finally:
-                    conn.isolation_level = prev_isolation
+            conn = self._handle.conn
+            prev_isolation = conn.isolation_level
+            try:
+                conn.commit()
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+            finally:
+                conn.isolation_level = prev_isolation
         after = self.maintenance_state()
         reclaimed = max(0, before.get("page_count", 0) - after.get("page_count", 0))
         return MaintenanceResult(

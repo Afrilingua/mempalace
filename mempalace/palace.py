@@ -355,7 +355,15 @@ def backend_requires_single_writer(backend_name: str) -> bool:
     plugin backends are treated conservatively. Only backends whose storage
     service is explicitly responsible for cross-process concurrency opt out.
     """
-    return backend_name.strip().lower() not in _MULTI_PROCESS_WRITER_BACKENDS
+    normalized = backend_name.strip().lower()
+    if normalized == "milvus":
+        # Only embedded Milvus Lite is local single-writer storage. A remote
+        # Milvus server or Zilliz Cloud coordinates concurrent clients itself.
+        from .backends.milvus import milvus_uri_is_server
+        from .config import MempalaceConfig
+
+        return not milvus_uri_is_server(MempalaceConfig().milvus_uri)
+    return normalized not in _MULTI_PROCESS_WRITER_BACKENDS
 
 
 def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):

@@ -123,8 +123,10 @@ index state between calls.
   It may therefore coexist for reads; mutating tools refuse while another
   process owns the lease and reopen writable storage after that owner exits.
 - Read-only MCP HTTP may coexist with the writer.
-- Read-only `sqlite_exact` clients use a `mode=ro`, `query_only` connection
-  and skip schema, WAL, FTS, migration, and metadata initialization.
+- Read-only `sqlite_exact` clients use an immutable connection for a clean
+  checkpointed database, or `mode=ro` when an active writer's complete WAL
+  sidecar pair must remain visible. Both paths enable `query_only` and skip
+  schema, WAL, FTS, migration, and metadata initialization.
 - Direct CLI and hook writes must not run beside a writable daemon or MCP HTTP
   owner. Route them through the daemon with `require` when the daemon owns the
   palace.
@@ -134,8 +136,9 @@ index state between calls.
 
 `MEMPALACE_MCP_ALLOW_PEER_WRITER` cannot bypass this protection for local
 file-backed or unknown plugin backends. It is retained only for explicitly
-remote service backends (`qdrant` and `pgvector`) that coordinate concurrent
-clients themselves.
+remote service backends (`qdrant`, `pgvector`, and Milvus server/Zilliz Cloud)
+that coordinate concurrent clients themselves. Milvus Lite remains protected
+as local file-backed storage.
 
 Do not delete or unlink a live palace lock to recover ownership. Stop the
 owning process cleanly; the operating system releases its lock automatically.

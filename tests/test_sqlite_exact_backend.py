@@ -402,21 +402,82 @@ def test_sqlite_exact_read_only_open_skips_schema_init_and_refuses_writes(tmp_pa
 
     db_path = tmp_path / "sqlite_exact.sqlite3"
     before = db_path.read_bytes()
-    read_only = backend.get_collection(
-        palace=palace,
-        collection_name="mempalace_drawers",
-        create=False,
-        options={"read_only": True},
-    )
+    assert not (tmp_path / "sqlite_exact.sqlite3-wal").exists()
+    assert not (tmp_path / "sqlite_exact.sqlite3-shm").exists()
+    db_path.chmod(0o400)
+    tmp_path.chmod(0o500)
+    try:
+        read_only = backend.get_collection(
+            palace=palace,
+            collection_name="mempalace_drawers",
+            create=False,
+            options={"read_only": True},
+        )
 
-    assert read_only.count() == 1
-    assert read_only._handle.read_only is True
-    assert read_only._handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
-    with pytest.raises(sqlite3.OperationalError):
-        read_only.add(ids=["b"], documents=["blocked"], metadatas=[{}], embeddings=[[1, 0]])
-
-    backend.close_palace(palace)
+        assert read_only.count() == 1
+        assert read_only._handle.read_only is True
+        assert read_only._handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            read_only.add(
+                ids=["b"],
+                documents=["blocked"],
+                metadatas=[{}],
+                embeddings=[[1, 0]],
+            )
+        assert not (tmp_path / "sqlite_exact.sqlite3-wal").exists()
+        assert not (tmp_path / "sqlite_exact.sqlite3-shm").exists()
+    finally:
+        tmp_path.chmod(0o700)
+        db_path.chmod(0o600)
+        backend.close_palace(palace)
     assert db_path.read_bytes() == before
+
+
+def test_sqlite_exact_read_only_open_sees_active_writer_wal(tmp_path):
+    writer_backend, writer = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    writer.add(ids=["wal-row"], documents=["uncheckpointed"], metadatas=[{}], embeddings=[[1, 0]])
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    wal_path = tmp_path / "sqlite_exact.sqlite3-wal"
+    shm_path = tmp_path / "sqlite_exact.sqlite3-shm"
+    assert wal_path.is_file()
+    assert shm_path.is_file()
+    before = {path: path.read_bytes() for path in (db_path, wal_path, shm_path)}
+    for path in before:
+        path.chmod(0o400)
+    tmp_path.chmod(0o500)
+    try:
+        reader_code = """
+import sys
+from mempalace.backends import PalaceRef
+from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+backend = SQLiteExactBackend()
+palace = PalaceRef(id=sys.argv[1], local_path=sys.argv[1])
+reader = backend.get_collection(
+    palace=palace,
+    collection_name="mempalace_drawers",
+    create=False,
+    options={"read_only": True},
+)
+print(reader.get(ids=["wal-row"]).documents[0])
+backend.close_palace(palace)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", reader_code, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "uncheckpointed"
+        assert {path: path.read_bytes() for path in before} == before
+    finally:
+        tmp_path.chmod(0o700)
+        for path in before:
+            path.chmod(0o600)
+        writer_backend.close_palace(palace)
 
 
 def test_sqlite_exact_direct_write_contends_with_palace_owner(tmp_path, monkeypatch):

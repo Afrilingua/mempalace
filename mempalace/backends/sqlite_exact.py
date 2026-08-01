@@ -22,6 +22,7 @@ import numpy as np
 
 from .base import (
     BackendClosedError,
+    BackendError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -884,6 +885,31 @@ class SQLiteExactBackend(BaseBackend):
     def _db_path(palace_path: str) -> str:
         return os.path.join(palace_path, _DB_FILENAME)
 
+    @staticmethod
+    def _connect_read_only(db_path: str) -> sqlite3.Connection:
+        """Open without creating WAL files while preserving an active WAL."""
+        wal_exists = os.path.isfile(f"{db_path}-wal")
+        shm_exists = os.path.isfile(f"{db_path}-shm")
+        if wal_exists != shm_exists:
+            raise BackendError(
+                "sqlite_exact read-only open found an incomplete WAL sidecar set; "
+                "open the palace after its writer exits cleanly or restore both "
+                "the -wal and -shm files"
+            )
+
+        db_uri = Path(db_path).resolve().as_uri()
+        if wal_exists:
+            # An active writer's uncheckpointed rows live in the WAL. With both
+            # sidecars already present, mode=ro can read them without creating
+            # filesystem state, including on a read-only mount.
+            db_uri = f"{db_uri}?mode=ro"
+        else:
+            # A clean WAL-mode database would otherwise make SQLite create new
+            # -wal/-shm files while connecting. Immutable mode is safe here
+            # because there is no WAL whose contents could be hidden.
+            db_uri = f"{db_uri}?mode=ro&immutable=1"
+        return sqlite3.connect(db_uri, uri=True, check_same_thread=False)
+
     def _connect(self, palace_path: str, create: bool, *, read_only: bool = False):
         if self._closed:
             raise BackendClosedError("SQLiteExactBackend has been closed")
@@ -913,12 +939,7 @@ class SQLiteExactBackend(BaseBackend):
             if cached is not None and not cached.closed:
                 return cached
             if read_only:
-                db_uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-                conn = sqlite3.connect(
-                    db_uri,
-                    uri=True,
-                    check_same_thread=False,
-                )
+                conn = self._connect_read_only(db_path)
             else:
                 conn = sqlite3.connect(db_path, check_same_thread=False)
             try:

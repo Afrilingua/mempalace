@@ -713,3 +713,21 @@ class TestExtractAuthoredAt:
         f = tmp_path / "session.jsonl"
         f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
         assert _extract_authored_at(f) is None
+
+
+def test_scan_convos_accepts_one_file_without_scanning_siblings(
+    tmp_path,
+):
+    selected = tmp_path / "selected.jsonl"
+    sibling = tmp_path / "sibling.jsonl"
+
+    selected.write_text(
+        '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+
+    assert scan_convos(str(selected)) == [selected.resolve()]

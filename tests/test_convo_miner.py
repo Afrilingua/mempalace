@@ -834,3 +834,41 @@ def test_register_file_sentinel_includes_source_mtime():
         assert abs(mined[str(tiny_file)] - os.path.getmtime(tiny_file)) < 0.001
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_dry_run_single_file_does_not_scan_siblings(
+    tmp_path,
+    capsys,
+):
+    selected = tmp_path / "selected.txt"
+    sibling = tmp_path / "sibling.txt"
+
+    selected.write_text(
+        "> Which transcript should be mined?\n"
+        "SELECTED_ONLY_MARKER belongs to the active transcript.\n\n"
+        "> Should sibling files be included?\n"
+        "No. Only the selected transcript should be scanned.\n",
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        "> Should this sibling be mined?\n"
+        "SIBLING_SHOULD_NOT_BE_MINED by the single-file invocation.\n\n"
+        "> Is that important?\n"
+        "Yes. It keeps hook-triggered mining narrowly scoped.\n",
+        encoding="utf-8",
+    )
+
+    palace_path = tmp_path / "palace"
+
+    mine_convos(
+        str(selected),
+        str(palace_path),
+        wing="sessions",
+        dry_run=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "Files:   1" in output
+    assert "[DRY RUN] selected.txt" in output
+    assert "sibling.txt" not in output
+    assert not palace_path.exists()

@@ -220,6 +220,43 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
 
 
+def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
+    """Replace tokenizer-only IDs that the text ONNX model cannot embed."""
+    model_vocab_size = tokenizer.get_vocab_size(with_added_tokens=False)
+    out_of_range = (input_ids < 0) | (input_ids >= model_vocab_size)
+
+    if not np.any(out_of_range):
+        return input_ids
+
+    unknown_token_id = tokenizer.token_to_id("<unk>")
+    if unknown_token_id is None or not 0 <= unknown_token_id < model_vocab_size:
+        raise RuntimeError(
+            "EmbeddingGemma tokenizer produced token IDs outside the ONNX "
+            "text vocabulary, but no valid <unk> token is available"
+        )
+
+    invalid_ids = sorted({int(token_id) for token_id in input_ids[out_of_range]})
+    warning_key = (
+        "embeddinggemma-out-of-range-token-ids",
+        model_vocab_size,
+        tuple(invalid_ids),
+    )
+
+    if warning_key not in _WARNED:
+        logger.warning(
+            "EmbeddingGemma tokenizer produced token IDs outside the ONNX "
+            "text vocabulary (size=%d): %s; remapping to <unk> (%d)",
+            model_vocab_size,
+            invalid_ids,
+            unknown_token_id,
+        )
+        _WARNED.add(warning_key)
+
+    sanitized = input_ids.copy()
+    sanitized[out_of_range] = unknown_token_id
+    return sanitized
+
+
 class EmbeddinggemmaONNX:
     """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL→384d).
 
@@ -340,6 +377,11 @@ class EmbeddinggemmaONNX:
             texts = [_EMBEDDINGGEMMA_PREFIX + t for t in chunk]
             encs = self._tokenizer.encode_batch(texts)
             input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+            input_ids = _sanitize_embeddinggemma_input_ids(
+                self._tokenizer,
+                input_ids,
+                np,
+            )
             attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
             outputs = self._session.run(
                 None, {"input_ids": input_ids, "attention_mask": attention_mask}

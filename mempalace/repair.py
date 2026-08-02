@@ -1310,6 +1310,13 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     returned as the document; this matches how chromadb itself stores
     ``add(documents=...)``.
 
+    Driven from ``embeddings`` (LEFT JOIN ``embedding_metadata``), not
+    the other way around: an embedding with zero ``embedding_metadata``
+    rows — a sparse historical write with no ``chroma:document`` and no
+    other key, the same condition ``_extract_drawers`` already sanitizes
+    for the collection-layer path, see #1458 — must still be yielded
+    with an empty metadata dict, not silently excluded by the join.
+
     Silent on missing palace, missing ``chroma.sqlite3``, or unknown
     collection name — yields nothing. Callers that need to distinguish
     "empty collection" from "collection not present" should query
@@ -1339,15 +1346,21 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
             """
             SELECT e.embedding_id, em.key, em.string_value, em.int_value,
                    em.float_value, em.bool_value
-            FROM embedding_metadata em
-            JOIN embeddings e ON em.id = e.id
+            FROM embeddings e
+            LEFT JOIN embedding_metadata em ON em.id = e.id
             WHERE e.segment_id = ?
-            ORDER BY em.id
+            ORDER BY e.id
             """,
             (segment_id,),
         ):
             if emb_id not in per_id:
                 order.append(emb_id)
+            if key is None:
+                # LEFT JOIN unmatched row: this embedding has zero
+                # embedding_metadata rows. `order`/`per_id` already
+                # account for it via the defaultdict below; nothing to
+                # merge for this row.
+                continue
             if sv is not None:
                 per_id[emb_id][key] = sv
             elif iv is not None:

@@ -60,6 +60,24 @@ def _first_or_empty(results, key: str) -> list:
     return outer[0] or []
 
 
+def _aligned_query_ids(results, document_count: int) -> list:
+    """Return query IDs padded to match the document result column.
+
+    Production backends return an ID for every document. Some legacy test
+    mocks omit IDs, so pad with ``None`` instead of letting ``zip`` discard
+    otherwise valid mocked results.
+    """
+    ids = list(_first_or_empty(results, "ids"))
+    if len(ids) < document_count:
+        ids.extend([None] * (document_count - len(ids)))
+    return ids[:document_count]
+
+
+def _result_drawer_id(meta, stored_drawer_id):
+    """Return the ID that round-trips through ``mempalace_get_drawer``."""
+    return (meta or {}).get("parent_drawer_id") or stored_drawer_id
+
+
 def _tokenize(text: str) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
@@ -752,9 +770,10 @@ def _bm25_only_via_sqlite(
         placeholders = ",".join(["?"] * len(candidate_ids))
         meta_rows = conn.execute(
             f"""
-            SELECT id, key, string_value, int_value
-            FROM embedding_metadata
-            WHERE id IN ({placeholders})
+            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
+            FROM embedding_metadata AS m
+            JOIN embeddings AS e ON e.id = m.id
+            WHERE m.id IN ({placeholders})
             """,
             candidate_ids,
         ).fetchall()
@@ -763,8 +782,16 @@ def _bm25_only_via_sqlite(
 
     # Group metadata rows into per-drawer dicts.
     drawers: dict[int, dict] = {}
-    for emb_id, key, sval, ival in meta_rows:
-        d = drawers.setdefault(emb_id, {"_id": emb_id, "metadata": {}, "text": ""})
+    for emb_id, stored_drawer_id, key, sval, ival in meta_rows:
+        d = drawers.setdefault(
+            emb_id,
+            {
+                "_id": emb_id,
+                "_stored_drawer_id": stored_drawer_id,
+                "metadata": {},
+                "text": "",
+            },
+        )
         if key == "chroma:document":
             d["text"] = sval or ""
         else:
@@ -784,6 +811,7 @@ def _bm25_only_via_sqlite(
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
+                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -887,6 +915,7 @@ def _merge_bm25_union_candidates(
         full_source = meta.get("source_file", "") or ""
         bm25_extra.append(
             {
+                "drawer_id": _result_drawer_id(meta, hit.id),
                 "text": hit.document or "",
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -1125,9 +1154,12 @@ def _query_drawers_with_filter_fallback(
             n_results=min(n_results * 15, 500),
             include=["documents", "metadatas", "distances"],
         )
-        fdocs, fmetas, fdists = [], [], []
-        for doc, meta, dist in zip(
-            _first_or_empty(raw, "documents"),
+        raw_docs = _first_or_empty(raw, "documents")
+        raw_ids = _aligned_query_ids(raw, len(raw_docs))
+        fids, fdocs, fmetas, fdists = [], [], [], []
+        for stored_drawer_id, doc, meta, dist in zip(
+            raw_ids,
+            raw_docs,
             _first_or_empty(raw, "metadatas"),
             _first_or_empty(raw, "distances"),
         ):
@@ -1138,10 +1170,16 @@ def _query_drawers_with_filter_fallback(
                 continue
             if source_file and meta.get("source_file") != source_file:
                 continue
+            fids.append(stored_drawer_id)
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
-        return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
+        return {
+            "ids": [fids],
+            "documents": [fdocs],
+            "metadatas": [fmetas],
+            "distances": [fdists],
+        }
 
 
 def search_memories(
@@ -1271,8 +1309,11 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
+    drawer_docs = _first_or_empty(drawer_results, "documents")
+    stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+    for stored_drawer_id, doc, meta, dist in zip(
+        stored_drawer_ids,
+        drawer_docs,
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
     ):
@@ -1301,6 +1342,7 @@ def search_memories(
         # inverting the ranking so the best hybrid matches sort last.
         effective_dist = max(0.0, min(2.0, dist - boost))
         entry = {
+            "drawer_id": _result_drawer_id(meta, stored_drawer_id),
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),

@@ -1553,6 +1553,7 @@ def rebuild_from_sqlite(
     *,
     archive_existing_dest: bool = False,
     batch_size: int = 1000,
+    dry_run: bool = False,
 ) -> dict[str, int]:
     """Rebuild a palace by reading drawers from ``source_palace``'s
     ``chroma.sqlite3`` and upserting them into a fresh palace at
@@ -1584,6 +1585,17 @@ def rebuild_from_sqlite(
       ``<dest_palace>.pre-rebuild-<timestamp>`` and read from there
       instead. Used by the in-place CLI flow where ``--source`` defaults
       to the same path as ``--palace``.
+
+    ``dry_run`` (CLI: ``--dry-run``) previews the rebuild without making any
+    change: source validation runs as normal, then per-collection row counts
+    are read from the source SQLite and printed, and the function returns
+    those would-be counts *without* archiving the existing palace, taking the
+    mine-lock, creating collections, or re-embedding (#2095, #2133). Useful
+    before a multi-hour rebuild on a large palace. A dry run returns a
+    populated dict (one key per recoverable collection) so CLI callers treat
+    it as success; a validation refusal still returns ``{}`` exactly as a real
+    run would. If SQLite row counts cannot be read, the preview fails closed
+    with ``{}`` rather than inventing zeros.
 
     Returns a ``{collection_name: row_count}`` dict so callers (CLI,
     tests) can verify the per-collection rebuild count without parsing
@@ -1669,6 +1681,19 @@ def rebuild_from_sqlite(
             )
             return {}
 
+    # --dry-run: validation has passed, so report what a real run would do
+    # and stop before the first irreversible step (mine-lock + archive).
+    # Counts come from ``sqlite_drawer_count`` — the same SQLite ground-truth
+    # helper repair uses elsewhere — so the preview matches the per-collection
+    # counts a real rebuild upserts. Reads the original ``source_palace``
+    # (not yet archived). Must never take the mine-lock or rename anything.
+    if dry_run:
+        return _preview_rebuild_from_sqlite(
+            source_palace=source_palace,
+            dest_palace=dest_palace,
+            in_place=in_place,
+        )
+
     # Acquire the single-writer mine-lock BEFORE the archive/rename. The
     # rebuild upserts into ``dest_palace`` through the same backend write
     # path that takes ``mine_palace_lock`` per batch; if a daemon or a
@@ -1688,6 +1713,49 @@ def rebuild_from_sqlite(
             in_place=in_place,
             batch_size=batch_size,
         )
+
+
+def _preview_rebuild_from_sqlite(
+    *,
+    source_palace: str,
+    dest_palace: str,
+    in_place: bool,
+) -> dict[str, int]:
+    """Read-only preview for :func:`rebuild_from_sqlite` (``dry_run=True``).
+
+    Never archives, locks, or writes. Returns ``{}`` if SQLite counts are
+    unreadable so a broken preview cannot look like a successful zero-row plan.
+    """
+    print("\n  DRY RUN — no changes will be made.")
+    if in_place:
+        print(
+            f"  Would archive {dest_palace} → "
+            f"{dest_palace}.pre-rebuild-<timestamp>, then rebuild from the copy."
+        )
+    else:
+        print(f"  Would rebuild into {dest_palace} from {source_palace}.")
+
+    counts: dict[str, int] = {}
+    for cname in _recoverable_collections():
+        n = sqlite_drawer_count(source_palace, cname)
+        if n is None:
+            # Fail closed: inventing 0 would hide an unreadable source and
+            # make the operator believe a real rebuild would upsert nothing
+            # (review note on #1654 / #2095).
+            print(
+                f"\n  Cannot preview [{cname}]: SQLite row count is unreadable "
+                f"at {os.path.join(source_palace, 'chroma.sqlite3')}.\n"
+                "  Fix source readability (schema, lock, permissions) and re-run "
+                "--dry-run; refusing to invent zero counts."
+            )
+            return {}
+        counts[cname] = n
+        print(f"  [{cname}] would re-embed and upsert {n} rows")
+    print(
+        f"\n  Would rebuild {sum(counts.values())} total rows. Re-run without --dry-run to execute."
+    )
+    print(f"{'=' * 55}\n")
+    return counts
 
 
 def _rebuild_from_sqlite_locked(

@@ -480,6 +480,77 @@ backend.close_palace(palace)
         writer_backend.close_palace(palace)
 
 
+def test_sqlite_exact_read_only_reopens_when_wal_appears_after_immutable_open(tmp_path):
+    """An immutable clean-database reader must reopen once a writer starts.
+
+    If a read-only MCP opens a cleanly closed palace before any writer is
+    alive, the connection uses immutable=1. A later daemon/HTTP writer creates
+    WAL sidecars; the cached immutable handle must not keep serving the
+    pre-writer snapshot forever.
+    """
+    writer_backend, writer = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    writer.add(
+        ids=["seed"],
+        documents=["seed drawer"],
+        metadatas=[{}],
+        embeddings=[[1, 0]],
+    )
+    # Force a full checkpoint so the on-disk database is clean (no WAL) when
+    # the first read-only open happens.
+    with writer._handle.lock:
+        writer._handle.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer._handle.conn.commit()
+    writer_backend.close_palace(palace)
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    wal_path = tmp_path / "sqlite_exact.sqlite3-wal"
+    shm_path = tmp_path / "sqlite_exact.sqlite3-shm"
+    assert db_path.is_file()
+    assert not wal_path.exists()
+    assert not shm_path.exists()
+
+    reader_backend = SQLiteExactBackend()
+    first = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    assert first.count() == 1
+    first_handle = first._handle
+    assert first_handle.immutable is True
+    assert first_handle.read_only is True
+
+    # A peer writer starts after the immutable reader cached its connection.
+    later_writer_backend, later_writer = _collection(tmp_path)
+    later_writer.add(
+        ids=["post-writer"],
+        documents=["written after immutable open"],
+        metadatas=[{}],
+        embeddings=[[0, 1]],
+    )
+    assert wal_path.is_file()
+    assert shm_path.is_file()
+
+    # Same backend instance: cache hit must detect WAL and reopen mode=ro.
+    second = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    assert first_handle.closed is True
+    assert second._handle is not first_handle
+    assert second._handle.immutable is False
+    assert second.count() == 2
+    got = second.get(ids=["post-writer"])
+    assert got.documents[0] == "written after immutable open"
+
+    later_writer_backend.close_palace(palace)
+    reader_backend.close_palace(palace)
+
+
 def test_sqlite_exact_direct_write_contends_with_palace_owner(tmp_path, monkeypatch):
     from mempalace.palace import MineAlreadyRunning
 

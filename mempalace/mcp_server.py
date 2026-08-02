@@ -416,6 +416,11 @@ def _discard_mcp_storage_handles() -> None:
     through its ``query_only`` connection. The inverse matters for embedded
     HTTP: close writable handles before releasing the lifetime lease so no
     storage client survives beyond the ownership interval.
+
+    Also clears per-process embedder-identity validation for this palace:
+    a prior read-only open of an empty collection may have cached a "validated"
+    key without recording identity on disk; promotion must re-run enforcement
+    so the first writable open still labels drawers with the active model.
     """
 
     global \
@@ -431,12 +436,22 @@ def _discard_mcp_storage_handles() -> None:
 
     cached_client = _client_cache
     try:
-        from .palace import get_backend_for_palace
+        from .palace import clear_validated_embedder_identity, get_backend_for_palace
 
         backend = get_backend_for_palace(_config.palace_path)
         backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
+        clear_validated_embedder_identity(_config.palace_path)
     except Exception:
         logger.debug("Failed to close cached backend while changing MCP ownership", exc_info=True)
+        try:
+            from .palace import clear_validated_embedder_identity
+
+            clear_validated_embedder_identity(getattr(_config, "palace_path", None))
+        except Exception:
+            logger.debug(
+                "Failed to clear embedder-identity cache while changing MCP ownership",
+                exc_info=True,
+            )
 
     if cached_client is not None:
         try:

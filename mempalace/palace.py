@@ -76,6 +76,23 @@ NORMALIZE_VERSION = 2
 _VALIDATED_IDENTITY: set = set()
 
 
+def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None:
+    """Drop cached embedder-identity verdicts so the next open re-checks.
+
+    Read-only opens of an empty collection can mark a key as validated without
+    recording identity on disk (``create=False``). When MCP later promotes that
+    reader to a writable owner, the writable open must re-run enforcement so
+    the first drawers still get labelled with the active model.
+    """
+    if palace_path is None:
+        _VALIDATED_IDENTITY.clear()
+        return
+    palace_key = str(palace_path)
+    stale = [key for key in _VALIDATED_IDENTITY if key and key[0] == palace_key]
+    for key in stale:
+        _VALIDATED_IDENTITY.discard(key)
+
+
 def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 

@@ -256,11 +256,16 @@ class _SQLiteExactHandle:
         palace_path: str,
         *,
         read_only: bool = False,
+        immutable: bool = False,
     ):
         self.conn = conn
         self.lock = lock
         self.palace_path = palace_path
         self.read_only = read_only
+        # True when opened with ``immutable=1`` because no WAL existed at connect
+        # time. A later writer can create WAL sidecars that this connection will
+        # never see, so the backend must reopen once those files appear.
+        self.immutable = immutable
         self.closed = False
 
 
@@ -886,10 +891,20 @@ class SQLiteExactBackend(BaseBackend):
         return os.path.join(palace_path, _DB_FILENAME)
 
     @staticmethod
-    def _connect_read_only(db_path: str) -> sqlite3.Connection:
-        """Open without creating WAL files while preserving an active WAL."""
-        wal_exists = os.path.isfile(f"{db_path}-wal")
-        shm_exists = os.path.isfile(f"{db_path}-shm")
+    def _wal_sidecar_state(db_path: str) -> tuple[bool, bool]:
+        return (
+            os.path.isfile(f"{db_path}-wal"),
+            os.path.isfile(f"{db_path}-shm"),
+        )
+
+    @staticmethod
+    def _connect_read_only(db_path: str) -> tuple[sqlite3.Connection, bool]:
+        """Open without creating WAL files while preserving an active WAL.
+
+        Returns ``(connection, immutable)``. ``immutable`` is True when the
+        database was clean (no WAL) and was opened with ``immutable=1``.
+        """
+        wal_exists, shm_exists = SQLiteExactBackend._wal_sidecar_state(db_path)
         if wal_exists != shm_exists:
             raise BackendError(
                 "sqlite_exact read-only open found an incomplete WAL sidecar set; "
@@ -903,12 +918,30 @@ class SQLiteExactBackend(BaseBackend):
             # sidecars already present, mode=ro can read them without creating
             # filesystem state, including on a read-only mount.
             db_uri = f"{db_uri}?mode=ro"
+            immutable = False
         else:
             # A clean WAL-mode database would otherwise make SQLite create new
             # -wal/-shm files while connecting. Immutable mode is safe here
-            # because there is no WAL whose contents could be hidden.
+            # only until a writer creates sidecars this connection would miss.
             db_uri = f"{db_uri}?mode=ro&immutable=1"
-        return sqlite3.connect(db_uri, uri=True, check_same_thread=False)
+            immutable = True
+        return sqlite3.connect(db_uri, uri=True, check_same_thread=False), immutable
+
+    def _retire_read_only_handle(self, palace_path: str, handle: _SQLiteExactHandle) -> None:
+        """Drop a cached read-only handle so the next open re-evaluates WAL state."""
+        self._read_only_clients.pop(palace_path, None)
+        with handle.lock:
+            if handle.closed:
+                return
+            handle.closed = True
+            try:
+                handle.conn.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close stale immutable sqlite_exact reader for %s",
+                    palace_path,
+                    exc_info=True,
+                )
 
     def _connect(self, palace_path: str, create: bool, *, read_only: bool = False):
         if self._closed:
@@ -937,11 +970,22 @@ class SQLiteExactBackend(BaseBackend):
             clients = self._read_only_clients if read_only else self._clients
             cached = clients.get(palace_path)
             if cached is not None and not cached.closed:
-                return cached
+                if read_only and cached.immutable:
+                    # An immutable snapshot freezes the clean-database view.
+                    # When a writer later creates WAL sidecars, keep serving
+                    # that snapshot only until both files exist, then reopen
+                    # with normal mode=ro so recall sees the writer's commits.
+                    wal_exists, shm_exists = self._wal_sidecar_state(db_path)
+                    if wal_exists or shm_exists:
+                        self._retire_read_only_handle(palace_path, cached)
+                        cached = None
+                if cached is not None:
+                    return cached
             if read_only:
-                conn = self._connect_read_only(db_path)
+                conn, immutable = self._connect_read_only(db_path)
             else:
                 conn = sqlite3.connect(db_path, check_same_thread=False)
+                immutable = False
             try:
                 conn.row_factory = sqlite3.Row
                 lock = threading.RLock()
@@ -950,6 +994,7 @@ class SQLiteExactBackend(BaseBackend):
                     lock,
                     palace_path,
                     read_only=read_only,
+                    immutable=immutable,
                 )
                 with handle.lock:
                     if read_only:

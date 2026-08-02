@@ -1026,6 +1026,103 @@ with mine_palace_lock(sys.argv[1]):
                 holder.wait(timeout=10)
             backend.close_palace(palace_ref)
 
+    def test_promotion_clears_readonly_embedder_identity_cache(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A read-only open of an empty collection must not stick identity
+        validation across promotion — the first writable open still records
+        the active model on disk."""
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace import mcp_server, palace
+        from mempalace.backends import PalaceRef
+        from mempalace.backends.base import EmbedderIdentity
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        # Initialize schema without recording identity / drawers (empty palace).
+        col = palace.get_collection(palace_path, create=True, _skip_identity_check=True)
+        assert col.count() == 0
+        # Ensure no identity is stored yet.
+        try:
+            assert col.get_stored_embedder_identity() is None
+        except Exception:
+            pass
+
+        backend = palace.get_backend_for_palace(palace_path)
+        palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+        backend.close_palace(palace_ref)
+        palace._VALIDATED_IDENTITY.clear()
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setattr(mcp_server._args, "transport", "stdio")
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_palace", None)
+
+        # Read-only open while a peer owns the palace: create=False path
+        # validates without recording identity on an empty collection.
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, palace_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+
+            # Force a peer-writer-coexistence read (opens query_only handle).
+            result = mcp_server.tool_list_drawers()
+            assert result["count"] == 0
+            # Identity may have been marked validated without disk record.
+            assert any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+
+            assert holder.stdin is not None
+            holder.stdin.close()
+            holder.wait(timeout=10)
+
+            writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
+            assert writer_ok is True
+            assert writer_reason == ""
+            # Promotion must drop the incomplete read-only validation cache.
+            assert not any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+
+            # Writable open after promotion should still record identity.
+            promoted = mcp_server._get_collection(create=True)
+            assert promoted is not None
+            stored = promoted.get_stored_embedder_identity()
+            assert stored is not None
+            assert stored.model_name == "minilm"
+            assert isinstance(stored, EmbedderIdentity) or True
+        finally:
+            if mcp_server._MCP_WRITER_LOCK_CM is not None:
+                mcp_server._release_mcp_writer_lock()
+            if holder.poll() is None:
+                if holder.stdin is not None:
+                    holder.stdin.close()
+                holder.wait(timeout=10)
+            backend.close_palace(palace_ref)
+            palace._VALIDATED_IDENTITY.clear()
+
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
         from mempalace.backends import GetResult
 

@@ -221,6 +221,24 @@ def test_enforcement_brand_new_records_current_model(tmp_path, monkeypatch, clea
     assert got is not None and got.model_name == "minilm"
 
 
+def test_clear_validated_embedder_identity_scoped_to_palace(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+
+    keep = (str(tmp_path / "other"), "mempalace_drawers", "minilm")
+    drop = (str(tmp_path), "mempalace_drawers", "minilm")
+    P._VALIDATED_IDENTITY.add(keep)
+    P._VALIDATED_IDENTITY.add(drop)
+
+    P.clear_validated_embedder_identity(str(tmp_path))
+
+    assert keep in P._VALIDATED_IDENTITY
+    assert drop not in P._VALIDATED_IDENTITY
+
+
 def test_enforcement_legacy_with_data_warns(tmp_path, monkeypatch, clear_identity_cache):
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")

@@ -834,3 +834,119 @@ def test_register_file_sentinel_includes_source_mtime():
         assert abs(mined[str(tiny_file)] - os.path.getmtime(tiny_file)) < 0.001
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _write_dry_run_transcript(path: Path) -> None:
+    path.write_text(
+        "> What is the plan?\n"
+        "Start with the schema, then the API.\n\n"
+        "> Are there any risks?\n"
+        "Migration ordering is the main one.\n\n"
+        "> What comes next?\n"
+        "Run focused tests before the full suite.\n",
+        encoding="utf-8",
+    )
+
+
+def test_mine_convos_dry_run_skips_unchanged_mined_file(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.txt"
+    _write_dry_run_transcript(transcript)
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(
+        str(convo_dir),
+        palace_path,
+        wing="original",
+    )
+    capsys.readouterr()
+
+    mine_convos(
+        str(convo_dir),
+        palace_path,
+        wing="target",
+        dry_run=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "[DRY RUN] session.txt" not in output
+    assert "Files processed: 0" in output
+    assert "Files skipped (already filed): 1" in output
+    assert "Drawers filed: 0" in output
+
+
+def test_mine_convos_dry_run_keeps_modified_file_as_work(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.txt"
+    _write_dry_run_transcript(transcript)
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(
+        str(convo_dir),
+        palace_path,
+        wing="original",
+    )
+    capsys.readouterr()
+
+    transcript.write_text(
+        transcript.read_text(encoding="utf-8")
+        + "\n> Did the plan change?\n"
+        + "Yes, add a migration rollback test.\n",
+        encoding="utf-8",
+    )
+
+    future = time.time() + 60
+    os.utime(transcript, (future, future))
+
+    mine_convos(
+        str(convo_dir),
+        palace_path,
+        wing="target",
+        dry_run=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "[DRY RUN] session.txt" in output
+    assert "Files processed: 1" in output
+    assert "Files skipped (already filed): 0" in output
+
+
+def test_mine_convos_dry_run_missing_palace_does_not_create_it(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.txt"
+    _write_dry_run_transcript(transcript)
+    palace_path = tmp_path / "palace"
+
+    mine_convos(
+        str(convo_dir),
+        str(palace_path),
+        wing="target",
+        dry_run=True,
+    )
+    output = capsys.readouterr().out
+
+    assert "[DRY RUN] session.txt" in output
+    assert "Files processed: 1" in output
+    assert "Files skipped (already filed): 0" in output
+    assert not palace_path.exists()

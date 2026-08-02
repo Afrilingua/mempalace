@@ -1711,7 +1711,12 @@ class TestDrawerGrepExpansion:
         )
 
         result = search_memories("JWT authentication", palace_path)
-        assert result["results"]
+        # Surface the full envelope when search fails (Windows CI has flaked
+        # with KeyError on a bare ``result["results"]`` after a mid-query
+        # error dict that lacked the key).
+        assert "results" in result, f"search envelope missing results: {result!r}"
+        assert result["results"], f"hybrid search returned no hits: {result!r}"
+        assert "error" not in result, f"hybrid search failed: {result!r}"
         boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
         assert boosted, "hybrid search should mark the closet-agreeing source"
         top = boosted[0]

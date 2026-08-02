@@ -551,6 +551,49 @@ def test_sqlite_exact_read_only_reopens_when_wal_appears_after_immutable_open(tm
     reader_backend.close_palace(palace)
 
 
+def test_sqlite_exact_immutable_reader_keeps_cache_on_partial_wal_sidecar(tmp_path):
+    """A lone -wal or -shm file must not retire the immutable reader.
+
+    Incomplete sidecar pairs are a transient mid-open state; forcing a
+    reconnect would raise from ``_connect_read_only`` and break recall.
+    """
+    writer_backend, writer = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    writer.add(ids=["seed"], documents=["seed"], metadatas=[{}], embeddings=[[1, 0]])
+    with writer._handle.lock:
+        writer._handle.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer._handle.conn.commit()
+    writer_backend.close_palace(palace)
+
+    wal_path = tmp_path / "sqlite_exact.sqlite3-wal"
+    shm_path = tmp_path / "sqlite_exact.sqlite3-shm"
+    assert not wal_path.exists() and not shm_path.exists()
+
+    reader_backend = SQLiteExactBackend()
+    first = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    first_handle = first._handle
+    assert first_handle.immutable is True
+
+    # Simulate a torn writer open: only one sidecar present.
+    wal_path.write_bytes(b"not-a-real-wal")
+    second = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    assert second._handle is first_handle
+    assert first_handle.closed is False
+    assert second.count() == 1
+
+    reader_backend.close_palace(palace)
+
+
 def test_sqlite_exact_direct_write_contends_with_palace_owner(tmp_path, monkeypatch):
     from mempalace.palace import MineAlreadyRunning
 

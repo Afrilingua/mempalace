@@ -972,11 +972,12 @@ class SQLiteExactBackend(BaseBackend):
             if cached is not None and not cached.closed:
                 if read_only and cached.immutable:
                     # An immutable snapshot freezes the clean-database view.
-                    # When a writer later creates WAL sidecars, keep serving
-                    # that snapshot only until both files exist, then reopen
-                    # with normal mode=ro so recall sees the writer's commits.
+                    # Reopen only when the complete WAL sidecar pair is present
+                    # (active writer). A partial pair is a transient mid-open
+                    # state — keep the immutable handle rather than forcing a
+                    # reconnect that would raise on the incomplete set.
                     wal_exists, shm_exists = self._wal_sidecar_state(db_path)
-                    if wal_exists or shm_exists:
+                    if wal_exists and shm_exists:
                         self._retire_read_only_handle(palace_path, cached)
                         cached = None
                 if cached is not None:

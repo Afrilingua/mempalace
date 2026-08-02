@@ -600,7 +600,11 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
-                if content_hash is not None:
+                # Stamp content_hash only on chunk 0 so multi-conversation
+                # privacy-export hashes are not O(N²)-duplicated across every
+                # chunk row. ``prefetch_content_hashes`` still finds them —
+                # it scans all drawers and splits comma-joined hash fields.
+                if content_hash is not None and chunk.get("chunk_index", 0) == 0:
                     meta["content_hash"] = content_hash
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)

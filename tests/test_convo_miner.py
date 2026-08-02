@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import shutil
@@ -568,6 +569,143 @@ def test_mine_convos_grown_file_purges_stale_drawers_not_additive(capsys):
             f"original exchange duplicated across re-mine: {original_hits} copies"
         )
         assert new_hits == 1, f"new exchange should appear exactly once, got {new_hits}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_skips_same_content_under_new_filename(capsys):
+    """Re-exporting the same conversation from Claude/ChatGPT under a new
+    filename (fresh export bundle, regenerated slug, etc.) must not create
+    a duplicate set of drawers -- only the exact-new content should file."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        transcript = (
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        (Path(tmpdir) / "export_2026-01-01.txt").write_text(transcript)
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        count_after_first = col.count()
+        assert count_after_first >= 2
+
+        # Simulate a later export: the same conversation lands under a new
+        # filename, alongside one genuinely new conversation.
+        (Path(tmpdir) / "export_2026-02-01.txt").write_text(transcript)
+        (Path(tmpdir) / "export_2026-02-01_new.txt").write_text(
+            "> What's next?\nUNIQUE_SECOND_EXPORT_MARKER covers the new work.\n"
+        )
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "duplicate of export_2026-01-01.txt" in out
+
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get(include=["documents"])["documents"]
+        dup_hits = sum(1 for d in docs if "Migration ordering is the main one" in d)
+        assert dup_hits == 1, f"duplicate transcript re-filed: {dup_hits} copies"
+        assert any("UNIQUE_SECOND_EXPORT_MARKER" in d for d in docs)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _privacy_export_bundle(conversations):
+    """Build a Claude.ai privacy-export-shaped JSON payload: an array of
+    conversation objects, each with its own chat_messages list."""
+    return [
+        {
+            "chat_messages": [
+                {"sender": "human", "text": turn}
+                if i % 2 == 0
+                else {"sender": "assistant", "text": turn}
+                for i, turn in enumerate(turns)
+            ]
+        }
+        for turns in conversations
+    ]
+
+
+def test_mine_convos_skips_same_conversation_within_re_exported_bundle(capsys):
+    """A Claude.ai privacy export bundles every conversation into one JSON
+    file. Re-exporting that bundle under a new filename with one additional
+    conversation must not re-file the conversations that didn't change --
+    hashing the whole bundle would change the file-level hash the moment
+    any conversation is added, hiding the ones that are still duplicates.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_a = ["What is the plan?", "CONVO_A_MARKER: start with the schema."]
+        convo_b = ["Any risks?", "CONVO_B_MARKER: migration ordering is the main one."]
+        convo_c = ["What's next?", "CONVO_C_MARKER: covers the new work."]
+
+        bundle1 = _privacy_export_bundle([convo_a, convo_b])
+        (Path(tmpdir) / "export_2026-01-01.json").write_text(json.dumps(bundle1))
+
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        docs_after_first = col.get(include=["documents"])["documents"]
+        assert any("CONVO_A_MARKER" in d for d in docs_after_first)
+        assert any("CONVO_B_MARKER" in d for d in docs_after_first)
+
+        # Re-export: same two conversations plus one genuinely new one, all
+        # under a fresh filename (as a real re-export from Claude would do).
+        bundle2 = _privacy_export_bundle([convo_a, convo_b, convo_c])
+        (Path(tmpdir) / "export_2026-02-01.json").write_text(json.dumps(bundle2))
+
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get(include=["documents"])["documents"]
+        a_hits = sum(1 for d in docs if "CONVO_A_MARKER" in d)
+        b_hits = sum(1 for d in docs if "CONVO_B_MARKER" in d)
+        c_hits = sum(1 for d in docs if "CONVO_C_MARKER" in d)
+        assert a_hits == 1, f"conversation A re-filed from the updated bundle: {a_hits} copies"
+        assert b_hits == 1, f"conversation B re-filed from the updated bundle: {b_hits} copies"
+        assert c_hits >= 1, "new conversation C was not filed at all"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_content_dedup_is_scoped_per_wing():
+    """Mining the same transcript content into a second wing must file real
+    drawers there, not just the registry sentinel -- the content-hash map
+    is a dedup signal within a wing, not a cross-wing "already have this
+    content anywhere" gate.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        transcript = (
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        dir_a = Path(tmpdir) / "wing_a_src"
+        dir_b = Path(tmpdir) / "wing_b_src"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "session.txt").write_text(transcript)
+        (dir_b / "session.txt").write_text(transcript)
+
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(str(dir_a), palace_path, wing="wing_a")
+        mine_convos(str(dir_b), palace_path, wing="wing_b")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        wing_b_docs = col.get(where={"wing": "wing_b"}, include=["documents", "metadatas"])
+        real_drawers = [
+            d
+            for d, m in zip(wing_b_docs["documents"], wing_b_docs["metadatas"])
+            if m.get("room") != "_registry"
+        ]
+        assert real_drawers, (
+            "wing_b holds only the registry sentinel -- content dedup leaked across wings"
+        )
+        assert any("Migration ordering is the main one" in d for d in real_drawers)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

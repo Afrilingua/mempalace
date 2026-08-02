@@ -11,6 +11,7 @@ Same palace as project mining. Different ingest strategy.
 import os
 import sys
 import json
+import hashlib
 import logging
 import stat
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Optional
 
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
-from .normalize import normalize
+from .normalize import normalize_conversations
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -31,6 +32,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_palace_lock,
+    prefetch_content_hashes,
     prefetch_mined_set,
 )
 
@@ -117,7 +119,14 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    content_hash: Optional[str] = None,
+):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
@@ -128,6 +137,11 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     grows past the min-chunk-size floor (e.g. a short session that gets
     extended) is correctly detected as changed on the next mine instead of
     being skipped forever by this sentinel.
+
+    Also used to register a file recognized as a content-duplicate of an
+    already-mined transcript under a different path (see
+    ``prefetch_content_hashes``) — stamping it here means the next run skips
+    it via the cheap mtime check instead of re-normalizing and re-hashing it.
     """
     try:
         source_mtime = os.path.getmtime(source_file)
@@ -147,6 +161,8 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     }
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
+    if content_hash is not None:
+        meta["content_hash"] = content_hash
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -487,7 +503,15 @@ def _extract_authored_at(filepath):
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    content_hash=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -560,6 +584,8 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                if content_hash is not None:
+                    meta["content_hash"] = content_hash
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
@@ -602,6 +628,32 @@ def _is_ai_tool_path(path: Path) -> bool:
         if parts[i] == ".claude" and parts[i + 1] == "projects":
             return True
     return False
+
+
+def _split_new_and_duplicate_conversations(
+    conversations: list,
+    wing: str,
+    source_file: str,
+    mined_content_hashes: dict,
+) -> tuple:
+    """Hash each conversation and split them into (new, duplicate) lists.
+
+    A conversation is a duplicate when its hash is already registered under
+    a *different* source_file in the same wing — mining the same transcript
+    into a second wing is a deliberate re-file, not a repeat, so the lookup
+    is scoped to (wing, hash). Returns ([(hash, text), ...] new, [(hash,
+    dup_source_file), ...] duplicates).
+    """
+    new_items = []
+    duplicates = []
+    for conversation in conversations:
+        content_hash = hashlib.sha256(conversation.strip().encode("utf-8")).hexdigest()
+        dup_source = mined_content_hashes.get((wing, content_hash))
+        if dup_source is None or dup_source == source_file:
+            new_items.append((content_hash, conversation))
+        else:
+            duplicates.append((content_hash, dup_source))
+    return new_items, duplicates
 
 
 def _is_unchanged_since_last_mine(source_file: str, mined_mtimes: dict) -> bool:
@@ -721,6 +773,43 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         print(f"  (hallways skipped: {exc})")
 
 
+def _normalize_convo_conversations(
+    filepath: Path,
+    source_file: str,
+    cfg_min_chunk_size: int,
+    collection,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    dry_run: bool,
+) -> Optional[list]:
+    """Normalize a transcript file into its individual conversations,
+    registering it as filed when there's nothing worth mining. Returns None
+    when the caller should skip the file (normalize failed, or normalized
+    content is too short to chunk).
+
+    Kept as separate conversations rather than joined into one string so
+    dedup can hash and skip per conversation — a Claude.ai privacy export
+    bundles every conversation into a single file, and hashing the joined
+    bundle means one new conversation added to a re-export changes the
+    whole-file hash and hides the conversations that didn't change.
+    """
+    try:
+        conversations = [c for c in normalize_conversations(str(filepath)) if c]
+    except (OSError, ValueError):
+        if not dry_run:
+            _register_file(collection, source_file, wing, agent, extract_mode)
+        return None
+
+    total_len = sum(len(c.strip()) for c in conversations)
+    if not conversations or total_len < cfg_min_chunk_size:
+        if not dry_run:
+            _register_file(collection, source_file, wing, agent, extract_mode)
+        return None
+
+    return conversations
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -773,6 +862,14 @@ def _mine_convos_impl(
     mined_mtimes: dict = (
         prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
     )
+    # content_hash -> source_file for transcripts already filed. Repeated
+    # exports from Claude/ChatGPT commonly land under a new filename each
+    # run even when the conversation itself is unchanged, so the
+    # source_file-keyed skip above ("mined_mtimes") never recognizes them —
+    # this catches the same conversation reappearing at a new path.
+    mined_content_hashes: dict = (
+        prefetch_content_hashes(collection, extract_mode=extract_mode) if not dry_run else {}
+    )
 
     total_drawers = 0
     files_mined = 0
@@ -800,18 +897,42 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
-        # Normalize format
-        try:
-            content = normalize(str(filepath))
-        except (OSError, ValueError):
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+        conversations = _normalize_convo_conversations(
+            filepath,
+            source_file,
+            cfg_min_chunk_size,
+            collection,
+            wing,
+            agent,
+            extract_mode,
+            dry_run,
+        )
+        if conversations is None:
             continue
 
-        if not content or len(content.strip()) < cfg_min_chunk_size:
+        # Hash and dedup per conversation, not per file: a Claude/ChatGPT
+        # privacy export bundles every conversation into one file, so a
+        # re-export that adds one new conversation changes the whole-file
+        # hash and would hide the conversations that didn't change if we
+        # hashed the joined bundle. Conversations whose hash is already
+        # filed under a different source_file in this wing are dropped;
+        # the rest are re-joined and mined as usual.
+        new_items, duplicates = _split_new_and_duplicate_conversations(
+            conversations, wing, source_file, mined_content_hashes
+        )
+        if not new_items:
             if not dry_run:
                 _register_file(collection, source_file, wing, agent, extract_mode)
+            dup_source = duplicates[0][1]
+            print(
+                f"  = [{i:4}/{len(files)}] {filepath.name[:50]:50} "
+                f"duplicate of {Path(dup_source).name}"
+            )
+            files_skipped += 1
             continue
+
+        content = "\n\n".join(text for _, text in new_items)
+        content_hash = ",".join(h for h, _ in new_items)
 
         # Chunk — either exchange pairs or general extraction
         if extract_mode == "general":
@@ -872,6 +993,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            content_hash=content_hash,
         )
         if skipped:
             files_skipped += 1
@@ -879,6 +1001,8 @@ def _mine_convos_impl(
         for r, n in room_delta.items():
             room_counts[r] += n
 
+        for h, _ in new_items:
+            mined_content_hashes[(wing, h)] = source_file
         total_drawers += drawers_added
         files_mined += 1
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")

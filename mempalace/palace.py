@@ -155,10 +155,29 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
         return
 
     if state == "unknown" and stored is None:
+        # Preflight HNSW divergence before touching count(): this is the
+        # universal chokepoint every tool passes through via
+        # get_collection(), and count() on a diverged segment can raise
+        # chromadb's rust-level pyo3_runtime.PanicException or hard-segfault
+        # (#1222) -- neither of which the except Exception below can catch,
+        # since a native crash takes the whole process down regardless of
+        # any Python try/except. A diverged palace must never reach count()
+        # here; this bookkeeping-only identity check simply skips itself
+        # (count treated as unknown, matching the except-Exception fallback
+        # already below) rather than risk the read.
         try:
-            count = collection.count()
+            from .backends.chroma import hnsw_capacity_status
+
+            diverged = hnsw_capacity_status(str(palace_path), str(collection_name)).get("diverged")
         except Exception:
+            diverged = False
+        if diverged:
             count = None
+        else:
+            try:
+                count = collection.count()
+            except Exception:
+                count = None
         if count == 0:
             if create:
                 try:

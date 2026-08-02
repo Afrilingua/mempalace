@@ -331,6 +331,17 @@ def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str]
     print(f"\n  Palace: {palace_path}")
     print("  Loading...")
 
+    # Preflight HNSW divergence before opening the collection: count() on a
+    # diverged segment can hit the #1222 SIGSEGV/panic class, which a
+    # try/except around count() cannot catch (a native crash takes the
+    # whole process down). scan_palace is meant to find corruption, not
+    # crash on the exact corruption class it should be reporting.
+    capacity_info = hnsw_capacity_status(palace_path, collection_name)
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print(index_read_recovery_guidance())
+        return set(), set()
+
     col = ChromaBackend().get_collection(palace_path, collection_name)
 
     where = {"wing": only_wing} if only_wing else None
@@ -414,6 +425,15 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     if not confirm:
         print("\n  DRY RUN — no deletions performed.")
         print("  Re-run with --confirm to actually delete.")
+        return
+
+    # Preflight HNSW divergence before opening the collection — see
+    # scan_palace's identical guard for why this can't rely on except
+    # Exception around count() alone.
+    capacity_info = hnsw_capacity_status(palace_path, collection_name)
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print(index_read_recovery_guidance())
         return
 
     col = ChromaBackend().get_collection(palace_path, collection_name)
@@ -1018,6 +1038,19 @@ def rebuild_index(
     if preflight is not None:
         return
 
+    # Preflight HNSW divergence before opening the collection: status()
+    # already has this same guard via hnsw_capacity_status (docstring above
+    # this module's status() references it as "the safe pattern"), but
+    # rebuild_index -- the legacy rebuild the CLI's rebuild-index subcommand
+    # dispatches straight to -- opens the collection and calls col.count()
+    # directly, wrapped only in except Exception, which cannot catch the
+    # #1222 SIGSEGV/panic class a diverged segment triggers.
+    capacity_info = hnsw_capacity_status(palace_path, collection_name)
+    if capacity_info.get("diverged"):
+        progress(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        progress(index_read_recovery_guidance())
+        return
+
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace_path, collection_name)
@@ -1098,6 +1131,23 @@ def rebuild_index(
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print("  HNSW index is now clean with cosine distance metric.")
+
+    # rebuild_index only ever touches collection_name (drawers by default).
+    # status() checks divergence for BOTH drawers and closets and recommends
+    # --mode from-sqlite (which rebuilds both via _recoverable_collections()),
+    # but a caller who ran this legacy rebuild instead would otherwise see
+    # an unqualified "Repair complete" even when closets remains diverged
+    # and just as capable of crashing reads via the same #1222 mechanism (#13).
+    if collection_name == _drawers_collection_name():
+        closets_info = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
+        if closets_info.get("diverged"):
+            print(
+                f"\n  NOTE: the closets index is still diverged "
+                f"({closets_info.get('message', '')}).\n"
+                "  This rebuild only covers drawers. Run "
+                "`mempalace repair --mode from-sqlite --archive-existing`\n"
+                "  to rebuild closets too."
+            )
     print(f"\n{'=' * 55}\n")
 
 

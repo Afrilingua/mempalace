@@ -5,7 +5,36 @@ import chromadb
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
-from mempalace.palace import _open_collection_or_explain, get_collection
+from mempalace.palace import (
+    _open_collection_or_explain,
+    backend_requires_single_writer,
+    get_collection,
+)
+
+
+def test_backend_writer_ownership_distinguishes_milvus_lite_from_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    monkeypatch.delenv("MEMPALACE_MILVUS_URI", raising=False)
+    assert backend_requires_single_writer("milvus") is True
+
+    monkeypatch.setenv("MEMPALACE_MILVUS_URI", str(tmp_path / "milvus.db"))
+    assert backend_requires_single_writer("milvus") is True
+
+    for uri in (
+        "https://zilliz.example",
+        "http://milvus.example:19530",
+        "tcp://milvus.example:19530",
+        "grpc://milvus.example:19530",
+    ):
+        monkeypatch.setenv("MEMPALACE_MILVUS_URI", uri)
+        assert backend_requires_single_writer("milvus") is False
+
+
+def test_backend_writer_ownership_remains_conservative_for_unknown_backend():
+    assert backend_requires_single_writer("plugin_backend") is True
+    assert backend_requires_single_writer("qdrant") is False
+    assert backend_requires_single_writer("pgvector") is False
 
 
 def _capture():

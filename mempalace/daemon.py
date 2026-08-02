@@ -28,6 +28,12 @@ from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
 from .config import MempalaceConfig
+from .palace import (
+    MineAlreadyRunning,
+    backend_requires_single_writer,
+    mine_palace_lock,
+    resolve_backend_name,
+)
 
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
@@ -633,6 +639,49 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[s
     handler.close_connection = True
 
 
+def _restore_server_process_state(previous_env: dict[str, str | None], previous_umask: int) -> None:
+    for key, value in previous_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    os.umask(previous_umask)
+
+
+def _close_writer_lease_after_worker(
+    writer_lease: contextlib.ExitStack,
+    worker: threading.Thread,
+) -> None:
+    """Retain writer ownership until a timed-out daemon worker really exits.
+
+    The normal daemon process may terminate first, in which case the operating
+    system releases the file lock. When ``run_server`` is embedded in a larger
+    process, this reaper prevents the server thread from exposing the palace to
+    another writer while the old worker is still finishing a mutation.
+    """
+
+    def _wait_and_close() -> None:
+        worker.join()
+        writer_lease.close()
+
+    threading.Thread(
+        target=_wait_and_close,
+        name="mempalace-daemon-writer-lease-reaper",
+        daemon=True,
+    ).start()
+
+
+def _close_or_defer_writer_lease(
+    writer_lease: contextlib.ExitStack,
+    runtime: "DaemonRuntime | None",
+) -> None:
+    worker = runtime.worker_thread if runtime is not None else None
+    if worker is not None and worker.is_alive():
+        _close_writer_lease_after_worker(writer_lease, worker)
+    else:
+        writer_lease.close()
+
+
 def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
@@ -651,8 +700,31 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     # QueueStore (its _init_db opens the DB in WAL mode) — not only once the HTTP
     # server starts. Restored in the finally at the end of run_server.
     prev_umask = os.umask(0o077)
-    token = ensure_token(palace_path)
-    runtime = DaemonRuntime(palace_path, backend=backend)
+    runtime = None
+    writer_lease = contextlib.ExitStack()
+    try:
+        resolved_backend = resolve_backend_name(palace_path, explicit=backend)
+        if backend_requires_single_writer(resolved_backend):
+            try:
+                writer_lease.enter_context(mine_palace_lock(palace_path))
+            except MineAlreadyRunning as exc:
+                raise DaemonError(
+                    "writable daemon startup refused: another writer owns "
+                    f"local backend {resolved_backend!r} for {palace_path!r}; "
+                    "stop the existing writable MCP/direct/daemon owner, or "
+                    "route all writes through that owner"
+                ) from exc
+
+        token = ensure_token(palace_path)
+        # Backend resolution above is only the ownership decision. Preserve
+        # the caller's explicit/implicit distinction in queued payloads:
+        # DaemonRuntime historically injects a backend only when one was
+        # explicitly selected.
+        runtime = DaemonRuntime(palace_path, backend=backend)
+    except BaseException:
+        writer_lease.close()
+        _restore_server_process_state(previous_env, prev_umask)
+        raise
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -803,7 +875,8 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             finally:
                 _drain_and_cleanup(runtime, palace_path, previous_env)
     finally:
-        os.umask(prev_umask)
+        _close_or_defer_writer_lease(writer_lease, runtime)
+        _restore_server_process_state(previous_env, prev_umask)
 
 
 def _drain_and_cleanup(

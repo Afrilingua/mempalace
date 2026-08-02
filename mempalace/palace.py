@@ -76,6 +76,23 @@ NORMALIZE_VERSION = 2
 _VALIDATED_IDENTITY: set = set()
 
 
+def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None:
+    """Drop cached embedder-identity verdicts so the next open re-checks.
+
+    Read-only opens of an empty collection can mark a key as validated without
+    recording identity on disk (``create=False``). When MCP later promotes that
+    reader to a writable owner, the writable open must re-run enforcement so
+    the first drawers still get labelled with the active model.
+    """
+    if palace_path is None:
+        _VALIDATED_IDENTITY.clear()
+        return
+    palace_key = str(palace_path)
+    stale = [key for key in _VALIDATED_IDENTITY if key and key[0] == palace_key]
+    for key in stale:
+        _VALIDATED_IDENTITY.discard(key)
+
+
 def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
     """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
 
@@ -165,9 +182,14 @@ def get_collection(
     collection_name: Optional[str] = None,
     create: bool = True,
     backend: Optional[str] = None,
+    read_only: bool = False,
     _skip_identity_check: bool = False,
 ):
     """Get the palace collection through the backend layer.
+
+    ``read_only=True`` asks local backends to open storage without schema
+    initialization, migrations, or metadata writes. Backends that support a
+    genuine read-only mode receive it through the backend ``options`` mapping.
 
     ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
     ``set-embedder`` override path can open a palace whose recorded model
@@ -179,20 +201,26 @@ def get_collection(
         collection_name = get_configured_collection_name()
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+    backend_options = {"read_only": True} if read_only else None
+    preferred_kwargs = {
+        "palace": palace_ref,
+        "collection_name": collection_name,
+        "create": create,
+    }
+    if backend_options is not None:
+        preferred_kwargs["options"] = backend_options
     try:
-        collection = backend_obj.get_collection(
-            palace=palace_ref,
-            collection_name=collection_name,
-            create=create,
-        )
+        collection = backend_obj.get_collection(**preferred_kwargs)
     except TypeError as exc:
         if "unexpected keyword argument 'palace'" not in str(exc):
             raise
-        collection = backend_obj.get_collection(
-            palace_path,
-            collection_name=collection_name,
-            create=create,
-        )
+        legacy_kwargs = {
+            "collection_name": collection_name,
+            "create": create,
+        }
+        if backend_options is not None:
+            legacy_kwargs["options"] = backend_options
+        collection = backend_obj.get_collection(palace_path, **legacy_kwargs)
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:
@@ -330,6 +358,29 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
             f"but {selected!r} was selected"
         )
     return selected
+
+
+_MULTI_PROCESS_WRITER_BACKENDS = frozenset({"pgvector", "qdrant"})
+
+
+def backend_requires_single_writer(backend_name: str) -> bool:
+    """Return whether a backend needs one process-lifetime writer owner.
+
+    Local file-backed backends cannot safely coordinate independent long-lived
+    clients by serializing only individual calls: each process may retain
+    SQLite/WAL, FTS, or vector-index state across operations. Unknown and
+    plugin backends are treated conservatively. Only backends whose storage
+    service is explicitly responsible for cross-process concurrency opt out.
+    """
+    normalized = backend_name.strip().lower()
+    if normalized == "milvus":
+        # Only embedded Milvus Lite is local single-writer storage. A remote
+        # Milvus server or Zilliz Cloud coordinates concurrent clients itself.
+        from .backends.milvus import milvus_uri_is_server
+        from .config import MempalaceConfig
+
+        return not milvus_uri_is_server(MempalaceConfig().milvus_uri)
+    return normalized not in _MULTI_PROCESS_WRITER_BACKENDS
 
 
 def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):

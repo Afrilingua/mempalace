@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -9,6 +10,16 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace import daemon
 from mempalace import service
+
+_LOCK_CONTENDER = """
+from mempalace.palace import MineAlreadyRunning, mine_palace_lock
+import sys
+try:
+    with mine_palace_lock(sys.argv[1]):
+        raise SystemExit(0)
+except MineAlreadyRunning:
+    raise SystemExit(23)
+"""
 
 # POSIX file-mode bits (0600/0700) are not representable on Windows: os.chmod
 # can only toggle the read-only attribute, so a "private" file still reports
@@ -130,6 +141,31 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     assert calls == [("mine", {"source": "src", "palace_path": str(palace.resolve())})]
 
     _stop_server(client, thread, holders)
+
+
+def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda kind, payload: {"success": True, "exit_code": 0}
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+            check=False,
+            env=os.environ.copy(),
+            timeout=10,
+        )
+        assert result.returncode == 23
+    finally:
+        _stop_server(client, thread, holders)
+
+    released = subprocess.run(
+        [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+        check=False,
+        env=os.environ.copy(),
+        timeout=10,
+    )
+    assert released.returncode == 0
 
 
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
@@ -340,8 +376,30 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
     # And recover_running must not re-queue a cancelled job.
     assert store.recover_running() == 0
 
+    # The server thread is gone, but its timed-out worker is still executing.
+    # Writer ownership must stay with that worker until it truly exits.
+    contender = subprocess.run(
+        [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+        check=False,
+        env=os.environ.copy(),
+        timeout=10,
+    )
+    assert contender.returncode == 23
+
     # Release the blocked worker so it (and the daemon thread) can exit.
     block.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        released = subprocess.run(
+            [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+            check=False,
+            env=os.environ.copy(),
+            timeout=10,
+        )
+        if released.returncode == 0:
+            break
+        time.sleep(0.02)
+    assert released.returncode == 0
 
 
 def test_recover_running_dead_letters_exhausted_jobs(tmp_path, monkeypatch):

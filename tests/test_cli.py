@@ -1909,6 +1909,7 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         source=None,
         archive_existing=False,
         yes=True,
+        dry_run=False,
     )
     fake_counts = {"mempalace_drawers": 1, "mempalace_closets": 0}
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts) as rebuild:
@@ -1918,4 +1919,5 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         source_palace=str(palace_dir),
         dest_palace=str(palace_dir),
         archive_existing_dest=True,
+        dry_run=False,
     )

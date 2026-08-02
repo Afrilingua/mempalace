@@ -132,7 +132,7 @@ Output includes the token and the exact client command. Useful flags:
 | `--port` | `8765` | Listen port |
 | `--backend` | config/env | Storage backend (e.g. `qdrant`) |
 | `--tls-cert` / `--tls-key` | _(none)_ | PEM cert + key to terminate **TLS natively** (server speaks `https`) |
-| `--read-only` | off | Expose recall only — the mutating tools are hidden and refused |
+| `--read-only` | off | Expose recall only — the tools that change state are hidden and refused |
 | `--token` | auto | Use a specific bearer token instead of the generated one |
 | `--allow-insecure` | off | Permit a non-loopback bind with no token (only behind a trusted proxy) |
 

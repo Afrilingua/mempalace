@@ -1839,6 +1839,35 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_dry_run_passes_through_and_skips_confirm(mock_config_cls, tmp_path):
+    """``repair --mode from-sqlite --dry-run`` must forward dry_run and skip
+    the destructive confirmation prompt (#2095, #2133)."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="from-sqlite",
+        source=None,
+        archive_existing=False,
+        yes=False,
+        dry_run=True,
+    )
+    with (
+        patch(
+            "mempalace.repair.rebuild_from_sqlite",
+            return_value={"mempalace_drawers": 0, "mempalace_closets": 0},
+        ) as mock_rebuild,
+        patch("mempalace.migrate.confirm_destructive_action") as mock_confirm,
+    ):
+        cmd_repair(args)
+
+    mock_confirm.assert_not_called()
+    assert mock_rebuild.call_args.kwargs["dry_run"] is True
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_from_sqlite_cleanup_failure_exits_nonzero(mock_config_cls, tmp_path, capsys):
     from mempalace.repair import RebuildCleanupError
 
@@ -1880,6 +1909,7 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         source=None,
         archive_existing=False,
         yes=True,
+        dry_run=False,
     )
     fake_counts = {"mempalace_drawers": 1, "mempalace_closets": 0}
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts) as rebuild:
@@ -1889,4 +1919,5 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         source_palace=str(palace_dir),
         dest_palace=str(palace_dir),
         archive_existing_dest=True,
+        dry_run=False,
     )

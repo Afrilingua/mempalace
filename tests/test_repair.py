@@ -2377,6 +2377,49 @@ def test_rebuild_from_sqlite_source_missing_chroma_db(tmp_path):
     assert not dest.exists()
 
 
+def test_rebuild_from_sqlite_dry_run_cross_palace_writes_nothing(tmp_path):
+    """``dry_run=True`` must report would-be counts without creating dest (#2133)."""
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    drawer_rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(12)]
+    _seed_palace(source, "mempalace_drawers", drawer_rows)
+    _seed_palace(source, "mempalace_closets", [("c1", "abbrev", {"wing": "w"})])
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest), dry_run=True)
+
+    assert counts == {"mempalace_drawers": 12, "mempalace_closets": 1}
+    assert not dest.exists()
+    assert (source / "chroma.sqlite3").exists()
+
+
+def test_rebuild_from_sqlite_dry_run_in_place_does_not_archive(tmp_path):
+    """In-place dry-run must not move the live palace aside (#2095, #2133)."""
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(8)])
+    sqlite_before = (palace / "chroma.sqlite3").stat().st_size
+
+    counts = repair.rebuild_from_sqlite(
+        str(palace), str(palace), archive_existing_dest=True, dry_run=True
+    )
+
+    assert counts == {"mempalace_drawers": 8, "mempalace_closets": 0}
+    assert (palace / "chroma.sqlite3").stat().st_size == sqlite_before
+    assert [p for p in tmp_path.iterdir() if "pre-rebuild" in p.name] == []
+
+
+def test_rebuild_from_sqlite_dry_run_fails_closed_when_count_unreadable(tmp_path, monkeypatch):
+    """Unreadable ``sqlite_drawer_count`` must not invent zero-row previews."""
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    _seed_palace(source, "mempalace_drawers", [("d1", "doc", {"wing": "w"})])
+
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *a, **k: None)
+    counts = repair.rebuild_from_sqlite(str(source), str(dest), dry_run=True)
+
+    assert counts == {}
+    assert not dest.exists()
+
+
 def test_rebuild_from_sqlite_in_place_validates_source_before_archiving(tmp_path):
     """In-place + archive_existing_dest=True with a dir that lacks
     chroma.sqlite3 must NOT rename the dir before bailing. An earlier

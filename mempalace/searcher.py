@@ -636,10 +636,10 @@ def _bm25_only_via_sqlite(
     """
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     if collection_name is None:
         from .config import get_configured_collection_name
 
@@ -673,7 +673,7 @@ def _bm25_only_via_sqlite(
     try:
         conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
-        return {"error": f"sqlite open failed: {e}"}
+        return _search_error_result(f"sqlite open failed: {e}")
 
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
@@ -1033,11 +1033,13 @@ def _finalize_candidate_hits(
             source_file=source_file,
         )
     except UnsupportedCapabilityError:
-        return [], {
-            "error": "candidate_strategy='union' requires a backend with lexical_search support",
-            "unsupported_capability": "supports_lexical_search",
-            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-        }
+        return [], _search_error_result(
+            "candidate_strategy='union' requires a backend with lexical_search support",
+            unsupported_capability="supports_lexical_search",
+            hint=(
+                "Use candidate_strategy='vector' or select a backend that supports lexical search."
+            ),
+        )
 
     hits = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))[:n_results]
     for h in hits:
@@ -1048,20 +1050,32 @@ def _finalize_candidate_hits(
     return hits, None
 
 
+def _search_error_result(error: str, **extra) -> dict:
+    """Error envelope for programmatic search callers.
+
+    Always includes ``results: []`` so callers can safely index
+    ``result["results"]`` without a KeyError when the palace failed to
+    open or the query raised mid-flight (Windows CI flake surface).
+    """
+    out = {"error": error, "results": []}
+    out.update(extra)
+    return out
+
+
 def _backend_mismatch_result(error: BackendMismatchError) -> dict:
-    return {
-        "error": "Backend mismatch",
-        "details": str(error),
-        "hint": "Select the matching backend or use a fresh palace directory.",
-    }
+    return _search_error_result(
+        "Backend mismatch",
+        details=str(error),
+        hint="Select the matching backend or use a fresh palace directory.",
+    )
 
 
 def _unknown_backend_result(error: KeyError) -> dict:
-    return {
-        "error": "Unknown backend",
-        "details": str(error),
-        "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
-    }
+    return _search_error_result(
+        "Unknown backend",
+        details=str(error),
+        hint="Check MEMPALACE_BACKEND or the configured backend name.",
+    )
 
 
 def _vector_disabled_search(
@@ -1081,12 +1095,12 @@ def _vector_disabled_search(
     except KeyError as e:
         return _unknown_backend_result(e)
     if backend_name != "chroma":
-        return {
-            "error": "vector_disabled fallback is Chroma-only",
-            "unsupported_capability": "chroma_hnsw_fallback",
-            "backend": backend_name,
-            "hint": "Disable vector_disabled for non-Chroma backends.",
-        }
+        return _search_error_result(
+            "vector_disabled fallback is Chroma-only",
+            unsupported_capability="chroma_hnsw_fallback",
+            backend=backend_name,
+            hint="Disable vector_disabled for non-Chroma backends.",
+        )
     return _bm25_only_via_sqlite(
         query,
         palace_path,
@@ -1107,23 +1121,23 @@ def _open_search_collection(palace_path: str, collection_name: str):
         return None, _unknown_backend_result(e)
     except (CollectionNotInitializedError, PalaceNotFoundError) as e:
         logger.error("No palace found at %s: %s", palace_path, e)
-        return None, {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return None, _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     except BackendError as e:
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
-        return None, {
-            "error": "Backend error",
-            "details": str(e),
-            "hint": "Check the selected backend configuration and availability.",
-        }
+        return None, _search_error_result(
+            "Backend error",
+            details=str(e),
+            hint="Check the selected backend configuration and availability.",
+        )
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
-        return None, {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return None, _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
 
 
 def _query_drawers_with_filter_fallback(
@@ -1273,7 +1287,7 @@ def search_memories(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
         )
     except Exception as e:
-        return {"error": f"Search error: {e}"}
+        return _search_error_result(f"Search error: {e}")
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)

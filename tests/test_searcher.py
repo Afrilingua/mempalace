@@ -196,6 +196,9 @@ class TestSearchMemories:
             result = search_memories("test", "/fake/path")
         assert "error" in result
         assert "query failed" in result["error"]
+        # Callers (and CI assertions) index ``results`` unconditionally —
+        # error envelopes must not omit the key (Windows KeyError flake).
+        assert result["results"] == []
 
     def test_search_memories_vector_path_uses_explicit_collection_name(self):
         mock_col = MagicMock()

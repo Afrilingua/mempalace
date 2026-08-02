@@ -235,15 +235,41 @@ def get_collection(
     try:
         collection = backend_obj.get_collection(**preferred_kwargs)
     except TypeError as exc:
-        if "unexpected keyword argument 'palace'" not in str(exc):
+        msg = str(exc)
+        # Plugin backends may still use the pre-options signature. Drop
+        # ``options`` first so read_only degrades gracefully instead of
+        # hard-failing TypeError on third-party entry points.
+        if backend_options is not None and "options" in msg:
+            preferred_kwargs.pop("options", None)
+            try:
+                collection = backend_obj.get_collection(**preferred_kwargs)
+            except TypeError as nested:
+                if "unexpected keyword argument 'palace'" not in str(nested):
+                    raise
+                collection = backend_obj.get_collection(
+                    palace_path,
+                    collection_name=collection_name,
+                    create=create,
+                )
+        elif "unexpected keyword argument 'palace'" not in msg:
             raise
-        legacy_kwargs = {
-            "collection_name": collection_name,
-            "create": create,
-        }
-        if backend_options is not None:
-            legacy_kwargs["options"] = backend_options
-        collection = backend_obj.get_collection(palace_path, **legacy_kwargs)
+        else:
+            legacy_kwargs = {
+                "collection_name": collection_name,
+                "create": create,
+            }
+            if backend_options is not None:
+                legacy_kwargs["options"] = backend_options
+            try:
+                collection = backend_obj.get_collection(palace_path, **legacy_kwargs)
+            except TypeError as nested:
+                if backend_options is None or "options" not in str(nested):
+                    raise
+                collection = backend_obj.get_collection(
+                    palace_path,
+                    collection_name=collection_name,
+                    create=create,
+                )
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:

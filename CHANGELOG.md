@@ -10,6 +10,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.7.0] — 2026-08-02
+
+### Features
+
+- **Hook write-routing through the daemon.** Background hook saves and mines can honor the shared write-routing policy so multi-session setups serialize mutations through one local owner instead of racing the palace. (#2030, #1963)
+
+### Performance
+
+- **HNSW capacity probes are cached** and invalidated by palace file signature, so repeated MCP status/taxonomy paths no longer re-scan native segment files on every call. (#2051, #1471)
+- **`chunk_text` line numbering is O(N)** via incremental tallies, fixing multi-second hangs on large sources. (#2054, #2055)
+
+### Bug Fixes
+
+- **Local backends enforce process-lifetime single-writer ownership.** File-backed and unknown backends require one writer owner for the full process lifetime (daemon holds the lease until workers exit; writable MCP HTTP acquires ownership before bind and refuses startup when blocked). Read-only MCP may coexist; `sqlite_exact` opens genuine query-only/immutable readers; remote Milvus/Zilliz remain multi-process. Addresses multi-writer SQLite/WAL corruption from MCP HTTP + daemon + mine topologies. (#2079, #2045)
+- **Chroma HNSW write defaults match chromadb** (`batch_size=100` / `sync_threshold=1000`) instead of the old 2/2 bloat guard that rewrote segments thousands of times on large mines. (#2107, #2106)
+- **Repair and recovery are safer under contention.** `repair --mode from-sqlite` takes the mine-lock before archiving; rebuilds preserve a verified temp collection when the live swap fails; sparse drawers with zero `embedding_metadata` rows are no longer dropped; truncated ID pagination fails loud instead of pretending success. (#2109, #2086, #2087)
+- **HNSW divergence is preflighted before remaining `col.count()` crash sites** across mine, dedup, migrate, repair, and palace helpers. (#2093)
+- **Re-mine and conversation ingest no longer lose or duplicate drawers.** Content-hash dedup prevents duplicate LLM conversation drawers; sweeper drawers are excluded from convo extract-mode purge scope and failed purges abort; search returns round-trippable `drawer_id` values for `get_drawer`. (#2050, #2125, #2089, #2090, #2044, #2080)
+- **MCP and daemon lifecycle harden multi-agent use.** Read-only mode refuses config and checkpoint-ack tools that rewrite host state; stdio MCP exits on stdin EOF/broken pipe so orphaned sessions release locks; daemon jobs refused the palace lock are deferred instead of failed permanently. (#2126, #2103, #2101, #2072, #2029, #2014)
+- **Entity-candidate extraction no longer hangs on long ASCII runs** (base64, minified blobs) while preserving CJK/non-ASCII text. (#2127, #2065, #2063)
+- **Mining windowing rejects `chunk_overlap` above half the chunk size**, stopping infinite chunk_text loops. (#2056, #2058)
+
+### Documentation
+
+- Operator write-routing / single-writer recovery notes in `docs/write-routing-policy.md`. (#2079)
+- Remote-server guide wording for read-only tools that change host state. (#2126)
+
+---
+
 ## [3.6.0] — 2026-07-14
 
 ### Features
@@ -630,7 +659,8 @@ Initial public release.
 
 ---
 
-[Unreleased]: https://github.com/MemPalace/mempalace/compare/v3.6.0...HEAD
+[Unreleased]: https://github.com/MemPalace/mempalace/compare/v3.7.0...HEAD
+[3.7.0]: https://github.com/MemPalace/mempalace/compare/v3.6.0...v3.7.0
 [3.6.0]: https://github.com/MemPalace/mempalace/compare/v3.5.0...v3.6.0
 [3.5.0]: https://github.com/MemPalace/mempalace/compare/v3.4.1...v3.5.0
 [3.4.1]: https://github.com/MemPalace/mempalace/compare/v3.4.0...v3.4.1

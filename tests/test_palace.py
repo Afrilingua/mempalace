@@ -6,6 +6,7 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
 from mempalace.palace import (
+    _metadata_matches_extract_mode,
     _open_collection_or_explain,
     backend_requires_single_writer,
     get_collection,
@@ -37,6 +38,7 @@ def test_backend_writer_ownership_remains_conservative_for_unknown_backend():
     assert backend_requires_single_writer("pgvector") is False
 
 
+
 def _capture():
     """Return (emit, lines) — emit appends to lines for inspection."""
     lines: list[str] = []
@@ -55,6 +57,45 @@ def test_open_collection_or_explain_state_a_missing_dir(tmp_path):
     assert any("mempalace init" in line for line in lines)
     # Helper must not create the directory.
     assert not missing.exists()
+
+
+class TestMetadataMatchesExtractMode:
+    """#104: a missing extract_mode must only be treated as a legacy
+    exchange-mode row when the drawer is otherwise convo_miner's own —
+    never for a drawer positively identified as another producer's
+    (e.g. the sweeper's ingest_mode="sweep"), which never set
+    extract_mode because it was never meant to carry one."""
+
+    def test_no_extract_mode_requested_matches_everything(self):
+        assert _metadata_matches_extract_mode({"ingest_mode": "sweep"}, None) is True
+
+    def test_exact_match(self):
+        assert _metadata_matches_extract_mode({"extract_mode": "general"}, "general") is True
+
+    def test_mismatched_explicit_extract_mode_never_matches(self):
+        assert _metadata_matches_extract_mode({"extract_mode": "general"}, "exchange") is False
+
+    def test_legacy_convo_row_with_no_ingest_mode_matches_exchange(self):
+        """Pre-ingest_mode-schema convo_miner drawers: no extract_mode,
+        no ingest_mode at all — the original legacy-compat case."""
+        assert _metadata_matches_extract_mode({"source_file": "chat.txt"}, "exchange") is True
+
+    def test_convo_miners_own_ingest_mode_matches_exchange(self):
+        assert _metadata_matches_extract_mode({"ingest_mode": "convos"}, "exchange") is True
+
+    def test_sweeper_row_never_matches_exchange(self):
+        """The actual #104 bug: a sweeper drawer has no extract_mode but
+        DOES carry ingest_mode="sweep" — it must not be swept into
+        convo_miner's default "exchange" purge/idempotency scope."""
+        sweeper_meta = {
+            "ingest_mode": "sweep",
+            "session_id": "s1",
+            "role": "assistant",
+        }
+        assert _metadata_matches_extract_mode(sweeper_meta, "exchange") is False
+
+    def test_sweeper_row_never_matches_general(self):
+        assert _metadata_matches_extract_mode({"ingest_mode": "sweep"}, "general") is False
 
 
 def test_open_collection_or_explain_state_b_no_db(tmp_path):

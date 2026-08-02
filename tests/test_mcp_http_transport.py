@@ -333,6 +333,7 @@ def test_writable_http_releases_writer_lease_after_bind_failure(monkeypatch):
     assert events == ["bind-failed", "discard", "lease-exit"]
     assert mcp._MCP_WRITER_LOCK_CM is None
 
+
 def _hook_settings_call(req_id):
     return {
         "jsonrpc": "2.0",

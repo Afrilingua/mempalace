@@ -39,7 +39,6 @@ def test_backend_writer_ownership_remains_conservative_for_unknown_backend():
     assert backend_requires_single_writer("pgvector") is False
 
 
-
 def _capture():
     """Return (emit, lines) — emit appends to lines for inspection."""
     lines: list[str] = []

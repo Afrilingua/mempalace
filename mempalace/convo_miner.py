@@ -419,9 +419,16 @@ def scan_convos(convo_dir: str) -> list:
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why an apparent conversation directory yielded no files.
     """
-    convo_path = Path(convo_dir).expanduser().resolve()
+    # A direct conversation file is a valid source. For a file, feed only
+    # its basename through the existing directory validation loop.
+    requested_path = Path(convo_dir).expanduser()
+    single_file = requested_path.is_file()
+    convo_path = (requested_path.parent if single_file else requested_path).resolve()
+    scan_entries = (
+        [(str(convo_path), [], [requested_path.name])] if single_file else os.walk(convo_path)
+    )
     files = []
-    for root, dirs, filenames in os.walk(convo_path):
+    for root, dirs, filenames in scan_entries:
         dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
         for filename in filenames:
             if filename.endswith(".meta.json"):

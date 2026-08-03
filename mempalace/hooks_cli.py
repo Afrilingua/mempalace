@@ -1090,12 +1090,12 @@ def _ingest_transcript(transcript_path: str):
                 _submit_daemon_job(
                     "mine",
                     {
-                        "source": str(path.parent),
+                        "source": str(path),
                         "mode": "convos",
                         "wing": "sessions",
                         "agent": "mempalace",
                     },
-                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
                     wait=False,
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
@@ -1113,7 +1113,7 @@ def _ingest_transcript(transcript_path: str):
                 "-m",
                 "mempalace",
                 "mine",
-                str(path.parent),
+                str(path),
                 "--mode",
                 "convos",
                 "--wing",

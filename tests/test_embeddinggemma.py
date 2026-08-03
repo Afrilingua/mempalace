@@ -70,6 +70,12 @@ class _FakeTokenizer:
         self._truncation_enabled = True
         self._truncation_max = max_length
 
+    def get_vocab_size(self, with_added_tokens=True):
+        return 262145 if with_added_tokens else 262144
+
+    def token_to_id(self, token):
+        return 3 if token == "<unk>" else None
+
     def encode_batch(self, texts):
         class _Enc:
             def __init__(self, n):
@@ -397,3 +403,59 @@ def test_config_embedding_model_default_is_minilm(monkeypatch):
 
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
     assert MempalaceConfig().embedding_model == "minilm"
+
+
+def test_out_of_range_added_token_is_remapped_to_unknown(
+    patched_lazy_load,
+    monkeypatch,
+    caplog,
+):
+    class EncodingWithAddedToken:
+        ids = [2, 262144, 1]
+        attention_mask = [1, 1, 1]
+
+    def encode_with_added_token(_self, texts):
+        return [EncodingWithAddedToken() for _ in texts]
+
+    monkeypatch.setattr(
+        _FakeTokenizer,
+        "encode_batch",
+        encode_with_added_token,
+    )
+
+    captured = {}
+    fake_session_class = _make_fake_session()
+
+    class BoundsCheckingSession(fake_session_class):
+        def run(self, output_names, feed):
+            captured["input_ids"] = feed["input_ids"].copy()
+
+            assert np.all(feed["input_ids"] >= 0)
+            assert np.all(feed["input_ids"] < 262144)
+
+            return super().run(
+                output_names,
+                feed,
+            )
+
+    import onnxruntime
+
+    monkeypatch.setattr(
+        onnxruntime,
+        "InferenceSession",
+        lambda *_args, **_kwargs: BoundsCheckingSession(),
+    )
+
+    caplog.set_level(
+        "WARNING",
+        logger=embedding.__name__,
+    )
+
+    embedding_function = embedding.EmbeddinggemmaONNX()
+
+    result = embedding_function(["literal <image_soft_token> in source"])
+
+    assert captured["input_ids"].tolist() == [[2, 3, 1]]
+    assert np.asarray(result).shape == (1, 384)
+    assert "remapping to <unk>" in caplog.text
+    assert patched_lazy_load["hf_hub_download"] == 3

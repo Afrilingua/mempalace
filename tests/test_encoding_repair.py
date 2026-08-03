@@ -1,60 +1,191 @@
+import json
+import os
+import stat
+
+import pytest
+
 from mempalace.encoding_repair import (
     repair_collection,
     repair_mojibake,
+    restore_collection,
 )
 
 
-def mojibake(text):
-    return text.encode("utf-8").decode("cp1252")
+CLEAN_MULTILINGUAL = [
+    "La canción «PERÚ» abre el disco.",
+    "Buried surface area 1250 Å².",
+    "Volume measured as 42 Å³.",
+    "CAFÉ® is a registered mark.",
+    "RÉSUMÉ\u00a0: présentation générale.",
+    "Already clean: café → ✅",
+    "Été à Noël — déjà vu.",
+    "L'œuvre d'André coûte 20 €.",
+    "Größe, Fußgänger und Straße.",
+    "Übermäßig süß — Öl und Äpfel.",
+    "A ação começa em São João.",
+    "Às vezes, o avô lê o jornal.",
+    "CORAÇÃO, PERÚ e CAFÉ®.",
+    "Zażółć gęślą jaźń.",
+    "Łódź — źródło wiedzy.",
+    "Średnica wynosi 25 µm.",
+    "L'Àngels diu: «això és català».",
+    "Per què l'aviació és útil?",
+    "Temperatura: −5 °C ± 0,2 °C.",
+    "Trademark™ and registered® symbols.",
+    "Crème brûlée — déjà vu.",
+    "São Tomé e Príncipe.",
+    "François parle à Élise.",
+    "Smörgåsbord, Ångström and Øresund.",
+    "naïve façade coöperate.",
+    "România, când și până.",
+    "Guðrún lives in Reykjavík.",
+    "Clean emoji: → ✅ 🚀.",
+]
 
 
-def test_repairs_common_accented_text():
-    assert repair_mojibake("cafÃ©") == "café"
-    assert repair_mojibake("naÃ¯ve") == "naïve"
+DAMAGED_CASES = [
+    (
+        "cafÃ©",
+        "café",
+    ),
+    (
+        "naÃ¯ve",
+        "naïve",
+    ),
+    (
+        "EspaÃ±a",
+        "España",
+    ),
+    (
+        "aÃ§Ã£o",
+        "ação",
+    ),
+    (
+        "MÃ¼nchen",
+        "München",
+    ),
+    (
+        "FranÃ§ais",
+        "Français",
+    ),
+    (
+        "Plan â†’ result â€” done.",
+        "Plan → result — done.",
+    ),
+    (
+        "Copyright Â© 2026",
+        "Copyright © 2026",
+    ),
+    (
+        "BOM ï»¿removed",
+        "BOM \ufeffremoved",
+    ),
+    (
+        "Emoji ðŸ˜€",
+        "Emoji 😀",
+    ),
+    (
+        "cafÃƒÂ©",
+        "café",
+    ),
+    (
+        "Clean prefix, cafÃ©, clean suffix.",
+        "Clean prefix, café, clean suffix.",
+    ),
+]
 
 
-def test_repairs_dash_arrow_and_emoji():
-    damaged = mojibake("Plan → result — ✅")
-    assert repair_mojibake(damaged) == "Plan → result — ✅"
+AMBIGUOUS_CASES = [
+    "Å‚",
+    "Åº",
+    "Ä™",
+]
 
 
-def test_preserves_clean_text():
-    clean = "Already clean: café → ✅"
-    assert repair_mojibake(clean) == clean
+@pytest.mark.parametrize(
+    "text",
+    CLEAN_MULTILINGUAL,
+)
+def test_preserves_clean_multilingual_text(
+    text,
+):
+    assert repair_mojibake(text) == text
 
 
-def test_repairs_mixed_clean_and_damaged_text():
-    text = "Clean prefix, cafÃ©, clean suffix."
-    assert repair_mojibake(text) == "Clean prefix, café, clean suffix."
+@pytest.mark.parametrize(
+    (
+        "damaged",
+        "expected",
+    ),
+    DAMAGED_CASES,
+)
+def test_repairs_high_confidence_mojibake(
+    damaged,
+    expected,
+):
+    assert repair_mojibake(damaged) == expected
 
 
-def test_repairs_double_encoded_text():
-    once = mojibake("café")
-    twice = mojibake(once)
-
-    assert repair_mojibake(twice) == "café"
+@pytest.mark.parametrize(
+    "text",
+    AMBIGUOUS_CASES,
+)
+def test_leaves_ambiguous_sequences_for_manual_review(
+    text,
+):
+    assert repair_mojibake(text) == text
 
 
 def test_repair_is_idempotent():
     repaired = repair_mojibake("cafÃ© â†’ done")
+
     assert repair_mojibake(repaired) == repaired
 
 
+def test_rejects_invalid_max_passes():
+    with pytest.raises(
+        ValueError,
+        match="max_passes",
+    ):
+        repair_mojibake(
+            "cafÃ©",
+            max_passes=0,
+        )
+
+
 class FakeCollection:
-    def __init__(self, documents):
+    name = "mempalace_drawers"
+
+    def __init__(
+        self,
+        documents,
+    ):
         self.ids = [f"drawer-{index}" for index in range(len(documents))]
         self.documents = list(documents)
         self.updates = []
 
-    def get(self, *, limit, offset, include):
+    def get(
+        self,
+        *,
+        limit,
+        offset,
+        include,
+    ):
         del include
+
         end = offset + limit
+
         return {
             "ids": self.ids[offset:end],
             "documents": self.documents[offset:end],
         }
 
-    def update(self, *, ids, documents):
+    def update(
+        self,
+        *,
+        ids,
+        documents,
+    ):
         self.updates.append(
             {
                 "ids": list(ids),
@@ -62,54 +193,395 @@ class FakeCollection:
             }
         )
 
+        positions = {drawer_id: index for index, drawer_id in enumerate(self.ids)}
 
-def test_collection_dry_run_reports_without_writing():
-    collection = FakeCollection(["cafÃ©", "plain", "arrow â†’"])
+        for drawer_id, document in zip(
+            ids,
+            documents,
+        ):
+            self.documents[positions[drawer_id]] = document
+
+
+def test_dry_run_flags_only_damaged_documents():
+    collection = FakeCollection(
+        [
+            CLEAN_MULTILINGUAL[0],
+            "cafÃ©",
+            CLEAN_MULTILINGUAL[1],
+            "arrow â†’",
+        ]
+    )
+    changes = []
 
     report = repair_collection(
         collection,
         apply=False,
         page_size=2,
+        on_change=(
+            lambda drawer_id, before, after: changes.append(
+                (
+                    drawer_id,
+                    before,
+                    after,
+                )
+            )
+        ),
     )
 
     assert report == {
-        "scanned": 3,
+        "scanned": 4,
         "changed": 2,
         "updated": 0,
+        "backup_path": None,
     }
+    assert [change[0] for change in changes] == [
+        "drawer-1",
+        "drawer-3",
+    ]
     assert collection.updates == []
 
 
-def test_collection_apply_updates_only_changed_documents():
-    collection = FakeCollection(["cafÃ©", "plain", "arrow â†’"])
+def test_apply_requires_backup_path():
+    with pytest.raises(
+        ValueError,
+        match="backup_path",
+    ):
+        repair_collection(
+            FakeCollection(["cafÃ©"]),
+            apply=True,
+        )
+
+
+def test_apply_writes_backup_before_update(
+    tmp_path,
+):
+    backup = tmp_path / "backup.jsonl"
+
+    class BackupCheckingCollection(FakeCollection):
+        def update(
+            self,
+            *,
+            ids,
+            documents,
+        ):
+            lines = backup.read_text(encoding="utf-8").splitlines()
+
+            assert len(lines) == 2
+            assert json.loads(lines[1]) == {
+                "id": "drawer-0",
+                "original_document": ("cafÃ©"),
+            }
+
+            super().update(
+                ids=ids,
+                documents=documents,
+            )
+
+    collection = BackupCheckingCollection(["cafÃ©"])
 
     report = repair_collection(
         collection,
         apply=True,
+        backup_path=backup,
+    )
+
+    assert report["updated"] == 1
+    assert report["backup_path"] == str(backup)
+    assert collection.documents == ["café"]
+
+    if os.name != "nt":
+        mode = stat.S_IMODE(backup.stat().st_mode)
+        assert mode & 0o077 == 0
+
+
+def test_apply_refuses_to_overwrite_existing_backup(
+    tmp_path,
+):
+    backup = tmp_path / "backup.jsonl"
+    backup.write_text(
+        "do not overwrite",
+        encoding="utf-8",
+    )
+    collection = FakeCollection(["cafÃ©"])
+
+    with pytest.raises(FileExistsError):
+        repair_collection(
+            collection,
+            apply=True,
+            backup_path=backup,
+        )
+
+    assert backup.read_text(encoding="utf-8") == "do not overwrite"
+    assert collection.updates == []
+
+
+def test_apply_with_no_changes_does_not_create_empty_backup(
+    tmp_path,
+):
+    backup = tmp_path / "backup.jsonl"
+
+    report = repair_collection(
+        FakeCollection(CLEAN_MULTILINGUAL[:3]),
+        apply=True,
+        backup_path=backup,
+    )
+
+    assert report["changed"] == 0
+    assert report["updated"] == 0
+    assert report["backup_path"] is None
+    assert not backup.exists()
+
+
+def test_backup_restores_original_documents(
+    tmp_path,
+):
+    backup = tmp_path / "backup.jsonl"
+    collection = FakeCollection(
+        [
+            "cafÃ©",
+            CLEAN_MULTILINGUAL[1],
+            "arrow â†’",
+        ]
+    )
+
+    repair_collection(
+        collection,
+        apply=True,
         page_size=2,
+        backup_path=backup,
+    )
+
+    assert collection.documents == [
+        "café",
+        CLEAN_MULTILINGUAL[1],
+        "arrow →",
+    ]
+
+    report = restore_collection(
+        collection,
+        backup,
+        batch_size=1,
     )
 
     assert report == {
-        "scanned": 3,
-        "changed": 2,
-        "updated": 2,
+        "validated": 2,
+        "restored": 2,
     }
-
-    updated_ids = [drawer_id for batch in collection.updates for drawer_id in batch["ids"]]
-    updated_documents = [
-        document for batch in collection.updates for document in batch["documents"]
+    assert collection.documents == [
+        "cafÃ©",
+        CLEAN_MULTILINGUAL[1],
+        "arrow â†’",
     ]
 
-    assert updated_ids == ["drawer-0", "drawer-2"]
-    assert updated_documents == ["café", "arrow →"]
+
+def test_restore_validates_whole_backup_before_writing(
+    tmp_path,
+):
+    backup = tmp_path / "backup.jsonl"
+    backup.write_text(
+        (
+            '{"format":'
+            '"mempalace-encoding-repair",'
+            '"version":1}\n'
+            '{"id":"drawer-0",'
+            '"original_document":"cafÃ©"}\n'
+            "not-json\n"
+        ),
+        encoding="utf-8",
+    )
+    collection = FakeCollection(["café"])
+
+    with pytest.raises(
+        ValueError,
+        match="line 3",
+    ):
+        restore_collection(
+            collection,
+            backup,
+        )
+
+    assert collection.updates == []
 
 
-def test_collection_rejects_invalid_page_size():
-    collection = FakeCollection([])
+def test_collection_rejects_misaligned_results():
+    class MisalignedCollection(FakeCollection):
+        def get(
+            self,
+            *,
+            limit,
+            offset,
+            include,
+        ):
+            del (
+                limit,
+                offset,
+                include,
+            )
 
-    try:
-        repair_collection(collection, page_size=0)
-    except ValueError as exc:
-        assert "page_size" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError")
+            return {
+                "ids": ["drawer-0"],
+                "documents": [],
+            }
+
+    with pytest.raises(
+        RuntimeError,
+        match="misaligned",
+    ):
+        repair_collection(MisalignedCollection([]))
+
+
+def test_real_chromadb_repair_path_preserves_review_cases(
+    tmp_path,
+):
+    from mempalace.palace import (
+        get_collection,
+    )
+
+    palace_path = str(tmp_path / "palace")
+    collection = get_collection(palace_path)
+
+    originals = {
+        "clean-spanish": ("La canción «PERÚ» abre el disco."),
+        "clean-scientific": ("Buried surface area 1250 Å²."),
+        "clean-trademark": ("CAFÉ® is a registered mark."),
+        "clean-french": ("RÉSUMÉ\u00a0: présentation générale."),
+        "damaged-accent": ("EspaÃ±a y cafÃ©."),
+        "damaged-punctuation": ("Plan â†’ result â€” done."),
+    }
+
+    expected = dict(originals)
+    expected["damaged-accent"] = "España y café."
+    expected["damaged-punctuation"] = "Plan → result — done."
+
+    collection.upsert(
+        ids=list(originals),
+        documents=list(originals.values()),
+    )
+
+    changed_ids = []
+
+    dry_run = repair_collection(
+        collection,
+        apply=False,
+        page_size=2,
+        on_change=(lambda drawer_id, _before, _after: changed_ids.append(drawer_id)),
+    )
+
+    assert dry_run["changed"] == 2
+    assert set(changed_ids) == {
+        "damaged-accent",
+        "damaged-punctuation",
+    }
+
+    backup = tmp_path / "originals.jsonl"
+
+    applied = repair_collection(
+        collection,
+        apply=True,
+        page_size=2,
+        backup_path=backup,
+    )
+
+    assert applied["updated"] == 2
+
+    result = collection.get(
+        ids=list(originals),
+        include=["documents"],
+    )
+    by_id = dict(
+        zip(
+            result["ids"],
+            result["documents"],
+        )
+    )
+
+    assert by_id == expected
+
+    restored = restore_collection(
+        collection,
+        backup,
+        batch_size=1,
+    )
+
+    assert restored == {
+        "validated": 2,
+        "restored": 2,
+    }
+
+    result = collection.get(
+        ids=list(originals),
+        include=["documents"],
+    )
+    by_id = dict(
+        zip(
+            result["ids"],
+            result["documents"],
+        )
+    )
+
+    assert by_id == originals
+
+
+def test_backup_header_resolves_wrapped_chroma_collection_name(
+    tmp_path,
+):
+    from mempalace.backends.chroma import (
+        ChromaCollection,
+    )
+
+    raw = FakeCollection(["cafÃ©"])
+    raw.name = "mempalace_drawers"
+
+    wrapped = ChromaCollection(raw)
+    backup = tmp_path / "wrapped-backup.jsonl"
+
+    report = repair_collection(
+        wrapped,
+        apply=True,
+        backup_path=backup,
+    )
+
+    lines = [
+        json.loads(line) for line in backup.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+
+    assert report["updated"] == 1
+    assert lines[0] == {
+        "collection": "mempalace_drawers",
+        "format": "mempalace-encoding-repair",
+        "version": 1,
+    }
+    assert lines[1] == {
+        "id": "drawer-0",
+        "original_document": "cafÃ©",
+    }
+
+
+def test_restore_rejects_backup_for_another_collection(
+    tmp_path,
+):
+    backup = tmp_path / "wrong-collection.jsonl"
+    backup.write_text(
+        (
+            '{"collection":"source_collection",'
+            '"format":"mempalace-encoding-repair",'
+            '"version":1}\n'
+            '{"id":"drawer-0",'
+            '"original_document":"cafÃ©"}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    collection = FakeCollection(["café"])
+    collection.name = "different_collection"
+
+    with pytest.raises(
+        ValueError,
+        match="source_collection",
+    ):
+        restore_collection(
+            collection,
+            backup,
+        )
+
+    assert collection.updates == []

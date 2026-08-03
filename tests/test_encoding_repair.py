@@ -585,3 +585,206 @@ def test_restore_rejects_backup_for_another_collection(
         )
 
     assert collection.updates == []
+
+
+UNDEFINED_CP1252_CONTINUATION_CASES = [
+    (
+        "Ã\x81",
+        "Á",
+    ),
+    (
+        "Ã\x8d",
+        "Í",
+    ),
+    (
+        "Ã\x8f",
+        "Ï",
+    ),
+    (
+        "Ã\x90",
+        "Ð",
+    ),
+    (
+        "Ã\x9d",
+        "Ý",
+    ),
+    (
+        ("Ã\x81LVARO vive en PARÃ\x8dS. Ã\x8dNDICE: pÃ¡gina 12."),
+        ("ÁLVARO vive en PARÍS. ÍNDICE: página 12."),
+    ),
+    (
+        "Dijo â€œholaâ€\x9d y se fue.",
+        "Dijo “hola” y se fue.",
+    ),
+]
+
+
+def _undefined_cp1252_review_rows():
+    originals = {
+        "spanish-controls": ("Ã\x81LVARO vive en PARÃ\x8dS. Ã\x8dNDICE: pÃ¡gina 12."),
+        "all-five-controls": ("Valores: Ã\x81 Ã\x8d Ã\x8f Ã\x90 Ã\x9d."),
+        "curly-quotes": ("Dijo â€œholaâ€\x9d y se fue."),
+        "mixed-damage": ("Texto mixto: cafÃ©, flecha â†’ y PARÃ\x8dS."),
+    }
+
+    expected = {
+        "spanish-controls": ("ÁLVARO vive en PARÍS. ÍNDICE: página 12."),
+        "all-five-controls": ("Valores: Á Í Ï Ð Ý."),
+        "curly-quotes": ("Dijo “hola” y se fue."),
+        "mixed-damage": ("Texto mixto: café, flecha → y PARÍS."),
+    }
+
+    return originals, expected
+
+
+@pytest.mark.parametrize(
+    (
+        "damaged",
+        "expected",
+    ),
+    UNDEFINED_CP1252_CONTINUATION_CASES,
+)
+def test_repairs_undefined_cp1252_continuation_bytes(
+    damaged,
+    expected,
+):
+    assert repair_mojibake(damaged) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        ("ÁLVARO vive en PARÍS. ÍNDICE: página 12."),
+        "Dijo “hola” y se fue.",
+    ],
+)
+def test_clean_undefined_cp1252_outputs_remain_unchanged(
+    text,
+):
+    assert repair_mojibake(text) == text
+
+
+def test_apply_completes_undefined_cp1252_rows_in_one_pass(
+    tmp_path,
+):
+    originals, expected = _undefined_cp1252_review_rows()
+    collection = FakeCollection(list(originals.values()))
+    backup = tmp_path / "undefined-controls.jsonl"
+
+    applied = repair_collection(
+        collection,
+        apply=True,
+        page_size=2,
+        backup_path=backup,
+    )
+
+    assert applied["scanned"] == 4
+    assert applied["changed"] == 4
+    assert applied["updated"] == 4
+    assert collection.documents == list(expected.values())
+
+    second_run = repair_collection(
+        collection,
+        apply=False,
+        page_size=2,
+    )
+
+    assert second_run["scanned"] == 4
+    assert second_run["changed"] == 0
+    assert second_run["updated"] == 0
+
+    undefined_controls = {
+        0x81,
+        0x8D,
+        0x8F,
+        0x90,
+        0x9D,
+    }
+
+    assert all(
+        not any(ord(character) in undefined_controls for character in document)
+        for document in collection.documents
+    )
+
+
+def test_real_chromadb_completes_undefined_cp1252_rows_in_one_pass(
+    tmp_path,
+):
+    from mempalace.palace import (
+        get_backend_for_palace,
+        get_collection,
+    )
+
+    palace_path = str(tmp_path / "palace")
+    originals, expected = _undefined_cp1252_review_rows()
+
+    try:
+        collection = get_collection(palace_path)
+
+        collection.upsert(
+            ids=list(originals),
+            documents=list(originals.values()),
+        )
+
+        changed_ids = []
+
+        dry_run = repair_collection(
+            collection,
+            apply=False,
+            page_size=2,
+            on_change=(lambda drawer_id, _before, _after: changed_ids.append(drawer_id)),
+        )
+
+        assert dry_run["scanned"] == 4
+        assert dry_run["changed"] == 4
+        assert dry_run["updated"] == 0
+        assert set(changed_ids) == set(originals)
+
+        backup = tmp_path / "real-undefined-controls.jsonl"
+
+        applied = repair_collection(
+            collection,
+            apply=True,
+            page_size=2,
+            backup_path=backup,
+        )
+
+        assert applied["scanned"] == 4
+        assert applied["changed"] == 4
+        assert applied["updated"] == 4
+
+        result = collection.get(
+            ids=list(originals),
+            include=["documents"],
+        )
+        by_id = dict(
+            zip(
+                result["ids"],
+                result["documents"],
+            )
+        )
+
+        assert by_id == expected
+
+        second_run = repair_collection(
+            collection,
+            apply=False,
+            page_size=2,
+        )
+
+        assert second_run["scanned"] == 4
+        assert second_run["changed"] == 0
+        assert second_run["updated"] == 0
+    finally:
+        try:
+            backend = get_backend_for_palace(palace_path)
+            close_palace = getattr(
+                backend,
+                "close_palace",
+                None,
+            )
+
+            if callable(close_palace):
+                close_palace(palace_path)
+        except Exception:
+            pass

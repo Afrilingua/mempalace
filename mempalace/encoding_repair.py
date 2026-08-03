@@ -21,14 +21,42 @@ _UNDEFINED_CP1252_BYTES = frozenset(
 )
 
 
-def _cp1252_character(byte_value: int) -> str:
+def _cp1252_character(
+    byte_value: int,
+) -> str:
+    """Map a legacy byte to the character stored in old palaces."""
+    if byte_value in _UNDEFINED_CP1252_BYTES:
+        # Pre-3.1 Windows reads could preserve these five undefined
+        # Windows-1252 byte values as their corresponding invisible
+        # C1 control code points.
+        return chr(byte_value)
+
     return bytes([byte_value]).decode("cp1252")
+
+
+def _encode_mojibake_candidate(
+    text: str,
+) -> bytes:
+    """Recover original bytes, including undefined CP1252 values."""
+    raw = bytearray()
+
+    for character in text:
+        codepoint = ord(character)
+
+        if codepoint in _UNDEFINED_CP1252_BYTES:
+            raw.append(codepoint)
+        else:
+            raw.extend(character.encode("cp1252"))
+
+    return bytes(raw)
 
 
 _CONTINUATION_CHARS = "".join(
     _cp1252_character(byte_value)
-    for byte_value in range(0x80, 0xC0)
-    if byte_value not in _UNDEFINED_CP1252_BYTES
+    for byte_value in range(
+        0x80,
+        0xC0,
+    )
 )
 _CONTINUATION_CLASS = re.escape(_CONTINUATION_CHARS)
 
@@ -58,7 +86,7 @@ def _decode_high_confidence_run(
     candidate = match.group(0)
 
     try:
-        return candidate.encode("cp1252").decode("utf-8")
+        return _encode_mojibake_candidate(candidate).decode("utf-8")
     except (
         UnicodeEncodeError,
         UnicodeDecodeError,

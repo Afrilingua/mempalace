@@ -1198,6 +1198,238 @@ def _candidate_pool_size(n_results: int, date_window_active: bool) -> int:
     return max(min(n_results * 15, 500), n_results)
 
 
+_CLOSET_RESULT_POOL_MULTIPLIER = 4
+_MAX_HYDRATION_CHARS = 10000
+
+
+def _candidate_pool_limits(
+    candidate_strategy: str,
+    n_results: int,
+    date_window_active: bool = False,
+) -> tuple[int, int]:
+    """Return vector-query and pre-enrichment candidate limits.
+
+    Date-window searches retain the wider current-develop pool because the
+    timestamp constraint is applied after retrieval. The normal vector path
+    also remains at least four times wide through closet enrichment. Union
+    mode keeps only the requested top vector candidates before lexical merge.
+    """
+    base_query_limit = _candidate_pool_size(
+        n_results,
+        date_window_active,
+    )
+
+    if candidate_strategy == "union":
+        return base_query_limit, n_results
+
+    widened = max(
+        base_query_limit,
+        n_results * _CLOSET_RESULT_POOL_MULTIPLIER,
+    )
+    return widened, widened
+
+
+def _enrich_closet_hits(
+    hits: list,
+    drawers_col,
+    query: str,
+    stop_words: frozenset = frozenset(),
+) -> list:
+    """Hydrate closet-boosted hits and memoise each source/group fetch."""
+    query_terms = set(
+        _tokenize(
+            query,
+            stop_words,
+        )
+    )
+    source_cache: dict = {}
+
+    for hit in hits:
+        if hit.get("matched_via") == "drawer":
+            continue
+
+        full_source = hit.get("_source_file_full") or ""
+
+        if not full_source:
+            continue
+
+        parent_drawer_id = hit.get("_parent_drawer_id") or None
+        cache_key = (
+            full_source,
+            parent_drawer_id,
+        )
+
+        if cache_key not in source_cache:
+            try:
+                source_drawers = drawers_col.get(
+                    where=(
+                        _scoped_source_filter(
+                            full_source,
+                            parent_drawer_id,
+                        )
+                    ),
+                    include=[
+                        "documents",
+                        "metadatas",
+                    ],
+                )
+            except Exception:
+                logger.debug(
+                    "Neighbor fetch failed for %s",
+                    full_source,
+                    exc_info=True,
+                )
+                source_cache[cache_key] = None
+            else:
+                source_cache[cache_key] = (
+                    list(
+                        getattr(
+                            source_drawers,
+                            "documents",
+                            None,
+                        )
+                        or []
+                    ),
+                    list(
+                        getattr(
+                            source_drawers,
+                            "metadatas",
+                            None,
+                        )
+                        or []
+                    ),
+                )
+
+        cached = source_cache[cache_key]
+
+        if cached is None:
+            continue
+
+        docs, metadatas = cached
+
+        if len(docs) <= 1:
+            continue
+
+        indexed = []
+
+        for index, (
+            document,
+            metadata,
+        ) in enumerate(
+            zip(
+                docs,
+                metadatas,
+            )
+        ):
+            chunk_index = (
+                metadata.get(
+                    "chunk_index",
+                    index,
+                )
+                if isinstance(
+                    metadata,
+                    dict,
+                )
+                else index
+            )
+
+            if not isinstance(
+                chunk_index,
+                int,
+            ):
+                chunk_index = index
+
+            indexed.append(
+                (
+                    chunk_index,
+                    document or "",
+                )
+            )
+
+        indexed.sort(key=lambda pair: pair[0])
+        ordered_docs = [document for _, document in indexed]
+
+        best_index = 0
+        best_score = -1
+
+        for index, document in enumerate(ordered_docs):
+            lowered = document.lower()
+            score = sum(1 for term in query_terms if term in lowered)
+
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        start = max(
+            0,
+            best_index - 1,
+        )
+        end = min(
+            len(ordered_docs),
+            best_index + 2,
+        )
+        expanded = "\n\n".join(ordered_docs[start:end])
+
+        if len(expanded) > _MAX_HYDRATION_CHARS:
+            expanded = expanded[:_MAX_HYDRATION_CHARS] + (
+                f"\n\n[...truncated. "
+                f"{len(ordered_docs)} total drawers. "
+                "Use mempalace_get_drawer "
+                "for full content.]"
+            )
+
+        hit["text"] = expanded
+        hit["drawer_index"] = best_index
+        hit["total_drawers"] = len(ordered_docs)
+
+    return hits
+
+
+def _dedupe_rendered_hits(
+    hits: list,
+) -> list:
+    """Drop repeated closet-rendered passages while preserving rank order.
+
+    Plain drawer hits retain their historical behavior, including legitimate
+    exact repeats at different source positions. A duplicate is removed only
+    when either occurrence came through closet enrichment.
+    """
+    unique = []
+    first_by_key: dict = {}
+
+    for hit in hits:
+        source = hit.get("_source_file_full") or hit.get("source_path") or hit.get("source_file")
+        text = hit.get("text")
+
+        if not source or not isinstance(
+            text,
+            str,
+        ):
+            unique.append(hit)
+            continue
+
+        key = (
+            source,
+            text,
+        )
+        previous = first_by_key.get(key)
+
+        if previous is None:
+            first_by_key[key] = hit
+            unique.append(hit)
+            continue
+
+        previous_is_closet = previous.get("matched_via") == "drawer+closet"
+        current_is_closet = hit.get("matched_via") == "drawer+closet"
+
+        if previous_is_closet or current_is_closet:
+            continue
+
+        unique.append(hit)
+
+    return unique
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
@@ -1292,14 +1524,20 @@ def _finalize_candidate_hits(
             ),
         )
 
-    hits = _hybrid_rank(
-        hits, query, metric=_metric_for_collection(drawers_col), stop_words=stop_words
-    )[:n_results]
-    for h in hits:
-        h.pop("_sort_key", None)
-        h.pop("_source_file_full", None)
-        h.pop("_chunk_index", None)
-        h.pop("_parent_drawer_id", None)
+    ranked = _hybrid_rank(
+        hits,
+        query,
+        metric=_metric_for_collection(drawers_col),
+        stop_words=stop_words,
+    )
+    hits = _dedupe_rendered_hits(ranked)[:n_results]
+
+    for hit in hits:
+        hit.pop("_sort_key", None)
+        hit.pop("_source_file_full", None)
+        hit.pop("_chunk_index", None)
+        hit.pop("_parent_drawer_id", None)
+
     return hits, None
 
 
@@ -1646,7 +1884,7 @@ def search_memories(
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
 
             * ``"vector"`` (default) — preserves historical behavior: top
-              ``n_results * 3`` rows from the vector index are the rerank pool.
+              ``n_results * 4`` rows from the vector index are the rerank pool.
               Cheap; works well when query and target docs agree in the
               embedding space.
             * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
@@ -1706,7 +1944,11 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    pool_size = _candidate_pool_size(n_results, date_window_active)
+    pool_size, pre_enrichment_limit = _candidate_pool_limits(
+        candidate_strategy,
+        n_results,
+        date_window_active,
+    )
     try:
         dkwargs = {
             "query_texts": [query],
@@ -1816,65 +2058,16 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    hits = scored[:pre_enrichment_limit]
 
-    # Drawer-grep enrichment: for closet-boosted hits whose source has
-    # multiple drawers, return the keyword-best chunk + its immediate
-    # neighbors instead of just the drawer vector search landed on. The
-    # closet said "this source is relevant"; vector may have picked the
-    # wrong chunk within it; grep picks the right one.
-    MAX_HYDRATION_CHARS = 10000
-    for h in hits:
-        if h["matched_via"] == "drawer":
-            continue
-        full_source = h.get("_source_file_full") or ""
-        if not full_source:
-            continue
-        # Narrow by ``parent_drawer_id`` when present so unrelated
-        # chunked drawers sharing ``source_file`` do not stitch (#1580).
-        try:
-            source_drawers = drawers_col.get(
-                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
-                include=["documents", "metadatas"],
-            )
-        except Exception:
-            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
-            continue
-        docs = source_drawers.documents
-        metas_ = source_drawers.metadatas
-        if len(docs) <= 1:
-            continue
-
-        # Sort by chunk_index so best_idx + neighbors are positional.
-        indexed = []
-        for idx, (d, m) in enumerate(zip(docs, metas_)):
-            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
-            if not isinstance(ci, int):
-                ci = idx
-            indexed.append((ci, d))
-        indexed.sort(key=lambda p: p[0])
-        ordered_docs = [d for _, d in indexed]
-
-        query_terms = set(_tokenize(query, stop_words))
-        best_idx, best_score = 0, -1
-        for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
-            s = sum(1 for t in query_terms if t in d_lower)
-            if s > best_score:
-                best_score, best_idx = s, idx
-
-        start = max(0, best_idx - 1)
-        end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
-        if len(expanded) > MAX_HYDRATION_CHARS:
-            expanded = (
-                expanded[:MAX_HYDRATION_CHARS]
-                + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer for full content.]"
-            )
-        h["text"] = expanded
-        h["drawer_index"] = best_idx
-        h["total_drawers"] = len(ordered_docs)
+    # Drawer-grep enrichment: retain the wider pool until repeated
+    # closet-rendered passages can be replaced by distinct candidates.
+    _enrich_closet_hits(
+        hits,
+        drawers_col,
+        query,
+        stop_words=stop_words,
+    )
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K

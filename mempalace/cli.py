@@ -586,7 +586,7 @@ def cmd_mine(args):
                 palace_path=palace_path,
                 dry_run=args.dry_run,
             )
-        except UnknownSourceAdapterError as exc:
+        except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(2)
         suffix = " would be written" if args.dry_run else " written"
@@ -674,6 +674,63 @@ class UnknownSourceAdapterError(ValueError):
     """Raised when an explicit ``--source`` name is absent from the registry."""
 
 
+class UnsupportedSourceAdapterProtocolError(ValueError):
+    """Raised when an adapter requires runner semantics not implemented yet."""
+
+
+class _DryRunCollectionProxy:
+    """Read-through collection facade that records, but never persists, writes.
+
+    Source adapters are deliberately allowed to access ``drawer_collection``
+    directly.  Passing the live collection during a dry run would therefore
+    make ``--dry-run`` advisory rather than safe.
+    """
+
+    def __init__(self, collection):
+        self._collection = collection
+        self.operations = []
+
+    def add(self, **kwargs):
+        self.operations.append(("add", kwargs))
+
+    def upsert(self, **kwargs):
+        self.operations.append(("upsert", kwargs))
+
+    def delete(self, **kwargs):
+        self.operations.append(("delete", kwargs))
+
+    def update(self, **kwargs):
+        self.operations.append(("update", kwargs))
+
+    def query(self, **kwargs):
+        return self._collection.query(**kwargs)
+
+    def get(self, **kwargs):
+        return self._collection.get(**kwargs)
+
+    def count(self):
+        return self._collection.count()
+
+
+class _DryRunKnowledgeGraphProxy:
+    """Recording no-op facade for the KG mutation surface published to adapters."""
+
+    def __init__(self):
+        self.operations = []
+
+    def add_entity(self, *args, **kwargs):
+        self.operations.append(("add_entity", args, kwargs))
+
+    def add_triple(self, *args, **kwargs):
+        self.operations.append(("add_triple", args, kwargs))
+
+    def invalidate(self, *args, **kwargs):
+        self.operations.append(("invalidate", args, kwargs))
+
+    def supersede(self, *args, **kwargs):
+        self.operations.append(("supersede", args, kwargs))
+
+
 def mine_source_adapter(
     *,
     source_name: str,
@@ -693,6 +750,7 @@ def mine_source_adapter(
         DrawerRecord,
         PalaceContext,
         SourceRef,
+        SourceItemMetadata,
         get_adapter,
         resolve_adapter_for_source,
     )
@@ -706,10 +764,24 @@ def mine_source_adapter(
             "check the adapter name with `mempalace mine --help`"
         ) from exc
 
-    knowledge_graph = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
+    if "supports_incremental" in adapter.capabilities:
+        raise UnsupportedSourceAdapterProtocolError(
+            f"source adapter {adapter_name!r} requires incremental ingestion, which "
+            "mempalace mine does not support yet"
+        )
+
+    knowledge_graph = None
     try:
+        drawer_collection = get_collection(palace_path)
+        if dry_run:
+            drawer_collection = _DryRunCollectionProxy(drawer_collection)
+            knowledge_graph = _DryRunKnowledgeGraphProxy()
+        else:
+            knowledge_graph = KnowledgeGraph(
+                db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+            )
         context = PalaceContext(
-            drawer_collection=get_collection(palace_path),
+            drawer_collection=drawer_collection,
             knowledge_graph=knowledge_graph,
             palace_path=palace_path,
             config=MempalaceConfig(palace_path=palace_path),
@@ -721,13 +793,18 @@ def mine_source_adapter(
             source=SourceRef(local_path=source_path),
             palace=context,
         ):
+            if isinstance(result, SourceItemMetadata):
+                raise UnsupportedSourceAdapterProtocolError(
+                    f"source adapter {adapter_name!r} yielded incremental item metadata, "
+                    "which mempalace mine does not support yet"
+                )
             if isinstance(result, DrawerRecord):
                 drawers_written += 1
-                if not dry_run:
-                    context.upsert_drawer(result)
+                context.upsert_drawer(result)
         return drawers_written
     finally:
-        knowledge_graph.close()
+        if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+            knowledge_graph.close()
 
 
 def cmd_sweep(args):

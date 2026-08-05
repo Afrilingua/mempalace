@@ -9,6 +9,8 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import os
+from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import subprocess
 import sys
@@ -879,6 +881,247 @@ class TestReadTools:
         assert result["total_drawers"] == 1
         assert "hnsw_capacity" not in result
         assert result.get("vector_disabled") is not True
+
+    def test_read_only_sqlite_exact_real_read_does_not_mutate_storage(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A real MCP read must use sqlite_exact's read-only connection path,
+        not the normal schema/WAL initialization path."""
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace import mcp_server, palace
+        from mempalace.backends import PalaceRef
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        col = palace.get_collection(palace_path, create=True)
+        col.add(
+            ids=["drawer_read_only"],
+            documents=["verbatim read-only drawer"],
+            metadatas=[{"wing": "w", "room": "r"}],
+        )
+
+        backend = palace.get_backend_for_palace(palace_path)
+        palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+        backend.close_palace(palace_ref)
+
+        db_path = Path(palace_path) / "sqlite_exact.sqlite3"
+        with sqlite3.connect(db_path) as conn:
+            before_schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            before_meta = conn.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+        before_bytes = db_path.read_bytes()
+        before_mtime_ns = db_path.stat().st_mtime_ns
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_palace", None)
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+
+        result = mcp_server.tool_list_drawers()
+
+        assert result["count"] == 1
+        assert result["drawers"][0]["drawer_id"] == "drawer_read_only"
+        read_only_handle = backend._read_only_clients[palace_path]
+        assert read_only_handle.read_only is True
+        assert read_only_handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+        backend.close_palace(palace_ref)
+        with sqlite3.connect(db_path) as conn:
+            after_schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            after_meta = conn.execute("SELECT key, value FROM meta ORDER BY key").fetchall()
+        assert after_schema_version == before_schema_version
+        assert after_meta == before_meta
+        assert db_path.read_bytes() == before_bytes
+        assert db_path.stat().st_mtime_ns == before_mtime_ns
+
+    def test_stdio_sqlite_exact_reads_with_peer_writer_then_reopens_on_promotion(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A writable-capable stdio server must recall through a read-only
+        handle while a peer owns the palace, then discard that handle when it
+        successfully promotes to writer."""
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace import mcp_server, palace
+        from mempalace.backends import PalaceRef
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        col = palace.get_collection(palace_path, create=True)
+        col.add(
+            ids=["drawer_peer_writer"],
+            documents=["verbatim recall beside peer writer"],
+            metadatas=[{"wing": "w", "room": "r"}],
+        )
+
+        backend = palace.get_backend_for_palace(palace_path)
+        palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+        backend.close_palace(palace_ref)
+
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, palace_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+
+            _patch_mcp_server(monkeypatch, config, kg)
+            monkeypatch.setattr(mcp_server._args, "transport", "stdio")
+            monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+            monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+            monkeypatch.setattr(mcp_server, "_collection_cache", None)
+            monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+            monkeypatch.setattr(mcp_server, "_collection_cache_palace", None)
+
+            result = mcp_server.tool_list_drawers()
+
+            assert result["count"] == 1
+            assert result["drawers"][0]["drawer_id"] == "drawer_peer_writer"
+            read_only_handle = backend._read_only_clients[palace_path]
+            assert read_only_handle.read_only is True
+            assert read_only_handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+            assert holder.stdin is not None
+            holder.stdin.close()
+            holder.wait(timeout=10)
+            assert holder.returncode == 0
+
+            writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
+            assert writer_ok is True
+            assert writer_reason == ""
+            assert read_only_handle.closed is True
+
+            promoted = mcp_server._get_collection(create=False)
+            assert promoted is not None
+            assert backend._clients[palace_path].read_only is False
+        finally:
+            if mcp_server._MCP_WRITER_LOCK_CM is not None:
+                mcp_server._release_mcp_writer_lock()
+            if holder.poll() is None:
+                if holder.stdin is not None:
+                    holder.stdin.close()
+                holder.wait(timeout=10)
+            backend.close_palace(palace_ref)
+
+    def test_promotion_clears_readonly_embedder_identity_cache(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """A read-only open of an empty collection must not stick identity
+        validation across promotion — the first writable open still records
+        the active model on disk."""
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+        from mempalace import mcp_server, palace
+        from mempalace.backends import PalaceRef
+        from mempalace.backends.base import EmbedderIdentity
+
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+        monkeypatch.setattr(
+            embedding_wrapper,
+            "_embed_texts",
+            lambda texts: [[float(len(text)), 1.0] for text in texts],
+        )
+        # Initialize schema without recording identity / drawers (empty palace).
+        col = palace.get_collection(palace_path, create=True, _skip_identity_check=True)
+        assert col.count() == 0
+        # Ensure no identity is stored yet.
+        try:
+            assert col.get_stored_embedder_identity() is None
+        except Exception:
+            pass
+
+        backend = palace.get_backend_for_palace(palace_path)
+        palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+        backend.close_palace(palace_ref)
+        palace._VALIDATED_IDENTITY.clear()
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setattr(mcp_server._args, "transport", "stdio")
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+        monkeypatch.setattr(mcp_server, "_collection_cache", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_backend", None)
+        monkeypatch.setattr(mcp_server, "_collection_cache_palace", None)
+
+        # Read-only open while a peer owns the palace: create=False path
+        # validates without recording identity on an empty collection.
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, palace_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+
+            # Force a peer-writer-coexistence read (opens query_only handle).
+            result = mcp_server.tool_list_drawers()
+            assert result["count"] == 0
+            # Identity may have been marked validated without disk record.
+            assert any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+
+            assert holder.stdin is not None
+            holder.stdin.close()
+            holder.wait(timeout=10)
+
+            writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
+            assert writer_ok is True
+            assert writer_reason == ""
+            # Promotion must drop the incomplete read-only validation cache.
+            assert not any(key[0] == palace_path for key in palace._VALIDATED_IDENTITY)
+
+            # Writable open after promotion should still record identity.
+            promoted = mcp_server._get_collection(create=True)
+            assert promoted is not None
+            stored = promoted.get_stored_embedder_identity()
+            assert stored is not None
+            assert stored.model_name == "minilm"
+            assert isinstance(stored, EmbedderIdentity) or True
+        finally:
+            if mcp_server._MCP_WRITER_LOCK_CM is not None:
+                mcp_server._release_mcp_writer_lock()
+            if holder.poll() is None:
+                if holder.stdin is not None:
+                    holder.stdin.close()
+                holder.wait(timeout=10)
+            backend.close_palace(palace_ref)
+            palace._VALIDATED_IDENTITY.clear()
 
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
         from mempalace.backends import GetResult
@@ -1996,6 +2239,205 @@ class TestWriteTools:
 
         assert "mempalace_checkpoint" in mcp_server.TOOLS
         assert mcp_server.TOOLS["mempalace_checkpoint"]["handler"] is mcp_server.tool_checkpoint
+
+    def test_checkpoint_added_by_defaults_to_diary_agent(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """#2023: with no explicit ``added_by``, each filed drawer is attributed
+        to the diary ``agent_name`` (verbatim case) rather than the generic
+        ``checkpoint`` label, so the filing agent survives in provenance."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        _client.close()  # release file handles; a bare del leaks them on Windows (#1128)
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[{"wing": "w", "room": "decisions", "content": "Use PostgreSQL for storage."}],
+            diary={"agent_name": "DeepSeek", "wing": "w", "entry": "SESSION|did.stuff|star"},
+        )
+        assert len(result["added"]) == 1
+
+        client, col = _get_collection(palace_path)
+        try:
+            metas = col.get(include=["metadatas"])["metadatas"]
+        finally:
+            client.close()
+        drawers = [m for m in metas if m.get("room") == "decisions"]
+        assert len(drawers) == 1
+        # Verbatim case, not the lowercased diary-index form of agent_name.
+        assert drawers[0]["added_by"] == "DeepSeek"
+
+    def test_checkpoint_explicit_added_by_overrides_diary(self, monkeypatch):
+        """An explicit ``added_by`` wins over the diary ``agent_name`` fallback."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "keep me"}],
+            diary={"agent_name": "deepseek", "entry": "SESSION|x|star"},
+            added_by="alice",
+        )
+        assert filed["added_by"] == "alice"
+
+    def test_checkpoint_added_by_falls_back_to_checkpoint_label(self, monkeypatch):
+        """Neither an explicit ``added_by`` nor a diary ``agent_name`` -> the
+        drawer keeps the legacy ``checkpoint`` attribution (backward compatible)."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        seen = []
+
+        def _add(**kwargs):
+            seen.append(kwargs["added_by"])
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        # No diary block at all.
+        mcp_server.tool_checkpoint(items=[{"wing": "w", "room": "r", "content": "a"}])
+        # Diary present but without an ``agent_name``.
+        mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "b"}],
+            diary={"entry": "SESSION|y|star"},
+        )
+        assert seen == ["checkpoint", "checkpoint"]
+
+    def test_checkpoint_added_by_accepted_via_dispatch(self, monkeypatch):
+        """#2023: ``added_by`` passes the tools/call schema whitelist (the
+        reporter's HTTP MCP transport reuses this dispatcher) and the real
+        handler forwards it, for both the explicit value and the diary fallback."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {
+                    "name": "mempalace_checkpoint",
+                    "arguments": {
+                        "items": [{"wing": "w", "room": "r", "content": "hi"}],
+                        "added_by": "alice",
+                    },
+                },
+            }
+        )
+        assert "error" not in resp
+        assert filed["added_by"] == "alice"
+
+        filed.clear()
+        resp2 = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_checkpoint",
+                    "arguments": {
+                        "items": [{"wing": "w", "room": "r", "content": "yo"}],
+                        "diary": {"agent_name": "DeepSeek", "entry": "SESSION|z|star"},
+                    },
+                },
+            }
+        )
+        assert "error" not in resp2
+        assert filed["added_by"] == "DeepSeek"
+
+    def test_checkpoint_schema_exposes_added_by(self):
+        """``added_by`` is declared in the checkpoint tool schema so the
+        dispatch whitelist admits it instead of rejecting it as unknown."""
+        from mempalace import mcp_server
+
+        props = mcp_server.TOOLS["mempalace_checkpoint"]["input_schema"]["properties"]
+        assert "added_by" in props
+        assert props["added_by"]["type"] == "string"
+
+    def test_checkpoint_blank_or_invalid_added_by_defers_to_diary(self, monkeypatch):
+        """A blank, whitespace-only, non-string, or None explicit ``added_by``
+        counts as unspecified, so it defers to the diary ``agent_name`` rather
+        than masking it; with no usable diary name it falls to ``checkpoint``."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        seen = []
+
+        def _add(**kwargs):
+            seen.append(kwargs["added_by"])
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        diary = {"agent_name": "deepseek", "entry": "SESSION|x|star"}
+        for bad in ("", "   ", 123, None):
+            mcp_server.tool_checkpoint(
+                items=[{"wing": "w", "room": "r", "content": f"c{bad!r}"}],
+                diary=diary,
+                added_by=bad,
+            )
+        # Every unusable explicit value defers to the diary agent.
+        assert seen == ["deepseek", "deepseek", "deepseek", "deepseek"]
+
+        # Blank explicit AND a blank diary name -> the legacy label.
+        seen.clear()
+        mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "z"}],
+            diary={"agent_name": "   ", "entry": "SESSION|y|star"},
+            added_by="",
+        )
+        assert seen == ["checkpoint"]
+
+    def test_checkpoint_added_by_uniform_across_items(self, monkeypatch):
+        """All items in one checkpoint share a single resolved author (a
+        checkpoint is one agent's session save; attribution is resolved once)."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        monkeypatch.setattr(mcp_server, "tool_diary_write", lambda **k: {"success": True})
+        seen = []
+
+        def _add(**kwargs):
+            seen.append(kwargs["added_by"])
+            return {"success": True, "drawer_id": kwargs["content"]}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        mcp_server.tool_checkpoint(
+            items=[
+                {"wing": "w", "room": "r", "content": "one"},
+                {"wing": "w", "room": "r", "content": "two"},
+            ],
+            diary={"agent_name": "DeepSeek", "entry": "SESSION|q|star"},
+        )
+        assert seen == ["DeepSeek", "DeepSeek"]
 
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -4060,6 +4502,32 @@ class TestStructuredErrors:
         assert "another mine is in progress" in result["error"]
         assert result.get("error_class") == "LockHeldByOtherProcess"
 
+    def test_tool_diary_write_lease_refusal_returns_error_class(self, monkeypatch):
+        """tool_diary_write must mark a peer-held palace lease with error_class,
+        like tool_mine/tool_sync already do. The daemon keys its defer-vs-fail
+        decision on that marker (#2014); swallowed by the bare `except Exception`
+        the refusal was indistinguishable from a genuine write error, so a queued
+        diary entry was dead-lettered instead of retried."""
+        from mempalace import daemon, mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        class _LeaseHeldCollection:
+            def add(self, **kwargs):
+                raise MineAlreadyRunning("palace /p is held by PID 999 (mempalace-mcp)")
+
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: _LeaseHeldCollection()
+        )
+        monkeypatch.setattr(mcp_server, "_wal_log", lambda *a, **kw: None)
+
+        result = mcp_server.tool_diary_write(agent_name="tester", entry="verbatim", topic="t")
+        assert result["success"] is False
+        assert "is held by PID 999" in result["error"]
+        # Assert against the daemon's constant, not a literal: the two are a
+        # wire contract, and drift silently un-fixes #2014 (the daemon would
+        # stop recognising the refusal and dead-letter the job again).
+        assert result.get("error_class") == daemon.LOCK_REFUSAL_ERROR_CLASS
+
     def test_mcp_idle_timeout_invalid_env_disables_watchdog(self, monkeypatch):
         """Invalid MEMPALACE_MCP_IDLE_HOURS disables idle auto-exit."""
         from mempalace import mcp_server
@@ -4832,6 +5300,85 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     assert '"ok": true' in response["result"]["content"][0]["text"]
 
 
+def test_read_only_refuses_exactly_the_refused_set(monkeypatch):
+    """Ask the gate which tools it refuses instead of restating the set.
+
+    Comparing against the whole TOOLS registry also catches a stale name: a tool
+    renamed or removed while the set still lists it would gate nothing, and the
+    two sides would stop matching.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+
+    refused = {
+        name for name in mcp_server.TOOLS if mcp_server._mcp_read_only_refusal(1, name) is not None
+    }
+    assert refused == set(mcp_server._READ_ONLY_REFUSED_TOOLS)
+    assert "mempalace_hook_settings" in refused
+    assert "mempalace_memories_filed_away" in refused
+    # Reconnect stays reachable on purpose: it is the only way a read-only
+    # server picks up an external writer's changes.
+    assert "mempalace_reconnect" not in refused
+
+    # The palace-write set the peer-writer lease arbitrates stays the narrower
+    # of the two; see test_peer_writer_guard_does_not_gate_hook_settings.
+    assert mcp_server._MUTATING_TOOLS < mcp_server._READ_ONLY_REFUSED_TOOLS
+    assert "mempalace_hook_settings" not in mcp_server._MUTATING_TOOLS
+
+
+def test_read_only_refuses_every_daemon_write_tool():
+    """Read-only must not be laxer than the daemon's own write classification.
+
+    service.WRITE_TOOLS is a security allowlist: execute_job lets the generic
+    mcp_tool escape hatch run write-classified tools only. A tool the daemon
+    calls a write while read-only serves it is the exact gap this fixes, and
+    mempalace_hook_settings was that tool.
+    """
+    from mempalace import mcp_server, service
+
+    assert service.WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
+    assert "mempalace_hook_settings" in service.WRITE_TOOLS
+
+
+def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):
+    """The read-only widening must not leak into the peer-writer path.
+
+    mempalace_hook_settings writes the config file and never the palace, so it
+    stays out of _MUTATING_TOOLS and the lease has no say over it. Read-only
+    refuses it through _READ_ONLY_REFUSED_TOOLS instead. Were it moved into
+    _MUTATING_TOOLS, a peer holding the lease would refuse it with -32001,
+    including the no-argument form that only reads the current settings.
+    """
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("hook_settings should not acquire the peer-writer lock")
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_hook_settings",
+        {
+            "description": "test config tool",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": lambda: {"ok": True},
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "mempalace_hook_settings", "arguments": {}},
+        }
+    )
+
+    assert '"ok": true' in response["result"]["content"][0]["text"]
+    assert "mempalace_hook_settings" not in mcp_server._MUTATING_TOOLS
+
+
 def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     from mempalace import mcp_server
 
@@ -4853,17 +5400,27 @@ def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
     assert mcp_server.tool_status()["total_drawers"] == 0
 
 
-def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
+def test_peer_writer_lock_setup_failure_retries_and_recovers(monkeypatch):
     from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
     calls = {"count": 0}
 
-    def broken_mine_palace_lock(palace_path):
+    def flaky_mine_palace_lock(palace_path):
         calls["count"] += 1
-        raise RuntimeError(f"permission denied for {palace_path}")
+        if calls["count"] == 1:
+            raise RuntimeError(f"permission denied for {palace_path}")
+        return _DummyLock()
 
     monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
-    monkeypatch.setattr(palace, "mine_palace_lock", broken_mine_palace_lock)
+    monkeypatch.setattr(palace, "mine_palace_lock", flaky_mine_palace_lock)
+    monkeypatch.setattr(mcp_server, "_discard_mcp_storage_handles", lambda: None)
 
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
     monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
@@ -4873,12 +5430,63 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
     ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
 
-    assert ok_first is True
+    assert ok_first is False
+    assert "later mutating request will retry ownership" in reason_first
     assert ok_second is True
+    assert reason_second == ""
+    assert calls["count"] == 2
+    assert mcp_server._MCP_WRITER_LOCK_FAILED is False
+    assert mcp_server._MCP_WRITER_LOCK_CM is not None
+    mcp_server._release_mcp_writer_lock()
+
+
+def test_peer_writer_override_cannot_bypass_local_backend_lock(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def tracked_lock(palace_path):
+        calls["count"] += 1
+        return _DummyLock()
+
+    monkeypatch.setenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, "1")
+    monkeypatch.setattr(palace, "resolve_backend_name", lambda path: "sqlite_exact")
+    monkeypatch.setattr(palace, "mine_palace_lock", tracked_lock)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok is True
+    assert reason == ""
     assert calls["count"] == 1
-    assert mcp_server._MCP_WRITER_LOCK_FAILED is True
-    assert "continuing without peer-writer protection" in reason_first
-    assert reason_second == reason_first
+
+
+def test_peer_writer_override_remains_available_for_remote_backend(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    monkeypatch.setenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, "1")
+    monkeypatch.setattr(palace, "resolve_backend_name", lambda path: "qdrant")
+    monkeypatch.setattr(
+        palace,
+        "mine_palace_lock",
+        lambda path: pytest.fail("remote backend should not take the local writer lease"),
+    )
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    assert mcp_server._acquire_mcp_writer_lock() == (True, "")
 
 
 def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):

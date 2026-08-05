@@ -665,6 +665,54 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_lock_deferral_reports_a_runnable_command(mock_config_cls, capsys):
+    """A foreground mine refused the palace lock must say so and hand back a
+    command that actually works. --palace is global, so it has to be echoed back
+    ahead of the subcommand: without it the suggestion silently lists the
+    default palace's queue instead of the one the job is parked in."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    parked = {
+        "id": "job-1",
+        "state": "queued",
+        "error": {
+            "error_class": "LockHeldByOtherProcess",
+            "message": "palace /my palace is held by PID 999",
+        },
+    }
+    args = argparse.Namespace(
+        dir="/src",
+        palace="/my palace",  # non-default, and with a space to pin the quoting
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=None,
+        extract="exchange",
+        daemon=True,
+        background=False,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
+        with pytest.raises(SystemExit) as exc:
+            cmd_mine(args)
+
+    assert exc.value.code == 1
+    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
+    err = capsys.readouterr().err
+    assert "is held by PID 999" in err  # the holder, not a generic failure
+    assert "daemon submission failed" not in err  # the submission did not fail
+    assert f"mempalace --palace {shlex.quote('/my palace')} daemon jobs" in err
+    # Not `daemon wait`: this branch exists because we would not wait out the
+    # holder, so it must not hand back a command that does exactly that.
+    assert "daemon wait" not in err
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_background_requires_daemon(mock_config_cls, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
     args = argparse.Namespace(
@@ -1168,6 +1216,8 @@ def test_cmd_repair_uses_configured_collection(mock_config_cls, tmp_path, capsys
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp_path, capsys):
+    """When the live swap fails after the delete, recovery must PROMOTE the
+    verified temp copy instead of restoring a sqlite-only file backup."""
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
@@ -1183,21 +1233,30 @@ def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp
     }
     mock_temp_col = MagicMock()
     mock_temp_col.count.return_value = 2
+    mock_promoted_col = MagicMock()
+    mock_promoted_col.count.return_value = 2
     mock_backend = _mock_backend_for(col=mock_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, RuntimeError("live build failed")]
+    mock_backend.create_collection.side_effect = [
+        mock_temp_col,
+        RuntimeError("live build failed"),
+        mock_promoted_col,
+    ]
     with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
         with pytest.raises(SystemExit) as excinfo:
             cmd_repair(args)
     out = capsys.readouterr().out
     assert excinfo.value.code == 1
     assert "Repair failed" in out
-    assert "restoring from backup" in out
+    assert "Attempting recovery: promoting verified copy" in out
+    assert "Recovery succeeded" in out
     mock_backend.close_palace.assert_called_once_with(str(palace_dir))
     assert mock_backend.delete_collection.call_args_list == [
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
-        call(str(palace_dir), "mempalace_drawers"),
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),  # pre-clean stale temp
+        call(str(palace_dir), "mempalace_drawers"),  # live delete before re-upload
+        call(str(palace_dir), "mempalace_drawers"),  # delete broken live before promotion
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),  # temp cleaned after promotion
     ]
+    assert mock_promoted_col.upsert.called
 
 
 def _repair_backend_mocks(mock_config_cls, palace_dir, create_collection_results=None):
@@ -1780,6 +1839,35 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_dry_run_passes_through_and_skips_confirm(mock_config_cls, tmp_path):
+    """``repair --mode from-sqlite --dry-run`` must forward dry_run and skip
+    the destructive confirmation prompt (#2095, #2133)."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="from-sqlite",
+        source=None,
+        archive_existing=False,
+        yes=False,
+        dry_run=True,
+    )
+    with (
+        patch(
+            "mempalace.repair.rebuild_from_sqlite",
+            return_value={"mempalace_drawers": 0, "mempalace_closets": 0},
+        ) as mock_rebuild,
+        patch("mempalace.migrate.confirm_destructive_action") as mock_confirm,
+    ):
+        cmd_repair(args)
+
+    mock_confirm.assert_not_called()
+    assert mock_rebuild.call_args.kwargs["dry_run"] is True
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_from_sqlite_cleanup_failure_exits_nonzero(mock_config_cls, tmp_path, capsys):
     from mempalace.repair import RebuildCleanupError
 
@@ -1821,6 +1909,7 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         source=None,
         archive_existing=False,
         yes=True,
+        dry_run=False,
     )
     fake_counts = {"mempalace_drawers": 1, "mempalace_closets": 0}
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts) as rebuild:
@@ -1830,4 +1919,5 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         source_palace=str(palace_dir),
         dest_palace=str(palace_dir),
         archive_existing_dest=True,
+        dry_run=False,
     )

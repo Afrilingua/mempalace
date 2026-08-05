@@ -810,6 +810,12 @@ def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) 
             backend=backend,
             wait=not background,
             auto_start=True,
+            # A job refused the palace lock is deferred, not failed (#2014), so
+            # it never becomes terminal while the holder lives. Waiting it out
+            # would strand this terminal behind a peer that can outlive the
+            # default hour; report the parked job instead. A job that is really
+            # running (a long mine) is still waited out.
+            stop_on_lock_deferral=not background,
         )
     except DaemonError as exc:
         print(f"mempalace: daemon submission failed: {exc}", file=sys.stderr)
@@ -818,6 +824,26 @@ def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) 
     if background:
         print(f"Submitted daemon job {job['id']} ({kind})")
         return
+
+    from .daemon import job_deferred_by_lock
+
+    if job_deferred_by_lock(job):
+        reason = (job.get("error") or {}).get("message") or "the palace write lock is held"
+        # --palace is global, so it has to be echoed back ahead of the
+        # subcommand: without it the suggestion silently lists the DEFAULT
+        # palace's queue (or nothing at all) instead of the one this job is
+        # parked in -- a wrong answer that looks authoritative.
+        # `daemon jobs` and not `daemon wait`: we just declined to wait out the
+        # holder, so pointing the operator at a command that blocks on the very
+        # state we could not wait for would undo the point of this branch.
+        palace_flag = f"--palace {shlex.quote(args.palace)} " if args.palace else ""
+        print(f"mempalace: {reason}", file=sys.stderr)
+        print(
+            f"mempalace: job {job['id']} is queued and runs when the holder exits "
+            f"(check it with: mempalace {palace_flag}daemon jobs)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     result = job.get("result") or {}
     from .service import print_job_result
@@ -1114,6 +1140,7 @@ def cmd_repair(args):
         _close_chroma_handles,
         _extract_drawers,
         _post_rebuild_cleanup,
+        _promote_temp_collection,
         _rebuild_collection_via_temp,
         check_extraction_safety,
         index_read_recovery_guidance,
@@ -1159,9 +1186,17 @@ def cmd_repair(args):
         # No prompt when source != dest AND dest does not exist (pure
         # extract-into-fresh-dir case is non-destructive to existing
         # palaces).
+        # A --dry-run only reads the source SQLite and prints a plan — it
+        # never archives, creates, or writes — so it must not trip the
+        # destructive-action confirmation (#2095, #2133).
+        dry_run = getattr(args, "dry_run", False)
         is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
-        if is_destructive_to_dest and not confirm_destructive_action(
-            "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+        if (
+            not dry_run
+            and is_destructive_to_dest
+            and not confirm_destructive_action(
+                "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+            )
         ):
             return
 
@@ -1170,6 +1205,7 @@ def cmd_repair(args):
                 source_palace=source_path,
                 dest_palace=palace_path,
                 archive_existing_dest=archive_existing,
+                dry_run=dry_run,
             )
         except RebuildPartialError as exc:
             # The error itself was already printed by rebuild_from_sqlite
@@ -1307,19 +1343,27 @@ def cmd_repair(args):
     except RebuildCollectionError as e:
         print(f"  Repair failed: {e}")
         if getattr(e, "live_replaced", False):
-            print("  Live collection was already replaced; restoring from backup...")
+            temp_name = f"{collection_name}__repair_tmp"
+            print(f"  Attempting recovery: promoting verified copy from '{temp_name}'...")
             try:
                 _close_chroma_handles(palace_path, backend=backend)
-                if os.path.exists(palace_path):
-                    shutil.rmtree(palace_path)
-                shutil.copytree(backup_path, palace_path)
-                print(f"  Restore complete from backup: {backup_path}")
-            except Exception as restore_error:
-                print(f"  Automatic restore failed: {restore_error}")
-                print("  Manual recovery required:")
-                print(f"    1. Remove or rename the broken directory: {palace_path}")
-                print(f"    2. Restore the backup directory to: {palace_path}")
-                print(f"       Backup location: {backup_path}")
+                _promote_temp_collection(
+                    backend,
+                    palace_path,
+                    temp_name,
+                    collection_name,
+                    len(all_ids),
+                    batch_size,
+                    progress=print,
+                )
+                print("  Recovery succeeded: live collection restored from the verified temp copy.")
+            except Exception as promote_error:
+                print(f"  Automatic recovery failed: {promote_error}")
+                print(
+                    f"  The verified pre-swap copy still survives under '{temp_name}' -- do NOT "
+                    f"delete it. Recover manually by promoting it, or restore the full-directory "
+                    f"backup at: {backup_path}"
+                )
         sys.exit(1)
 
     # The bulk delete + re-upsert cycle above leaves the FTS5 inverted index
@@ -1797,7 +1841,9 @@ def main():
 
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
-    p_mine.add_argument("dir", help="Directory to mine")
+    p_mine.add_argument(
+        "dir", help="Directory to mine, or one conversation file with --mode convos"
+    )
     p_mine.add_argument(
         "--backend",
         default=None,
@@ -2154,7 +2200,7 @@ def main():
     p_serve.add_argument(
         "--read-only",
         action="store_true",
-        help="Expose recall only: mutating tools are hidden and refused",
+        help="Expose recall only: tools that change state are hidden and refused",
     )
     p_serve.add_argument(
         "--allow-insecure",

@@ -71,9 +71,10 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
-    _HNSW_BLOAT_GUARD,
+    _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
     hnsw_capacity_status,
+    reset_hnsw_capacity_cache,
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
@@ -289,8 +290,8 @@ def _parse_args():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Serve a read-only tool surface: the mutating tools are hidden from "
-        "tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
+        help="Serve a read-only tool surface: the tools that change state are hidden "
+        "from tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
     )
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -312,10 +313,12 @@ if _args.backend:
 
 _config = MempalaceConfig()
 
-# Read-only server mode: when on, the mutating tools are hidden from tools/list
-# and refused at dispatch (-32003). Resolved once at startup from --read-only or
-# MEMPALACE_MCP_READ_ONLY. Computed inline (not via _truthy_env, defined below)
-# so it is available to the request path regardless of import order.
+# Read-only server mode: when on, the tools in _READ_ONLY_REFUSED_TOOLS (defined
+# below) are hidden from tools/list and refused at dispatch (-32003). That is a
+# wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved once at
+# startup from --read-only or MEMPALACE_MCP_READ_ONLY. Computed inline (not via
+# _truthy_env, defined below) so it is available to the request path regardless
+# of import order.
 _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
     "MEMPALACE_MCP_READ_ONLY", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -380,6 +383,7 @@ _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
+_MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
 _MUTATING_TOOLS = frozenset(
@@ -401,9 +405,132 @@ _MUTATING_TOOLS = frozenset(
     }
 )
 
+# Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
+#
+# _MUTATING_TOOLS is the *palace-write* set: _mcp_peer_writer_refusal consults it
+# to decide which calls need this process to hold the palace mine lock. A tool
+# that never touches Chroma or the knowledge graph has to stay out of that set,
+# or a server that lost the lease to a peer would start refusing calls the lease
+# has no say over.
+#
+# Two tools are exactly that shape, and read-only has to name both because it is
+# a capability boundary rather than a lock: it exists so a shared server can
+# serve recall to a client that must not change server state.
+#
+#   mempalace_hook_settings, given an argument, writes the server's
+#   ~/.mempalace/config.json through MempalaceConfig.set_hook_setting.
+#   service.WRITE_TOOLS already classifies it as a write, which the daemon uses
+#   as an allowlist, so read-only was the odd one out.
+#
+#   mempalace_memories_filed_away unlinks ~/.mempalace/hook_state/last_checkpoint
+#   on both of its branches. Consuming the file is the contract of the tool, but
+#   it is still a delete of state that outlives the process, on behalf of a
+#   client with no write access. (service.classify_tool calls this one "read",
+#   which is wrong for the same reason.)
+#
+# mempalace_reconnect is deliberately NOT here even though it is not write-free:
+# it clears ChromaBackend._quarantined_paths, so the reopen that follows can let
+# quarantine_stale_hnsw rename a segment directory. It is the only way to pick up
+# an external writer's changes, and _SQLITE_INTEGRITY_ALLOWED_TOOLS already keeps
+# it reachable for recovery, so gating it would strand a read-only server on a
+# stale index. This set means "refuse what a client asked to change", not
+# "nothing past here touches the disk" -- opening the palace or the knowledge
+# graph materialises files on its own, which no name-based gate can express.
+_READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
+    "mempalace_hook_settings",
+    "mempalace_memories_filed_away",
+}
+
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discard_mcp_storage_handles() -> None:
+    """Close cached storage handles before changing writer-lease state.
+
+    A stdio reader can hold a genuine read-only ``sqlite_exact`` collection
+    while another process owns the palace. Once this process promotes to
+    writer, that cached collection must not keep routing the mutating request
+    through its ``query_only`` connection. The inverse matters for embedded
+    HTTP: close writable handles before releasing the lifetime lease so no
+    storage client survives beyond the ownership interval.
+
+    Also clears per-process embedder-identity validation for this palace:
+    a prior read-only open of an empty collection may have cached a "validated"
+    key without recording identity on disk; promotion must re-run enforcement
+    so the first writable open still labels drawers with the active model.
+    """
+
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time
+
+    cached_client = _client_cache
+    try:
+        from .palace import clear_validated_embedder_identity, get_backend_for_palace
+
+        backend = get_backend_for_palace(_config.palace_path)
+        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
+        clear_validated_embedder_identity(_config.palace_path)
+    except Exception:
+        logger.debug("Failed to close cached backend while changing MCP ownership", exc_info=True)
+        try:
+            from .palace import clear_validated_embedder_identity
+
+            clear_validated_embedder_identity(getattr(_config, "palace_path", None))
+        except Exception:
+            logger.debug(
+                "Failed to clear embedder-identity cache while changing MCP ownership",
+                exc_info=True,
+            )
+
+    if cached_client is not None:
+        try:
+            close = getattr(cached_client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug(
+                "Failed to close MCP-local client while changing ownership",
+                exc_info=True,
+            )
+
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
+    _palace_db_inode = 0
+    _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+
+
+def _release_mcp_writer_lock() -> None:
+    """Close writable handles and release this process's palace lease."""
+
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
+
+    lock_cm = _MCP_WRITER_LOCK_CM
+    if lock_cm is None:
+        return
+
+    try:
+        _discard_mcp_storage_handles()
+    finally:
+        # Clear first so the atexit callback and embedded hosts can call this
+        # repeatedly without exiting the same context manager twice.
+        _MCP_WRITER_LOCK_CM = None
+        _MCP_WRITER_READ_ONLY = False
+        lock_cm.__exit__(None, None, None)
 
 
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
@@ -418,29 +545,40 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     the original holder exits — the OS releases its flock on process death —
     the next mutating call transparently promotes this server to writer, with
     no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
-    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` is now only a
-    status flag; it no longer short-circuits the retry (that sticky latch used
-    to strand a server read-only for life even after the peer was long gone).
+    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` and
+    ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
+    neither short-circuits a later retry. Peer ownership and transient setup
+    failures can both be corrected without restarting the MCP host.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR
-
-    if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
-        return True, ""
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
-    # NB: deliberately NO sticky read-only short-circuit here. If a peer held
-    # the lease at startup we fall through and retry mine_palace_lock below, so
-    # the server self-heals into the writer the moment the peer exits. A broken
-    # lock *mechanism* (below) is still cached, since retrying it can't help.
-    if _MCP_WRITER_LOCK_FAILED:
-        return True, _MCP_WRITER_LOCK_ERROR
+    # Deliberately no sticky failure short-circuit here. A peer can exit, a
+    # backend mismatch can be corrected, and lock-directory permissions can be
+    # repaired while this long-lived stdio host remains alive. Each mutating
+    # request therefore gets a fresh ownership attempt.
 
     try:
-        from .palace import MineAlreadyRunning, mine_palace_lock
+        from .palace import (
+            MineAlreadyRunning,
+            backend_requires_single_writer,
+            mine_palace_lock,
+            resolve_backend_name,
+        )
+
+        backend_name = resolve_backend_name(_config.palace_path)
+        if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+            if not backend_requires_single_writer(backend_name):
+                return True, ""
+            logger.warning(
+                "%s cannot bypass the single-writer requirement for local backend %r",
+                _MCP_ALLOW_PEER_WRITER_ENV,
+                backend_name,
+            )
 
         lock_cm = mine_palace_lock(_config.palace_path)
         lock_cm.__enter__()
@@ -455,16 +593,23 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
-            f"{_config.palace_path!r}: {exc!r}; continuing without "
-            "peer-writer protection"
+            f"{_config.palace_path!r}: {exc!r}; refusing this mutating tool "
+            "because peer-writer protection could not be established; a later "
+            "mutating request will retry ownership"
         )
-        logger.warning(_MCP_WRITER_LOCK_ERROR)
-        return True, _MCP_WRITER_LOCK_ERROR
+        logger.error(_MCP_WRITER_LOCK_ERROR)
+        return False, _MCP_WRITER_LOCK_ERROR
 
     _MCP_WRITER_LOCK_CM = lock_cm
     import atexit
 
-    atexit.register(lambda: lock_cm.__exit__(None, None, None))
+    if not _MCP_WRITER_ATEXIT_REGISTERED:
+        atexit.register(_release_mcp_writer_lock)
+        _MCP_WRITER_ATEXIT_REGISTERED = True
+    # Reads performed before promotion may have cached a query-only SQLite
+    # collection. Drop it while ownership is held so the pending mutating
+    # request reopens a writable handle rather than failing on query_only.
+    _discard_mcp_storage_handles()
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
@@ -847,6 +992,12 @@ def _force_chroma_cache_reset() -> None:
     _palace_db_mtime = 0.0
     _metadata_cache = None
     _metadata_cache_time = 0
+    # This runs on the #1315 retry path, which drops caches precisely to
+    # re-observe the palace after a transient index error. The capacity verdict
+    # is another cached view of that same palace, so it must be dropped too, or
+    # the retry could be answered from the pre-error verdict (its 10 s ceiling
+    # outlasts the 2 s retry sleep).
+    reset_hnsw_capacity_cache()
     try:
         from .palace import get_backend_for_palace
 
@@ -1032,6 +1183,11 @@ def _get_collection(create=False):
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    # Operator read-only mode must never bootstrap a collection. In
+    # particular, sqlite_exact's normal create/open path initializes WAL,
+    # schema, FTS metadata, and commits before the first read.
+    if _READ_ONLY:
+        create = False
     try:
         backend_name = _selected_backend_name()
     except (BackendMismatchError, KeyError) as exc:
@@ -1049,6 +1205,18 @@ def _get_collection(create=False):
         return None
 
     if backend_name != "chroma":
+        # Normal stdio MCP remains capable of promotion to writer, but until
+        # it actually owns the palace it must not open sqlite_exact through
+        # the schema-initializing read/write path. This lets recall coexist
+        # with a daemon/HTTP writer. _acquire_mcp_writer_lock() discards this
+        # cached read-only collection before a promoted mutation is handled.
+        collection_read_only = _READ_ONLY or (
+            backend_name == "sqlite_exact"
+            and getattr(_args, "transport", "stdio") == "stdio"
+            and _MCP_WRITER_LOCK_CM is None
+        )
+        if collection_read_only:
+            create = False
         for attempt in range(2):
             try:
                 if (
@@ -1069,6 +1237,7 @@ def _get_collection(create=False):
                         collection_name=_config.collection_name,
                         create=create,
                         backend=backend_name,
+                        read_only=collection_read_only,
                     )
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
@@ -1169,7 +1338,7 @@ def _get_collection(create=False):
                         metadata={
                             "hnsw:space": "cosine",
                             "hnsw:num_threads": 1,
-                            **_HNSW_BLOAT_GUARD,
+                            **_HNSW_WRITE_DEFAULTS,
                         },
                         **ef_kwargs,
                     )
@@ -2793,6 +2962,7 @@ def tool_mine(
     mining — use ``mempalace_sync`` for that.
     """
     global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning, MineValidationError
 
     if not _config.palace_path:
@@ -2855,7 +3025,7 @@ def tool_mine(
             return {
                 "success": False,
                 "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
             }
         except MineValidationError as exc:
             return {
@@ -3065,6 +3235,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
     from .sync import sync_palace
 
@@ -3089,7 +3260,7 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             return {
                 "success": False,
                 "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
             }
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
@@ -3491,6 +3662,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .palace import MineAlreadyRunning
+
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
@@ -3598,6 +3772,21 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "timestamp": now.isoformat(),
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
+        }
+    except MineAlreadyRunning as e:
+        # Order matters: this typed handler precedes the bare Exception below,
+        # mirroring tool_mine / tool_sync. The lock wraps ``col.add`` itself, so
+        # a peer holding it means no entry was filed -- a refusal, not a write
+        # failure -- and the daemon defers such a job rather than dead-lettering
+        # it (#2014). Swallowed into the generic branch the refusal loses
+        # ``error_class``, becomes indistinguishable from a genuine write error,
+        # and the queued diary entry is dropped. The daemon's constant, not a
+        # literal: the two sides are a wire contract, and drift on either end
+        # silently un-fixes #2014.
+        return {
+            "success": False,
+            "error": f"another mine is in progress: {e}",
+            "error_class": LOCK_REFUSAL_ERROR_CLASS,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3831,7 +4020,10 @@ def tool_reconnect():
     ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
-    # still applies after the reconnect.
+    # still applies after the reconnect. The probe keeps its own cache
+    # (#1471), so drop that too — otherwise the "re-run" would be served
+    # from the verdict this reconnect is meant to discard.
+    reset_hnsw_capacity_cache()
     _vector_disabled = False
     _vector_disabled_reason = ""
     # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
@@ -3898,7 +4090,7 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
-def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     """Batch session save in a single call.
 
     Semantic-dedups each item, files the non-duplicates as drawers, then
@@ -3909,6 +4101,9 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
 
     ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
     is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    ``added_by`` attributes the filed drawers; when omitted it falls back to
+    the diary's ``agent_name`` (and then to ``"checkpoint"``), so the agent
+    that filed the session is recorded instead of a generic label.
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
@@ -3925,6 +4120,20 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
+    # Drawer attribution: an explicit ``added_by`` wins; otherwise fall back to
+    # the diary's ``agent_name`` (the agent filing this session); otherwise the
+    # legacy ``"checkpoint"`` label. A blank, whitespace-only, or non-string
+    # value counts as unspecified at each step, so an empty explicit argument
+    # still defers to the diary instead of masking it. The chosen name is stored
+    # verbatim (tool_add_drawer strips lone surrogates but does not case-fold),
+    # matching how every other caller records ``added_by``; the diary index
+    # lowercases the same name separately for case-insensitive reads.
+    resolved_added_by = added_by if isinstance(added_by, str) and added_by.strip() else None
+    if resolved_added_by is None and isinstance(diary, dict):
+        agent = diary.get("agent_name")
+        resolved_added_by = agent if isinstance(agent, str) and agent.strip() else None
+    if resolved_added_by is None:
+        resolved_added_by = "checkpoint"
     for item in items:
         if not isinstance(item, dict):
             out["errors"].append({"item": item, "error": "item must be an object"})
@@ -3947,7 +4156,7 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -4352,6 +4561,10 @@ TOOLS = {
                     "type": "number",
                     "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
                 },
+                "added_by": {
+                    "type": "string",
+                    "description": "Who is filing these drawers. An explicit value takes precedence; otherwise the diary agent_name, else 'checkpoint'.",
+                },
             },
             "required": ["items"],
         },
@@ -4641,15 +4854,19 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
 
 
 def _mcp_read_only_refusal(req_id, tool_name: str):
-    """Refuse mutating tools when the server runs in read-only mode (#1877).
+    """Refuse state-changing tools when the server runs in read-only mode (#1877).
 
     Read-only is an operator-set server mode (``--read-only`` /
     ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
     it is an unconditional gate so a shared team server can expose recall
     without write access. Enforced at dispatch, not merely hidden from
     tools/list, so a client that calls a mutating tool by name is still refused.
+
+    Gates on ``_READ_ONLY_REFUSED_TOOLS``, not ``_MUTATING_TOOLS``: a tool can
+    write outside the palace database, which the peer-writer lease has no reason
+    to arbitrate but read-only still has to refuse.
     """
-    if not _READ_ONLY or tool_name not in _MUTATING_TOOLS:
+    if not _READ_ONLY or tool_name not in _READ_ONLY_REFUSED_TOOLS:
         return None
 
     return {
@@ -4721,8 +4938,9 @@ def handle_request(request):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
     elif method == "tools/list":
-        # In read-only mode, hide the mutating tools so clients don't advertise
+        # In read-only mode, hide the refused tools so clients don't advertise
         # write capabilities they can't use (dispatch also refuses them, #1877).
+        # Same set on both sides, or a tool would be listed and then rejected.
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -4730,7 +4948,7 @@ def handle_request(request):
                 "tools": [
                     {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
-                    if not (_READ_ONLY and n in _MUTATING_TOOLS)
+                    if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]
             },
         }
@@ -5411,6 +5629,24 @@ def _startup_preflight() -> None:
         logger.exception("startup preflight failed")
 
 
+def _drop_broken_stdout() -> None:
+    """Point fd 1 at devnull after a stdout write failed with a pipe error.
+
+    The response line that failed mid-write can leave bytes buffered in
+    ``sys.stdout``; the interpreter's shutdown flush would then re-raise
+    ``BrokenPipeError`` and turn a clean exit into status 120. With fd 1
+    on devnull that final flush drains harmlessly, so the process exits 0
+    and any held flocks (e.g. ``mine_palace``) release via normal
+    teardown.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def _run_stdio_loop() -> None:
     _restore_stdout()
 
@@ -5453,23 +5689,49 @@ def _run_stdio_loop() -> None:
     while True:
         try:
             line = sys.stdin.readline()
-            if not line:
-                break
+        except KeyboardInterrupt:
+            break
+        except OSError as exc:
+            # An orphaned pty/pipe surfaces as EIO/EBADF here instead of a
+            # clean EOF — same meaning: the client is gone. Never loop on
+            # it: an orphaned stdio server holding the mine_palace flock
+            # blocked all palace writes for hours (2026-07-10 outage).
+            logger.info("stdin read failed (%s) — client disconnected, shutting down", exc)
+            break
+        if not line:
+            logger.info("stdin EOF — client disconnected, shutting down")
+            break
 
-            line = line.strip()
-            if not line:
-                continue
+        line = line.strip()
+        if not line:
+            continue
 
+        payload = None
+        try:
             request = json.loads(line)
             response = handle_request(request)
-
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
         except Exception as e:
             logger.error(f"Server error: {e}")
+            continue
+
+        if payload is None:
+            continue
+        try:
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except KeyboardInterrupt:
+            break
+        except (BrokenPipeError, OSError) as exc:
+            # The client's read end is gone; every future response write
+            # would fail the same way, so treat it like stdin EOF and
+            # shut down instead of swallowing it in the generic handler.
+            logger.info("stdout write failed (%s) — client disconnected, shutting down", exc)
+            _drop_broken_stdout()
+            break
 
 
 def _run_http_loop() -> None:
@@ -5478,30 +5740,51 @@ def _run_http_loop() -> None:
     # still cannot masquerade as an HTTP response.
     logger.info("MemPalace MCP HTTP server starting...")
 
-    # The HTTP transport exists for long-lived deployments. Do the cheap
-    # filesystem-only probe before binding, but never make the listener wait on
-    # optional embedder/HNSW warmup. Operators and tests should see /healthz as
-    # soon as the process is alive.
-    _refresh_vector_disabled_flag()
-    _start_idle_exit_watchdog()
+    # A writable HTTP server is a long-lived storage client, so it must own the
+    # local palace before it binds. Refusing at startup avoids advertising a
+    # writable service that will only fail (or race) on its first mutation.
+    # Explicit read-only HTTP remains safe to run beside the one writer owner.
+    owns_writer_lease = False
+    if not _READ_ONLY:
+        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        if not writer_ok:
+            logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
+            raise SystemExit(2)
+        owns_writer_lease = True
 
-    raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
-    if raw_warmup in _WARMUP_TRUTHY:
+    try:
+        # The HTTP transport exists for long-lived deployments. Do the cheap
+        # filesystem-only probe before binding, but never make the listener wait on
+        # optional embedder/HNSW warmup. Operators and tests should see /healthz as
+        # soon as the process is alive.
+        _refresh_vector_disabled_flag()
+        _start_idle_exit_watchdog()
 
-        def _warmup_with_lock():
+        raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+        if raw_warmup in _WARMUP_TRUTHY:
+
+            def _warmup_with_lock():
+                with _HTTP_REQUEST_LOCK:
+                    _maybe_eager_warmup_embedder()
+
+            threading.Thread(
+                target=_warmup_with_lock,
+                name="mcp-http-eager-warmup",
+                daemon=True,
+            ).start()
+        elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
+            # Keep the same warning behavior as stdio mode for typo values.
+            _maybe_eager_warmup_embedder()
+
+        _serve_http(_args.host, _args.port)
+    finally:
+        if owns_writer_lease:
+            # _serve_http uses daemon request threads, so synchronize with the
+            # dispatch lock before closing storage and exposing the palace to
+            # another process. Response serialization happens after this lock
+            # and no longer touches the backend.
             with _HTTP_REQUEST_LOCK:
-                _maybe_eager_warmup_embedder()
-
-        threading.Thread(
-            target=_warmup_with_lock,
-            name="mcp-http-eager-warmup",
-            daemon=True,
-        ).start()
-    elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
-        # Keep the same warning behavior as stdio mode for typo values.
-        _maybe_eager_warmup_embedder()
-
-    _serve_http(_args.host, _args.port)
+                _release_mcp_writer_lock()
 
 
 def main():

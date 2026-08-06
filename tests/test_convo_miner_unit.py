@@ -589,6 +589,22 @@ class TestScanConvos:
         assert "main.jsonl" in names
         assert "agent.jsonl" not in names
 
+    def test_scan_mines_an_explicitly_named_file_inside_subagents(self, tmp_path):
+        # The skip is directory pruning, so it cannot reach a caller who names
+        # one file: that path feeds a single synthetic entry with no directories
+        # to prune. The split is deliberate -- --include-subagents governs what a
+        # directory walk sweeps up, while naming a path is an explicit request
+        # and stays honored. Pinned because the two behaviours were written
+        # independently and nothing else exercises them together.
+        subagents_dir = tmp_path / "session-abc" / "subagents"
+        subagents_dir.mkdir(parents=True)
+        target = subagents_dir / "agent-abc.jsonl"
+        target.write_text('{"type":"user"}\n', encoding="utf-8")
+
+        files = scan_convos(str(target))
+
+        assert [f.name for f in files] == ["agent-abc.jsonl"]
+
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):

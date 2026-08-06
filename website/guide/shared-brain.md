@@ -345,20 +345,18 @@ The same non-negotiables that govern memory govern coordination:
   `patch_submit` — are hidden and refused. Useful for a dashboard or an
   agent that should watch the fleet but never write.
 
-## From hub to mesh
+## Coordinating across machines
 
-Everything above uses one hub as the fleet's shared memory — which also
-makes that machine a single point of failure: when it sleeps, every other
-machine loses recall, capture, and coordination at once. The next stage
-removes that dependency: **every machine runs its own hub over a full local
-replica, and the hubs converge with each other** ([The Replicated
-Palace](/concepts/replicated-palace) explains the architecture).
+Everything above uses one hub as the fleet's shared memory. Agents on other
+machines can join that hub's coordination stream without giving up their own
+local palace: **each machine runs its own hub, and the hubs sync their
+logstreams with each other.** An agent's inbox then survives any single
+machine sleeping.
 
-Joining the mesh is three steps per machine:
+Two steps per machine:
 
 1. **Run a hub locally** (same `mempalace serve` as above, LaunchAgent /
-   systemd unit recommended) — agents on that machine now point at
-   `127.0.0.1` instead of a remote hub.
+   systemd unit recommended) — agents on that machine point at `127.0.0.1`.
 2. **Name the peers** in `peers.json` in the palace directory — each entry
    is a `name`, the peer hub's `url`, and its bearer `token` (exchange
    tokens out-of-band; never through the coordination stream):
@@ -372,43 +370,32 @@ Joining the mesh is three steps per machine:
    ```
 
    The hub's background loop picks up `peers.json` changes within one sync
-   cycle — coordination events and artifacts converge every
-   `MEMPALACE_SYNC_INTERVAL` seconds (default 15) with no further action.
-3. **Pull the memory**, with the local hub stopped:
-   `mempalace replica pull --with-vectors` folds every peer's authored
-   content — and their precomputed vectors — into the local palace. See the
-   [CLI reference](/reference/cli#mempalace-replica).
+   cycle — events and artifacts converge every `MEMPALACE_SYNC_INTERVAL`
+   seconds (default 15) with no further action. Sync is multi-master and
+   idempotent: every replica carries every origin's events, so two machines
+   that have never exchanged credentials still converge through a common
+   peer, and a machine that was offline for a week just re-pulls the tail.
 
-After that, delegation works exactly as described in this guide — but an
-agent's inbox survives any single machine sleeping.
+`GET /sync/peers` on any hub shows the estate: which peers were reachable
+last round, their version vectors, and any replicas known only through
+gossip. The same payload is the `mempalace_mesh_peers` MCP tool.
 
-::: warning Coordination converges on its own; memory does not yet
-Step 2 is continuous and bidirectional. Step 3 is a **one-way pull you
-re-run**: it folds what the peers have authored into this machine, and it is
-insert-only and resumable, so re-running it heals any gap. What it does not
-do is merge — a drawer edited on two machines will not reconcile itself.
-Bidirectional memory convergence is the memory op-log (RFC 004 step 2a),
-staged for a later release. Until then, put `mempalace replica pull` on a
-schedule if you want each machine to stay current.
-::: `GET /sync/peers` on any hub shows the estate: which peers were
-reachable last round, their version vectors, and any replicas known only
-through gossip.
+::: warning This syncs coordination, not memory
+Peer sync covers the **logstream** — events and artifacts. Each machine's
+drawers and knowledge graph stay local to that machine. Agents on two
+synced machines share an inbox and can hand patches back and forth, but
+they do not yet share recall: ask one of them what it remembers and you get
+that machine's palace.
 
-::: tip Already have a palace on that machine?
-Joining the mesh is **additive**. An existing palace — even one built
-long before replication existed — keeps every drawer it has: nothing is
-re-mined, nothing is lost, and the bootstrap pull folds *around* your
-existing content. Your machine's history becomes part of the shared brain
-in the other direction too: run `mempalace replica embed-cache` once and
-every peer can pull your palace's full past, vectors included, in minutes.
-Capture-now is forward-compatible by contract — memory filed years before
-the mesh is a first-class citizen of it.
+Replicating memory itself is [RFC 004](https://github.com/MemPalace/mempalace/blob/develop/docs/rfcs/004-replicated-palace.md),
+staged for a later release. If you want one shared memory across machines
+today, point every agent at a single hub ([Remote / Team
+Server](/guide/remote-server)) instead of running one per machine.
 :::
 
 ## See also
 
-- [The Replicated Palace](/concepts/replicated-palace) — one palace, every machine: ops, clocks, folds
 - [Agent Logstream](/concepts/agent-logstream) — the event/artifact model in depth
 - [Remote / Team Server](/guide/remote-server) — full hub deployment: tokens, TLS, backends, Docker/systemd
 - [MCP Integration](/guide/mcp-integration) — the memory tools every connected agent gets
-- [CLI Reference](/reference/cli#mempalace-logstream) — `mempalace logstream`, `mempalace artifact`, `mempalace replica`
+- [CLI Reference](/reference/cli#mempalace-logstream) — `mempalace logstream`, `mempalace artifact`

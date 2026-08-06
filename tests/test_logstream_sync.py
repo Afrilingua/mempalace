@@ -673,3 +673,66 @@ class TestNodeProfile:
         from mempalace import mcp_server as mcp
 
         assert "mempalace_mesh_peers" in mcp._SQLITE_INTEGRITY_ALLOWED_TOOLS
+
+
+class TestPeerSyncThreadStartup:
+    """The loop must not latch membership at startup.
+
+    Joining the mesh is "write peers.json", and the guide has users start
+    the hub before writing it. A thread that returns early when the file
+    is missing leaves that hub permanently non-syncing with no error —
+    the failure mode is silence, which is why it needs a test.
+    """
+
+    def _start(self, tmp_path, monkeypatch, interval="0.05"):
+        import threading
+
+        from mempalace import mcp_server as mcp
+
+        monkeypatch.setenv("MEMPALACE_SYNC_INTERVAL", interval)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
+
+        # Compare thread objects, not names: earlier tests in this class
+        # leave their own daemon loop running under the same name.
+        before = set(threading.enumerate())
+        mcp._start_peer_sync_thread()
+        return [
+            t for t in threading.enumerate() if t.name == "mempalace-logsync" and t not in before
+        ]
+
+    def test_thread_starts_without_peers_json(self, tmp_path, monkeypatch):
+        assert not (tmp_path / "peers.json").exists()
+        assert self._start(tmp_path, monkeypatch), (
+            "peer sync thread must start even with no peers.json — otherwise a "
+            "peers.json written after the hub boots is silently ignored forever"
+        )
+
+    def test_peers_written_after_startup_are_picked_up(self, tmp_path, monkeypatch):
+        import time as _time
+
+        from mempalace import mcp_server as mcp
+
+        calls = []
+
+        def _fake_sync_all(ls, palace_path, transport=None):
+            calls.append(palace_path)
+            return []
+
+        monkeypatch.setattr("mempalace.logsync.sync_all", _fake_sync_all)
+        monkeypatch.setattr(mcp, "_get_logstream", lambda: object())
+
+        assert self._start(tmp_path, monkeypatch)
+
+        # peers.json appears only now — after the thread is already running.
+        (tmp_path / "peers.json").write_text(
+            json.dumps({"peers": [{"name": "a", "url": "http://x", "token": "t"}]}),
+            encoding="utf-8",
+        )
+
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline and not calls:
+            _time.sleep(0.05)
+        assert calls, "sync round never ran; membership was latched at startup"
+
+    def test_disabled_by_zero_interval(self, tmp_path, monkeypatch):
+        assert not self._start(tmp_path, monkeypatch, interval="0")

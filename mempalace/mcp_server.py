@@ -6200,163 +6200,9 @@ def _http_handle_get(handler) -> None:
         if not _http_serve_sync(handler, path):
             handler.send_error(404, "Not Found")
         return
-    if path.startswith("/snapshot/"):
-        if handler._request_rejected(require_auth=True):
-            return
-        if not _http_serve_snapshot(handler, path):
-            handler.send_error(404, "Not Found")
-        return
     if handler._request_rejected(require_auth=False):
         return
     handler.send_error(404, "Not Found")
-
-
-def _http_serve_snapshot(handler, path: str) -> bool:
-    """RFC 004 step 1: content-snapshot endpoints for memory read replicas.
-
-    GET /snapshot/manifest                → {replica_id, drawers, kg, collection}
-    GET /snapshot/drawers?offset=&limit=  → {items: [{id, document, metadata}]}
-    GET /snapshot/ids?offset=&limit=      → {ids: [...]} (delete reconciliation)
-    GET /snapshot/kg?table=&after=&limit= → {rows: [...]} (rowid-paged)
-
-    Facts only — verbatim documents, metadata, and KG rows. Vector indexes
-    are never served: the replica derives its own (RFC 004 layer 3). Chroma
-    access happens under the global request lock like every other
-    Chroma-touching request; pages are small enough to keep holds short.
-    """
-    from urllib.parse import parse_qsl
-
-    query = dict(parse_qsl(urlparse(handler.path).query))
-    try:
-        limit = max(1, min(int(query.get("limit", "500") or 500), 1000))
-        offset = max(0, int(query.get("offset", "0") or 0))
-        after = max(0, int(query.get("after", "0") or 0))
-    except (TypeError, ValueError):
-        handler._send_json(400, {"error": "limit/offset/after must be integers"})
-        return True
-
-    if path == "/snapshot/manifest":
-        from .vector_cache import VECTOR_CACHE_FILENAME, VectorCache
-
-        with _HTTP_REQUEST_LOCK:
-            col = _get_collection()
-            drawer_count = col.count() if col else 0
-        kg_stats = _call_kg(lambda kg: kg.stats())
-        vector_models = {}
-        if _config.palace_path and os.path.exists(
-            os.path.join(os.path.expanduser(_config.palace_path), VECTOR_CACHE_FILENAME)
-        ):
-            cache = VectorCache(_config.palace_path)
-            try:
-                with cache._lock:
-                    rows = (
-                        cache._conn()
-                        .execute("SELECT embedder, count(*) AS n FROM vectors GROUP BY embedder")
-                        .fetchall()
-                    )
-                vector_models = {row["embedder"]: row["n"] for row in rows}
-            finally:
-                cache.close()
-        handler._send_json(
-            200,
-            {
-                "replica_id": _call_logstream(lambda ls: ls.replica_id),
-                "drawers": drawer_count,
-                "kg": {
-                    "entities": kg_stats.get("entities", 0),
-                    "triples": kg_stats.get("triples", 0),
-                },
-                "collection": _config.collection_name,
-                "vector_cache": vector_models,
-            },
-        )
-        return True
-    if path == "/snapshot/drawers":
-        from .replica_sync import REPLICA_ORIGIN_KEY
-
-        with _HTTP_REQUEST_LOCK:
-            col = _get_collection()
-            if col is None:
-                handler._send_json(503, {"error": "no palace collection available"})
-                return True
-            batch = col.get(limit=limit, offset=offset, include=["documents", "metadatas"])
-        ids = batch.get("ids") or []
-        docs = batch.get("documents") or []
-        metas = batch.get("metadatas") or []
-        # Authored-only: a snapshot serves the facts THIS replica authors.
-        # Drawers folded from another origin (replica_origin-stamped) are
-        # excluded, or bidirectional pull-pairs would echo each other's
-        # content back re-stamped, corrupting provenance and reconciliation.
-        items = [
-            {"id": i, "document": d, "metadata": m or {}}
-            for i, d, m in zip(ids, docs, metas)
-            if not (m or {}).get(REPLICA_ORIGIN_KEY)
-        ]
-        # Distributed derivation (RFC 004): ship cached vectors alongside
-        # content when the caller names an embedder identity, so the fold
-        # side can insert without re-deriving. Missing vectors are simply
-        # omitted; the fold falls back to local embedding per item.
-        vectors_model = query.get("vectors") or ""
-        if vectors_model and items:
-            from .vector_cache import VectorCache, vector_to_b64
-
-            cache = VectorCache(_config.palace_path)
-            try:
-                found = cache.get_many(vectors_model, [item["id"] for item in items])
-            finally:
-                cache.close()
-            for item in items:
-                vector = found.get(item["id"])
-                if vector is not None:
-                    item["vector_b64"] = vector_to_b64(vector)
-            items_with = sum(1 for item in items if "vector_b64" in item)
-        else:
-            items_with = 0
-        handler._send_json(
-            200,
-            {
-                "items": items,
-                "count": len(items),
-                "vectors_included": items_with,
-                "vectors_model": vectors_model or None,
-                "offset": offset,
-                # Raw advance: pages may return fewer items than scanned.
-                "next_offset": offset + len(ids) if ids else None,
-            },
-        )
-        return True
-    if path == "/snapshot/ids":
-        from .replica_sync import REPLICA_ORIGIN_KEY
-
-        with _HTTP_REQUEST_LOCK:
-            col = _get_collection()
-            if col is None:
-                handler._send_json(503, {"error": "no palace collection available"})
-                return True
-            batch = col.get(limit=limit, offset=offset, include=["metadatas"])
-        raw_ids = batch.get("ids") or []
-        metas = batch.get("metadatas") or []
-        ids = [i for i, m in zip(raw_ids, metas) if not (m or {}).get(REPLICA_ORIGIN_KEY)]
-        handler._send_json(
-            200,
-            {
-                "ids": ids,
-                "count": len(ids),
-                "offset": offset,
-                "next_offset": offset + len(raw_ids) if raw_ids else None,
-            },
-        )
-        return True
-    if path == "/snapshot/kg":
-        table = query.get("table") or ""
-        try:
-            rows = _call_kg(lambda kg: kg.dump_rows(table, after_rowid=after, limit=limit))
-        except ValueError as exc:
-            handler._send_json(400, {"error": str(exc)})
-            return True
-        handler._send_json(200, {"table": table, "rows": rows, "count": len(rows)})
-        return True
-    return False
 
 
 def _http_serve_sync(handler, path: str) -> bool:
@@ -6595,14 +6441,21 @@ def _peer_sync_interval_s() -> float:
 
 
 def _start_peer_sync_thread() -> None:
-    """Background anti-entropy loop when peers.json exists (RFC 004 step 0).
+    """Background anti-entropy loop for the logstream (RFC 004 step 0).
 
     Runs in the serving process so a hub with configured peers converges
     with zero extra processes. Interval via MEMPALACE_SYNC_INTERVAL
     (seconds, default 15; 0 disables). Errors are logged, never fatal —
     a dead peer must not take the loop down (R1).
+
+    Membership is re-read from peers.json every round, never latched at
+    startup: joining the mesh is "write peers.json", and requiring a hub
+    restart for a file the docs describe as picked up "within one sync
+    cycle" is a silent no-op for anyone following the guide in order (hub
+    first, peers after). A malformed peers.json logs once per transition
+    rather than every round, so a typo is visible without flooding the log.
     """
-    from .logsync import load_peers, sync_all
+    from .logsync import sync_all
 
     palace_path = getattr(_config, "palace_path", None)
     if not palace_path:
@@ -6610,14 +6463,9 @@ def _start_peer_sync_thread() -> None:
     interval = _peer_sync_interval_s()
     if interval <= 0:
         return
-    try:
-        if not load_peers(palace_path):
-            return
-    except ValueError as exc:
-        logger.error("peers.json is malformed; peer sync disabled: %s", exc)
-        return
 
     def _loop():
+        malformed_logged = False
         while True:
             time.sleep(interval)
             try:
@@ -6633,6 +6481,11 @@ def _start_peer_sync_thread() -> None:
                             stats["pulled_events"],
                             stats["pulled_artifacts"],
                         )
+                malformed_logged = False
+            except ValueError as exc:
+                if not malformed_logged:
+                    logger.error("peers.json is malformed; skipping peer sync: %s", exc)
+                    malformed_logged = True
             except Exception:
                 logger.warning("peer sync round failed", exc_info=True)
 

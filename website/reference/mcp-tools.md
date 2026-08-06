@@ -612,7 +612,7 @@ Convenience: store a patch artifact and append its `patch.ready` event in one ca
 
 ### `mempalace_mesh_peers`
 
-Mesh estate snapshot (see [The Replicated Palace](/concepts/replicated-palace)):
+Mesh estate snapshot — this hub's view of its logstream peers (see [Shared Brain](/guide/shared-brain#coordinating-across-machines)):
 this replica's identity, version vector and self-derived node profile; each
 configured peer's reachability, last sync outcome, remote version vector and
 advertised profile; origins known only transitively; and `origin_profiles`

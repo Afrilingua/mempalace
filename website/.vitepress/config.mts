@@ -78,7 +78,6 @@ export default withMermaid(
               { text: 'Knowledge Graph', link: '/concepts/knowledge-graph' },
               { text: 'Specialist Agents', link: '/concepts/agents' },
               { text: 'Agent Logstream', link: '/concepts/agent-logstream' },
-              { text: 'Replicated Palace', link: '/concepts/replicated-palace' },
               { text: 'Contradiction Detection', link: '/concepts/contradiction-detection' },
             ],
           },

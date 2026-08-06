@@ -31,10 +31,12 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
-import os
-import sys
-import shlex
 import argparse
+import contextlib
+import os
+import shlex
+import sys
+import warnings
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -679,14 +681,14 @@ class UnsupportedSourceAdapterProtocolError(ValueError):
 
 
 class _DryRunCollectionProxy:
-    """Read-through collection facade that records, but never persists, writes.
+    """Read-only collection facade that records, but never persists, writes.
 
     Source adapters are deliberately allowed to access ``drawer_collection``
     directly.  Passing the live collection during a dry run would therefore
     make ``--dry-run`` advisory rather than safe.
     """
 
-    def __init__(self, collection):
+    def __init__(self, collection=None):
         self._collection = collection
         self.operations = []
 
@@ -703,12 +705,18 @@ class _DryRunCollectionProxy:
         self.operations.append(("update", kwargs))
 
     def query(self, **kwargs):
+        if self._collection is None:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
         return self._collection.query(**kwargs)
 
     def get(self, **kwargs):
+        if self._collection is None:
+            return {"ids": [], "documents": [], "metadatas": []}
         return self._collection.get(**kwargs)
 
     def count(self):
+        if self._collection is None:
+            return 0
         return self._collection.count()
 
 
@@ -745,7 +753,7 @@ def mine_source_adapter(
     and ``--mode`` calls must retain their established dispatch paths.
     """
     from .knowledge_graph import KnowledgeGraph
-    from .palace import get_collection
+    from .palace import get_collection, mine_palace_lock
     from .sources import (
         DrawerRecord,
         PalaceContext,
@@ -770,41 +778,68 @@ def mine_source_adapter(
             "mempalace mine does not support yet"
         )
 
-    knowledge_graph = None
-    try:
-        drawer_collection = get_collection(palace_path)
-        if dry_run:
-            drawer_collection = _DryRunCollectionProxy(drawer_collection)
-            knowledge_graph = _DryRunKnowledgeGraphProxy()
-        else:
-            knowledge_graph = KnowledgeGraph(
-                db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
-            )
-        context = PalaceContext(
-            drawer_collection=drawer_collection,
-            knowledge_graph=knowledge_graph,
-            palace_path=palace_path,
-            config=MempalaceConfig(palace_path=palace_path),
-            adapter_name=adapter.name,
-            adapter_version=adapter.adapter_version,
-        )
-        drawers_written = 0
-        for result in adapter.ingest(
-            source=SourceRef(local_path=source_path),
-            palace=context,
-        ):
-            if isinstance(result, SourceItemMetadata):
-                raise UnsupportedSourceAdapterProtocolError(
-                    f"source adapter {adapter_name!r} yielded incremental item metadata, "
-                    "which mempalace mine does not support yet"
+    # A dry run must never create a collection: opening a fresh Chroma palace
+    # can create storage and persist embedder identity before write proxies are
+    # installed.  It may safely retain a read-only view of an existing
+    # collection so adapters can produce an accurate preview.  Non-dry runs
+    # hold one writer lease from handle creation through adapter iteration,
+    # including direct KG mutations by adapters.
+    lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
+    with lock:
+        knowledge_graph = None
+        try:
+            if dry_run:
+                try:
+                    drawer_collection = _DryRunCollectionProxy(
+                        get_collection(palace_path, create=False)
+                    )
+                except FileNotFoundError:
+                    # No palace or collection has been initialized yet.  Use
+                    # an empty recording facade rather than materializing one.
+                    drawer_collection = _DryRunCollectionProxy()
+                knowledge_graph = _DryRunKnowledgeGraphProxy()
+            else:
+                drawer_collection = get_collection(palace_path)
+                knowledge_graph = KnowledgeGraph(
+                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
                 )
-            if isinstance(result, DrawerRecord):
-                drawers_written += 1
-                context.upsert_drawer(result)
-        return drawers_written
-    finally:
-        if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
-            knowledge_graph.close()
+            context = PalaceContext(
+                drawer_collection=drawer_collection,
+                knowledge_graph=knowledge_graph,
+                palace_path=palace_path,
+                config=MempalaceConfig(palace_path=palace_path),
+                adapter_name=adapter.name,
+                adapter_version=adapter.adapter_version,
+            )
+            drawers_written = 0
+            for result in adapter.ingest(
+                source=SourceRef(local_path=source_path),
+                palace=context,
+            ):
+                if isinstance(result, SourceItemMetadata):
+                    # Non-incremental adapters may report a cursor or version
+                    # while still doing a complete re-extract.  Incremental
+                    # adapters are rejected before ingest above, so accepting
+                    # this avoids a late partial-ingest failure.
+                    warnings.warn(
+                        f"Source adapter {adapter_name!r} yielded non-incremental item "
+                        "metadata; ignoring it during complete ingest",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                if isinstance(result, DrawerRecord):
+                    drawers_written += 1
+                    context.upsert_drawer(result)
+                    continue
+                raise TypeError(
+                    f"source adapter {adapter_name!r} yielded unsupported result type "
+                    f"{type(result).__name__}"
+                )
+            return drawers_written
+        finally:
+            if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+                knowledge_graph.close()
 
 
 def cmd_sweep(args):

@@ -1140,13 +1140,14 @@ def cmd_repair(args):
         _close_chroma_handles,
         _extract_drawers,
         _post_rebuild_cleanup,
+        _preview_legacy_repair,
         _promote_temp_collection,
         _rebuild_collection_via_temp,
         check_extraction_safety,
         index_read_recovery_guidance,
-        maybe_autoheal_fts5_index,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
+        resolve_repair_preflight_errors,
         sqlite_integrity_errors,
     )
 
@@ -1250,9 +1251,13 @@ def cmd_repair(args):
     # stack trace instead of the friendly abort message. Run quick_check
     # here so we can surface the clear recovery instructions and exit
     # cleanly before chromadb's compactor touches the disk.
-    sqlite_errors = sqlite_integrity_errors(palace_path)
-    if sqlite_errors:
-        sqlite_errors = maybe_autoheal_fts5_index(palace_path, sqlite_errors)
+    dry_run = getattr(args, "dry_run", False)
+    # The FTS5 autoheal inside this call is a write, so a --dry-run predicts
+    # its outcome instead of performing it (#1596 is auto-healable and must
+    # not surface as an abort in a preview).
+    sqlite_errors = resolve_repair_preflight_errors(
+        palace_path, sqlite_integrity_errors(palace_path), dry_run=dry_run
+    )
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         sys.exit(1)
@@ -1260,7 +1265,7 @@ def cmd_repair(args):
     preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
         palace_path,
         backup=getattr(args, "backup", True),
-        dry_run=getattr(args, "dry_run", False),
+        dry_run=dry_run,
         assume_yes=getattr(args, "yes", False),
     )
     if preflight is not None:
@@ -1270,6 +1275,24 @@ def cmd_repair(args):
     print(" MemPalace Repair")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
+
+    if dry_run:
+        # Return before the backend is used at all: the chromadb client this
+        # path opens is itself a write to chroma.sqlite3 (measured — the file
+        # hash changes on get_collection alone, before count()), so a preview
+        # that reached it could not be inert. Staying off the chromadb layer
+        # also keeps a dry run clear of the layer repair is separately reported
+        # to segfault in on a large palace (#2113). Exit non-zero on an
+        # unreadable count for parity with the from-sqlite preview above, so
+        # `--dry-run && repair --yes` cannot walk into the destructive run
+        # after a failed preview (#2095, #2133).
+        if not _preview_legacy_repair(
+            palace_path=palace_path,
+            collection_name=collection_name,
+            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+        ):
+            sys.exit(1)
+        return
 
     backend = ChromaBackend()
 
@@ -2135,7 +2158,7 @@ def main():
     p_repair.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print detected poisoned rows and exit without mutation (--mode max-seq-id only)",
+        help="Print what the repair would do and exit without modifying the palace",
     )
 
     # repair-status — read-only HNSW capacity health check (#1222)

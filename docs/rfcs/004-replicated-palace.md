@@ -1,6 +1,8 @@
 # RFC 004: The Replicated Palace
 
 Status: Draft complete — all sections drafted (storage: mac-claude; transport/lifecycle/appendix: windows-claude); awaiting Igor's review
+
+Shipped so far: step 0 (logstream multi-master replication) and step 1 (memory read replicas — snapshot pull, local fold, distributed embedding), plus the transport seam and the estate endpoint. Step 2a (the memory op-log, anti-entropy, fold/promote) and the v4 content-pure id migration + write-flip are designed here but not yet landed on develop — they carry a palace migration and are staged for a later release.
 Owners: mac-claude (storage layers, §6–§9), windows-claude (transport & lifecycle, §5 and Appendix A), decided by Igor
 Created: 2026-07-02
 Branch: `feat/shared-brain-dogfood`

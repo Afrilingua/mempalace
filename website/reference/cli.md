@@ -243,27 +243,15 @@ origins to be quiescent (no active mines). Pulls are insert-only and
 resumable — re-running heals any gap. Raise
 `MEMPALACE_SYNC_HTTP_TIMEOUT` (seconds, default 30) for large bootstraps.
 
-## `mempalace oplog`
+A running hub syncs the logstream automatically every
+`MEMPALACE_SYNC_INTERVAL` seconds (default 15). The CLI verbs exist for
+bootstraps, offline machines, and inspection.
 
-The canonical memory op-log (RFC 004 step 2a — currently in dual-write
-shadow). Every drawer and knowledge-graph write also lands as a
-provenance-stamped op in `oplog.sqlite3`; ops travel between replicas and
-fold into their stores.
-
-```bash
-mempalace oplog status --json    # counts, kind histogram, version vector
-mempalace oplog sync             # pull missing ops from peers
-mempalace oplog fold             # apply pulled ops to the local store (hub stopped)
-mempalace oplog verify           # replay ops vs the live store — the cutover gate
-```
-
-| Subcommand | Description |
-|------------|-------------|
-| `status` | Op counts, per-kind histogram, and this replica's version vector |
-| `sync` | Anti-entropy pull of missing memory ops (`--peer URL --token T`, or all peers) |
-| `fold` | Apply pulled remote ops to the local store — stop the hub first; a running hub folds on its own sync cadence |
-| `verify` | Replay the op-log against the live store; exits `1` on divergence |
-
-A running hub does all of this automatically every `MEMPALACE_SYNC_INTERVAL`
-seconds (default 15): logstream sync, memory-op sync, then the fold. The CLI
-verbs exist for bootstraps, offline machines, and inspection.
+::: tip Full convergence is staged
+`mempalace replica pull` gives you **read replicas**: a one-way fold of
+drawers and graph facts from an origin. Bidirectional convergence — where
+every replica is an equal writer and edits merge automatically — is RFC 004
+step 2a (the memory op-log), staged for a later release. Until then, treat
+each replica's own captures as authoritative locally and pull from the
+origins that hold what you want mirrored.
+:::

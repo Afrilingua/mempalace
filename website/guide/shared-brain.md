@@ -372,16 +372,25 @@ Joining the mesh is three steps per machine:
    ```
 
    The hub's background loop picks up `peers.json` changes within one sync
-   cycle — coordination events, memory ops, and the fold all converge every
+   cycle — coordination events and artifacts converge every
    `MEMPALACE_SYNC_INTERVAL` seconds (default 15) with no further action.
-3. **Bootstrap the memory** once, with the local hub stopped:
+3. **Pull the memory**, with the local hub stopped:
    `mempalace replica pull --with-vectors` folds every peer's authored
    content — and their precomputed vectors — into the local palace. See the
    [CLI reference](/reference/cli#mempalace-replica).
 
 After that, delegation works exactly as described in this guide — but an
-agent's inbox, and the palace behind it, survive any single machine
-sleeping. `GET /sync/peers` on any hub shows the estate: which peers were
+agent's inbox survives any single machine sleeping.
+
+::: warning Coordination converges on its own; memory does not yet
+Step 2 is continuous and bidirectional. Step 3 is a **one-way pull you
+re-run**: it folds what the peers have authored into this machine, and it is
+insert-only and resumable, so re-running it heals any gap. What it does not
+do is merge — a drawer edited on two machines will not reconcile itself.
+Bidirectional memory convergence is the memory op-log (RFC 004 step 2a),
+staged for a later release. Until then, put `mempalace replica pull` on a
+schedule if you want each machine to stay current.
+::: `GET /sync/peers` on any hub shows the estate: which peers were
 reachable last round, their version vectors, and any replicas known only
 through gossip.
 
@@ -402,4 +411,4 @@ the mesh is a first-class citizen of it.
 - [Agent Logstream](/concepts/agent-logstream) — the event/artifact model in depth
 - [Remote / Team Server](/guide/remote-server) — full hub deployment: tokens, TLS, backends, Docker/systemd
 - [MCP Integration](/guide/mcp-integration) — the memory tools every connected agent gets
-- [CLI Reference](/reference/cli#mempalace-logstream) — `mempalace logstream`, `mempalace artifact`, `mempalace replica`, `mempalace oplog`
+- [CLI Reference](/reference/cli#mempalace-logstream) — `mempalace logstream`, `mempalace artifact`, `mempalace replica`

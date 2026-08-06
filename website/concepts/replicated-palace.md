@@ -28,7 +28,7 @@ an edge case.
   │ agents → 127.0.0.1  │   ops   │ agents → 127.0.0.1  │ ops  │ agents → local   │
   │ ┌─────────────────┐ │ ◀─────▶ │ ┌─────────────────┐ │◀────▶│ ┌──────────────┐ │
   │ │ mempalace hub   │ │         │ │ mempalace hub   │ │      │ │ mempalace hub│ │
-  │ │  op-log         │ │         │ │  op-log         │ │      │ │  op-log      │ │
+  │ │  event log      │ │         │ │  event log      │ │      │ │  event log   │ │
   │ │  derived index  │ │         │ │  derived index  │ │      │ │ derived index│ │
   │ └─────────────────┘ │         │ └─────────────────┘ │      │ └──────────────┘ │
   └─────────────────────┘         └─────────────────────┘      └──────────────────┘
@@ -39,9 +39,11 @@ an edge case.
    per-hub bearer tokens. The transport lives behind a seam
    (`MEMPALACE_TRANSPORT`), so a decentralized mesh-identity transport can
    replace tokens without touching anything above it.
-2. **Sync** — append-only logs of *ops*, merged by union. Every mutation
-   (a filed drawer, a knowledge-graph fact, a coordination event) becomes an
-   immutable, provenance-stamped op that travels between replicas.
+2. **Sync** — append-only logs of *ops*, merged by union. Each op is
+   immutable and provenance-stamped, and travels between replicas. Today
+   coordination events and artifacts move this way; memory content moves by
+   one-way replica pull until the memory op-log lands (see
+   [What syncs today](#what-syncs-today)).
 3. **Derived state** — vector indexes and caches are rebuilt or folded
    locally, never copied. **Sync the facts, derive the senses**: ops are
    kilobytes; vector indexes are gigabytes. Every machine remembers
@@ -71,19 +73,26 @@ converge through a common peer. Gossip, in the practical sense.
 | Layer | Mechanism | Status |
 |---|---|---|
 | Coordination events + artifacts (the [agent logstream](/concepts/agent-logstream)) | op sync, multi-master | shipping |
-| Memory content (drawers) | snapshot bootstrap + memory ops | shipping (ops in shadow) |
-| Knowledge graph | snapshot bootstrap + memory ops | shipping (ops in shadow) |
+| Memory content (drawers) | snapshot pull + local fold (**one-way**) | shipping |
+| Knowledge graph | snapshot pull + local fold (**one-way**) | shipping |
 | Vectors | never synced — derived locally, or folded from a peer's [vector cache](#distributed-embedding) | shipping |
+| Memory content (drawers), bidirectional | memory op-log + anti-entropy | next |
 | Organization (wings/rooms/tunnels as ops) | op vocabulary reserved | next |
 
-"Shadow" is deliberate engineering honesty: the memory op-log currently runs
-in a **dual-write shadow** — every drawer and knowledge-graph write also
-emits an op, ops travel and fold into peer replicas, but each machine's
-vector store remains its system of record until the shadow proves itself.
-`mempalace oplog verify` replays the op-log against the live store and must
-stay clean over a real usage period before ops become authoritative. A fold
-never mutates a locally-authored drawer from a remote op during the shadow;
-conflicts are counted and preserved for review, not applied silently.
+Read the split carefully, because it is the difference between what works
+today and what the rest of this page describes. **Coordination is already
+multi-master**: any agent on any machine appends events, and the logstream
+converges in both directions. **Memory is not yet.** Drawers and graph facts
+move via `mempalace replica pull` — a one-way, insert-only fold from an
+origin you name. Two machines that each capture their own conversations do
+not merge; each pulls what it wants from the other.
+
+The **memory op-log** — provenance-stamped ops for every drawer and graph
+write, anti-entropy sync, and a fold that resolves cross-replica edits by
+last-writer-wins — is the mechanism that closes that gap. It is designed
+(RFC 004 step 2a) and staged for a later release, along with the
+content-pure id recipe it depends on. Until it lands, treat each replica's
+own captures as authoritative locally.
 
 ## Bootstrapping a new machine
 
@@ -112,8 +121,9 @@ drawers carry a `replica_origin` stamp naming where they came from — ask
 "who is X?" on any machine and the answer arrives with its provenance.
 
 Once the hub starts, the background sync loop (every
-`MEMPALACE_SYNC_INTERVAL` seconds, default 15) keeps everything converging:
-logstream events, memory ops, and the fold — no cron jobs, no manual steps.
+`MEMPALACE_SYNC_INTERVAL` seconds, default 15) keeps the logstream
+converging on its own — no cron jobs, no manual steps. Memory pulls are
+still an explicit `mempalace replica pull` until the memory op-log lands.
 
 ## Distributed embedding
 
@@ -179,4 +189,4 @@ Two things replication is **not**:
   agents included
 - [Agent Logstream](/concepts/agent-logstream) — the coordination layer that
   pioneered the op-sync machinery
-- [CLI reference](/reference/cli) — `mempalace replica` and `mempalace oplog`
+- [CLI reference](/reference/cli) — `mempalace replica`

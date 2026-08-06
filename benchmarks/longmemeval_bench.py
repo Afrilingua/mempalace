@@ -3015,7 +3015,7 @@ def run_benchmark(
 
         if unique_sessions and api_key and not skip_precompute:
             print(
-                f"  Diary ingest: pre-computing {len(unique_sessions)} sessions with {llm_model.split('-')[1]}..."
+                f"  Diary ingest: pre-computing {len(unique_sessions)} sessions with {llm_model}..."
             )
             done = 0
             cache_path = Path(diary_cache_file) if diary_cache_file else None

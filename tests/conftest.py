@@ -130,9 +130,13 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
     from chromadb.api.types import DefaultEmbeddingFunction
 
     monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
-    monkeypatch.setattr(DefaultEmbeddingFunction, "embed_query", lambda self, input: ef(input=input))
+    monkeypatch.setattr(
+        DefaultEmbeddingFunction, "embed_query", lambda self, input: ef(input=input)
+    )
     monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
-    monkeypatch.setattr(chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef))
+    monkeypatch.setattr(
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
+    )
     monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
     yield
 

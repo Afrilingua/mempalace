@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Performance
 
+- **EmbeddingGemma groups documents by size before sub-batching.** The tokenizer pads every row of a sub-batch to the longest sequence in it, so arrival order decided the bill: one long verbatim message dragged a whole sub-batch up to its own length. Measured over 43,157 `sweep` drawers from 160 Claude Code transcripts, padded token slots drop 39.7% and the quadratic attention term 45.0%. Vectors move by at most one float32 ULP (1.2e-07 absolute, cosine 0.99999992), which is reduction-order rounding and not a change of meaning. Applies to `embedding_model: embeddinggemma` only; the default MiniLM embedder pads to a fixed width and was never affected. (#2104)
 - **HNSW capacity probes are cached** and invalidated by palace file signature, so repeated MCP status/taxonomy paths no longer re-scan native segment files on every call. (#2051, #1471)
 - **`chunk_text` line numbering is O(N)** via incremental tallies, fixing multi-second hangs on large sources. (#2054, #2055)
 

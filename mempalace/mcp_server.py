@@ -44,6 +44,7 @@ except (OSError, AttributeError):
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import contextlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
@@ -404,6 +405,31 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_diary_write",
     }
 )
+
+# The subset of _MUTATING_TOOLS whose write path reaches the chroma vector
+# segment. Deliberately narrower: the knowledge-graph and tunnel/hallway tools
+# keep their own sqlite/JSON state and never touch HNSW, so an unusable vector
+# index has no say over them.
+#
+# The distinction earns its keep because a write into a diverged HNSW segment
+# does not fail — it blocks inside chromadb's Rust upsert with no timeout of its
+# own, for the life of the process, while this server holds the palace mine lock
+# and the writer lease. One stuck call becomes a palace-wide outage that a still
+# healthy handshake hides.
+_VECTOR_WRITE_TOOLS = frozenset(
+    {
+        "mempalace_add_drawer",
+        "mempalace_update_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_diary_write",
+        "mempalace_checkpoint",
+        "mempalace_mine",
+        "mempalace_sync",
+    }
+)
+
+_DIVERGED_INDEX_ERROR_CODE = -32004
 
 # Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
 #
@@ -4880,6 +4906,57 @@ def _mcp_read_only_refusal(req_id, tool_name: str):
     }
 
 
+def _mcp_diverged_index_refusal(req_id, tool_name: str):
+    """Refuse vector writes while the HNSW segment is known to be diverged.
+
+    The capacity probe (#1222) already routes *reads* around a diverged index:
+    ``search`` and ``check_duplicate`` fall back to BM25-only sqlite. Writes had
+    no such gate — they went straight to chromadb, where an upsert into that same
+    index can never come back. Observed on a 3.7.0 palace whose flushed segment
+    held 803 of 820 embeddings: three of five freshly generated vectors blocked
+    forever (25+ minutes, then killed), the other two committed in 0.03 s, and
+    the same vector reproduced the same verdict on every retry — so a write's
+    fate depended on where its embedding landed in the damaged graph. After
+    ``mempalace repair rebuild-index`` all five committed.
+
+    Refusing is also the honest answer for the write that does not hang: chromadb
+    acknowledges it into sqlite and the metadata segment, then leaves it out of
+    the HNSW segment. That drawer is filed and reported as success while being
+    invisible to vector search — 16 such drawers came out of a single checkpoint
+    that returned "completed successfully in 2s".
+
+    The probe behind this is pure sqlite + pickle, so the gate costs no chromadb
+    interaction on the path it is protecting.
+    """
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        return None
+
+    _refresh_vector_disabled_flag()
+
+    if not _vector_disabled:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _DIVERGED_INDEX_ERROR_CODE,
+            "message": ("Palace vector index is diverged; refusing the write until it is rebuilt"),
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path or "",
+                "vector_disabled_reason": _vector_disabled_reason,
+                "hint": (
+                    "Stop the MemPalace MCP servers, run `mempalace repair rebuild-index`, "
+                    "then mempalace_reconnect. Recall keeps working meanwhile through the "
+                    "BM25 fallback; writes stay refused so they can neither hang inside "
+                    "chromadb nor land outside the index."
+                ),
+            },
+        },
+    }
+
+
 def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     """Run MCP request preflight gates outside handle_request complexity."""
 
@@ -4890,6 +4967,10 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
+
+    diverged_index_error = _mcp_diverged_index_refusal(req_id, tool_name)
+    if diverged_index_error is not None:
+        return diverged_index_error
 
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
@@ -5041,7 +5122,10 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+            with _write_stall_watch(tool_name):
+                result = _decorate_mcp_tool_result(
+                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                )
 
             return {
                 "jsonrpc": "2.0",
@@ -5265,6 +5349,130 @@ def _maybe_eager_warmup_embedder() -> None:
             palace_path,
             device,
         )
+
+
+_WRITE_STALL_WARN_ENV = "MEMPALACE_MCP_WRITE_STALL_WARN_SECS"
+_WRITE_STALL_WARN_DEFAULT = 60.0
+_WRITE_STALL_EXIT_ENV = "MEMPALACE_MCP_WRITE_STALL_EXIT_SECS"
+_WRITE_STALL_EXIT_DEFAULT = 0.0
+# EX_TEMPFAIL: the palace is fine, this process is not. A client that restarts
+# the server gets a working one; a zero exit would read as an orderly shutdown.
+_WRITE_STALL_EXIT_CODE = 75
+
+_write_stall_lock = threading.Lock()
+# Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
+_write_stall_inflight: Optional[dict] = None
+
+
+def _write_stall_secs(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "")
+    if not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %.0fs", env_name, raw, default)
+        return default
+
+
+def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warned: bool):
+    """Decide what an in-flight vector write has earned: ``None``/warn/exit.
+
+    Pure so the thresholds can be tested without a stalled write; ``exit`` is
+    checked first so a single tick can escalate straight past an unsent warning.
+    """
+    if exit_secs > 0 and elapsed >= exit_secs:
+        return "exit"
+    if warn_secs > 0 and elapsed >= warn_secs and not warned:
+        return "warn"
+    return None
+
+
+@contextlib.contextmanager
+def _write_stall_watch(tool_name: str):
+    """Register a vector write as in flight for the stall watchdog."""
+    global _write_stall_inflight
+
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+
+    with _write_stall_lock:
+        _write_stall_inflight = {
+            "tool": tool_name,
+            "since": time.monotonic(),
+            "warned": False,
+        }
+    try:
+        yield
+    finally:
+        with _write_stall_lock:
+            _write_stall_inflight = None
+
+
+def _start_write_stall_watchdog() -> None:
+    """Start a daemon thread that reports a vector write that stopped returning.
+
+    A chromadb write has no timeout of its own. When one blocks, this process
+    holds the dispatch lock, the palace mine lock and the writer lease, so it
+    answers nothing else and every peer session drops to read-only — and no log
+    on the server side says why. The only trace of a 25-minute outage was the
+    client's own "tool still running" ticks; the handshake stayed healthy, and
+    ``mempalace_status`` could not answer because the dispatch lock was held by
+    the stuck call. So the report has to come from a thread that is not waiting
+    on that lock, and it has to reach stderr, where the MCP host records it.
+
+    ``MEMPALACE_MCP_WRITE_STALL_WARN_SECS`` (default 60, 0 disables) sets when to
+    warn. ``MEMPALACE_MCP_WRITE_STALL_EXIT_SECS`` (default 0 = never) lets an
+    operator turn the wedge into a restartable failure: a server stuck inside
+    chromadb will not recover, and exiting is what releases the locks its peers
+    are queued behind.
+    """
+    warn_secs = _write_stall_secs(_WRITE_STALL_WARN_ENV, _WRITE_STALL_WARN_DEFAULT)
+    exit_secs = _write_stall_secs(_WRITE_STALL_EXIT_ENV, _WRITE_STALL_EXIT_DEFAULT)
+    if warn_secs <= 0 and exit_secs <= 0:
+        return
+
+    thresholds = [t for t in (warn_secs, exit_secs) if t > 0]
+    interval = max(1.0, min(15.0, min(thresholds) / 4))
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(interval)
+            with _write_stall_lock:
+                inflight = _write_stall_inflight
+                if inflight is None:
+                    continue
+                elapsed = time.monotonic() - inflight["since"]
+                action = _write_stall_action(elapsed, warn_secs, exit_secs, inflight["warned"])
+                tool = inflight["tool"]
+                if action == "warn":
+                    inflight["warned"] = True
+            if action == "warn":
+                logger.warning(
+                    "%s has been inside the palace write path for %.0fs and has not "
+                    "returned. chromadb writes have no timeout: this server now answers "
+                    "nothing else and holds the writer lease, so peer sessions are "
+                    "read-only. Check `mempalace repair --dry-run` for HNSW divergence; "
+                    "restarting this MCP server releases the locks.",
+                    tool,
+                    elapsed,
+                )
+            elif action == "exit":
+                logger.error(
+                    "%s stalled in the palace write path for %.0fs (limit %s=%.0fs); "
+                    "exiting so the palace locks are released and the client can "
+                    "reconnect. The stalled write is lost — rebuild the index before "
+                    "retrying it.",
+                    tool,
+                    elapsed,
+                    _WRITE_STALL_EXIT_ENV,
+                    exit_secs,
+                )
+                os._exit(_WRITE_STALL_EXIT_CODE)
+
+    t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
 
 
 def _start_idle_exit_watchdog() -> None:
@@ -5686,6 +5894,10 @@ def _run_stdio_loop() -> None:
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
 
+    # Say so when a chromadb write stops coming back, from a thread the stuck
+    # call is not blocking.
+    _start_write_stall_watchdog()
+
     while True:
         try:
             line = sys.stdin.readline()
@@ -5759,6 +5971,7 @@ def _run_http_loop() -> None:
         # soon as the process is alive.
         _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
+        _start_write_stall_watchdog()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
         if raw_warmup in _WARMUP_TRUTHY:

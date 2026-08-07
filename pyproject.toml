@@ -164,7 +164,11 @@ packages = ["mempalace"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
-extend-exclude = ["benchmarks"]
+# "*.md": ruff 0.16 began formatting Python inside markdown fences, which
+# pulls ~96 docs into scope and reflows hand-aligned example code (the
+# column-aligned field comments in docs/rfcs/002 are deliberate). Docs are
+# authored prose, not linted source — keep the formatter on real modules.
+extend-exclude = ["benchmarks", "*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "C901"]

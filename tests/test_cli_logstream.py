@@ -253,3 +253,102 @@ class TestMainDispatch:
         artifact = json.loads(capsys.readouterr().out)
         assert artifact["kind"] == "note"
         assert artifact["size_bytes"] == 5
+
+
+class TestVerbatimNewlines:
+    """CRLF content must survive the CLI byte-for-byte.
+
+    Every read/write path here used Python text mode, whose universal-newline
+    translation rewrites \\r\\n to \\n on read and (on Windows) \\n back to
+    \\r\\n on write. For a store whose whole contract is verbatim bytes
+    addressed by sha256, that is silent corruption: a patch produced by a
+    Windows agent arrives on another machine as different bytes with a
+    different digest.
+
+    It also disarmed the CRLF warning in put_artifact — the \\r it looks for
+    was already stripped before the content got there, so the one check meant
+    to catch unappliable diffs could never fire on the platform that produces
+    them.
+    """
+
+    CRLF_PATCH = "diff --git a/x b/x\r\n--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n"
+
+    def _stdin(self, monkeypatch, text):
+        """Stand in for a real console stdin: a text layer with universal
+        newlines (what Windows gives you) over a .buffer holding the true
+        bytes. Reading the text layer translates; reading .buffer does not.
+        """
+        import io
+
+        raw = io.BytesIO(text.encode("utf-8"))
+        stream = io.TextIOWrapper(raw, encoding="utf-8", newline=None)
+        monkeypatch.setattr(sys, "stdin", stream)
+
+    def test_put_from_file_preserves_crlf(self, palace_path, tmp_dir, capsys):
+        src = f"{tmp_dir}/in.patch"
+        with open(src, "wb") as fh:
+            fh.write(self.CRLF_PATCH.encode("utf-8"))
+
+        cmd_artifact(_put_args(palace_path, None, file=src))
+        artifact = json.loads(capsys.readouterr().out)
+
+        assert artifact["size_bytes"] == len(self.CRLF_PATCH.encode("utf-8"))
+        assert artifact["sha256"] == _sha256(self.CRLF_PATCH)
+
+    def test_put_from_stdin_preserves_crlf(self, palace_path, monkeypatch, capsys):
+        self._stdin(monkeypatch, self.CRLF_PATCH)
+        cmd_artifact(_put_args(palace_path, None))
+        artifact = json.loads(capsys.readouterr().out)
+        assert artifact["sha256"] == _sha256(self.CRLF_PATCH)
+
+    def test_put_from_stdin_dash_preserves_crlf(self, palace_path, monkeypatch, capsys):
+        self._stdin(monkeypatch, self.CRLF_PATCH)
+        cmd_artifact(_put_args(palace_path, None, file="-"))
+        artifact = json.loads(capsys.readouterr().out)
+        assert artifact["sha256"] == _sha256(self.CRLF_PATCH)
+
+    def test_crlf_warning_actually_fires(self, palace_path, tmp_dir, capsys):
+        """The CRLF warning is the reason this bug mattered — prove it fires."""
+        src = f"{tmp_dir}/in.patch"
+        with open(src, "wb") as fh:
+            fh.write(self.CRLF_PATCH.encode("utf-8"))
+
+        cmd_artifact(_put_args(palace_path, None, file=src, json=False))
+        captured = capsys.readouterr()
+        assert "carriage returns" in captured.err
+
+    def test_get_out_is_byte_identical(self, palace_path, tmp_dir, capsys):
+        src = f"{tmp_dir}/in.patch"
+        with open(src, "wb") as fh:
+            fh.write(self.CRLF_PATCH.encode("utf-8"))
+        cmd_artifact(_put_args(palace_path, None, file=src))
+        artifact = json.loads(capsys.readouterr().out)
+
+        out_path = f"{tmp_dir}/out.patch"
+        cmd_artifact(
+            SimpleNamespace(
+                palace=palace_path,
+                artifact_action="get",
+                artifact_id=artifact["id"],
+                out=out_path,
+                json=True,
+            )
+        )
+        with open(out_path, "rb") as fh:
+            written = fh.read()
+        assert written == self.CRLF_PATCH.encode("utf-8")
+
+    def test_append_body_file_preserves_crlf(self, palace_path, tmp_dir, capsys):
+        src = f"{tmp_dir}/body.txt"
+        with open(src, "wb") as fh:
+            fh.write("line one\r\nline two\r\n".encode("utf-8"))
+
+        cmd_logstream(_append_args(palace_path, body=None, body_file=src))
+        event = json.loads(capsys.readouterr().out)
+        assert event["body"] == "line one\r\nline two\r\n"
+
+
+def _sha256(text):
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

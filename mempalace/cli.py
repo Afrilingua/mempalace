@@ -1225,14 +1225,52 @@ def _logstream_fail(message: str, as_json: bool):
     sys.exit(1)
 
 
+def _read_stdin_exact() -> str:
+    """Read stdin as bytes and decode — never through the text layer.
+
+    ``sys.stdin.read()`` applies universal-newline translation, turning
+    CRLF into LF before we ever see it. For a store addressed by sha256
+    over the exact bytes, that is silent corruption: a patch piped in from
+    a Windows agent would be stored as different content with a different
+    digest than the one that produced it. ``.buffer`` is absent when stdin
+    has been replaced by a plain StringIO, so fall back to the text read
+    rather than crashing.
+    """
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:
+        return sys.stdin.read()
+    return buffer.read().decode("utf-8")
+
+
+def _write_stdout_exact(content: str) -> None:
+    """Write content to stdout as bytes, bypassing newline translation.
+
+    The counterpart to :func:`_read_stdin_exact` — ``mempalace artifact get
+    ID | git apply`` must deliver the stored bytes, not a re-translated
+    copy of them.
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(content)
+        return
+    sys.stdout.flush()
+    buffer.write(content.encode("utf-8"))
+    buffer.flush()
+
+
 def _read_text_arg(inline, file_arg, default=""):
-    """Resolve inline text vs --*-file (with '-' meaning stdin)."""
+    """Resolve inline text vs --*-file (with '-' meaning stdin).
+
+    File and stdin reads are byte-exact (see :func:`_read_stdin_exact`):
+    the logstream's contract is verbatim content, so line endings must
+    reach the store exactly as the author wrote them.
+    """
     if inline is not None and file_arg is not None:
         raise ValueError("pass inline text or a file, not both")
     if file_arg is not None:
         if file_arg == "-":
-            return sys.stdin.read()
-        return Path(os.path.expanduser(file_arg)).read_text(encoding="utf-8")
+            return _read_stdin_exact()
+        return Path(os.path.expanduser(file_arg)).read_bytes().decode("utf-8")
     if inline is not None:
         return inline
     return default
@@ -1401,7 +1439,7 @@ def cmd_artifact(args):
             try:
                 content = _read_text_arg(args.content, args.file, default=None)
                 if content is None:
-                    content = sys.stdin.read()
+                    content = _read_stdin_exact()
                 artifact = ls.put_artifact(
                     kind=args.kind,
                     content=content,
@@ -1428,7 +1466,10 @@ def cmd_artifact(args):
             if artifact is None:
                 _logstream_fail(f"artifact {args.artifact_id!r} not found", as_json)
             if args.out:
-                Path(os.path.expanduser(args.out)).write_text(artifact["content"], encoding="utf-8")
+                # write_bytes, not write_text: on Windows the text layer
+                # expands LF back to CRLF, so the file on disk would not
+                # match the sha256 the user is told to verify.
+                Path(os.path.expanduser(args.out)).write_bytes(artifact["content"].encode("utf-8"))
             if as_json:
                 if args.out:
                     artifact = {**artifact, "content_written_to": args.out}
@@ -1439,8 +1480,10 @@ def cmd_artifact(args):
                 print(f"  sha256={artifact['sha256']}")
             else:
                 # Exact content on stdout so `mempalace artifact get ID | git apply`
-                # works; metadata would corrupt the stream.
-                sys.stdout.write(artifact["content"])
+                # works; metadata would corrupt the stream. Written through
+                # .buffer because the text layer would re-translate newlines
+                # on Windows — the pipe must carry the stored bytes.
+                _write_stdout_exact(artifact["content"])
     finally:
         ls.close()
 

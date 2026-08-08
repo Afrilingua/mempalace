@@ -3051,9 +3051,8 @@ def run_benchmark(
     print(f"  Data:        {Path(data_file).name}")
     print(f"  Questions:   {len(data)}")
     print(f"  Granularity: {granularity}")
-    model_short = llm_model.split("-")[1] if "-" in llm_model else llm_model
-    rerank_label = f" + LLM re-rank ({model_short})" if llm_rerank_enabled else ""
-    diary_label = f" [diary ingest: {model_short}]" if mode == "diary" else ""
+    rerank_label = f" + LLM re-rank ({llm_model})" if llm_rerank_enabled else ""
+    diary_label = f" [diary ingest: {llm_model}]" if mode == "diary" else ""
     print(f"  Mode:        {mode}{diary_label}{rerank_label}")
     print(f"{'─' * 60}\n")
 

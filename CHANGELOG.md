@@ -43,6 +43,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Operator write-routing / single-writer recovery notes in `docs/write-routing-policy.md`. (#2079)
 - Remote-server guide wording for read-only tools that change host state. (#2126)
 
+### Internal
+
+- **The Docker workflow runs the image before publishing it.** It previously built both images without ever starting a container or parsing a Compose file, so a green run only proved the Dockerfile compiled — which is how two defects that break the first documented command shipped past it. `scripts/docker-smoke.sh` now validates both Compose files, checks entrypoint dispatch, mines a mounted directory, asserts the drawer reads back verbatim from a separate container, and drives a real MCP stdio handshake; publication is gated on it. The script runs the same way locally: `scripts/docker-smoke.sh <image>`. (#2189)
+
 ---
 
 ## [3.6.0] — 2026-07-14

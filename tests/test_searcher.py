@@ -15,6 +15,7 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
     SearchError,
+    _result_drawer_id,
     build_where_filter,
     get_collection,
     search,
@@ -1017,3 +1018,32 @@ def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch, tmp_
     searcher.search(query="cat", palace_path=str(tmp_path))
 
     assert captured["stop_words"] == frozenset({"the"})
+
+
+# ── _result_drawer_id logical-id resolution (#2185) ────────────────────
+
+
+class TestResultDrawerId:
+    """The drawer_id on a search hit must round-trip through
+    ``mempalace_get_drawer``. Chunk rows carry their logical-group id under
+    ``parent_drawer_id`` (``tool_add_drawer``) or ``parent_entry_id``
+    (``tool_diary_write``); both must resolve to the logical id (#2185).
+    """
+
+    def test_plain_drawer_returns_stored_id(self):
+        assert _result_drawer_id({"wing": "w"}, "drawer_abc") == "drawer_abc"
+
+    def test_parent_drawer_id_wins_over_stored_chunk_id(self):
+        meta = {"parent_drawer_id": "drawer_abc", "chunk_index": 2}
+        assert _result_drawer_id(meta, "drawer_abc_chunk_000002") == "drawer_abc"
+
+    def test_parent_entry_id_resolves_for_diary_chunks(self):
+        """Regression for #2185: before the fix a chunked diary hit reported
+        the physical chunk id, so fetching it returned one chunk of the entry
+        instead of the whole entry."""
+        meta = {"parent_entry_id": "diary_wing_lily_20260808_1", "chunk_index": 3}
+        stored = "diary_wing_lily_20260808_1_chunk_000003"
+        assert _result_drawer_id(meta, stored) == "diary_wing_lily_20260808_1"
+
+    def test_missing_metadata_falls_back_to_stored_id(self):
+        assert _result_drawer_id(None, "drawer_abc") == "drawer_abc"

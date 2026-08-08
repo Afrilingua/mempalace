@@ -3076,6 +3076,132 @@ def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, pa
     assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
+def test_diary_write_chunked_logical_id_fetches_deletes_and_lists_as_one(
+    monkeypatch, config, palace_path, kg
+):
+    """Regression for #2185: the ``entry_id`` returned by a chunked
+    ``tool_diary_write`` must behave like any other logical drawer id.
+
+    Before the fix the diary chunking path stamped only ``parent_entry_id``
+    while logical-id resolution queried only ``parent_drawer_id``, so
+    get/update/delete answered "Drawer not found" for the one id the diary
+    tools ever hand to MCP clients, and ``list_drawers`` showed the entry as
+    N unrelated chunk rows. Mirrors the ``tool_add_drawer`` contract locked
+    in by #1782.
+    """
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_delete_drawer,
+        tool_diary_write,
+        tool_get_drawer,
+        tool_list_drawers,
+    )
+
+    oversized = "Z" * 5000
+    written = tool_diary_write(agent_name="TestAgent", entry=oversized, topic="general")
+    assert written["success"] is True
+    assert written["chunks"] > 1
+
+    entry_id = written["entry_id"]
+
+    fetched = tool_get_drawer(entry_id)
+    assert "error" not in fetched
+    assert fetched["drawer_id"] == entry_id
+    assert fetched["content"] == oversized, "must return the entry verbatim, not one chunk"
+    assert fetched["chunks"] == written["chunks"]
+    assert fetched["chunk_ids"] == written["chunk_ids"]
+
+    listed = tool_list_drawers(wing="wing_testagent", room="diary")
+    assert listed["total"] == 1, "a chunked entry is ONE logical drawer, not N chunk rows"
+    assert listed["drawers"][0]["drawer_id"] == entry_id
+    assert listed["drawers"][0]["chunks"] == written["chunks"]
+
+    deleted = tool_delete_drawer(entry_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == written["chunks"]
+
+    missing = tool_get_drawer(entry_id)
+    assert "error" in missing
+
+
+def test_diary_write_chunked_logical_id_updates_group(monkeypatch, config, palace_path, kg):
+    """Regression for #2185: updating a chunked diary entry by its
+    ``entry_id`` must rewrite the whole underlying chunk group."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_diary_write,
+        tool_get_drawer,
+        tool_update_drawer,
+    )
+
+    written = tool_diary_write(agent_name="TestAgent", entry="A" * 4000, topic="general")
+    assert written["chunks"] > 1
+    entry_id = written["entry_id"]
+
+    updated = tool_update_drawer(entry_id, content="B" * 2600)
+    assert updated["success"] is True
+    assert updated["drawer_id"] == entry_id
+
+    fetched = tool_get_drawer(entry_id)
+    assert fetched["content"] == "B" * 2600
+    _client2, col = _get_collection(palace_path)
+    del _client2
+    assert "".join(col.get()["documents"]) == "B" * 2600, "stale chunks must not survive"
+
+
+def test_legacy_diary_chunks_resolve_without_parent_drawer_id(monkeypatch, config, palace_path, kg):
+    """Regression for #2185: palaces written BEFORE this fix carry diary
+    chunks tagged only with ``parent_entry_id``. The read paths must resolve
+    that shape too, so existing palaces are repaired with no data migration.
+    """
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+    )
+
+    entry_id = "diary_wing_lily_20260808_142113121027_3e4c74763d73"
+    # Exactly what mempalace 3.6.0 wrote: parent_entry_id only.
+    col.upsert(
+        ids=[f"{entry_id}_chunk_{i:06d}" for i in range(3)],
+        documents=["legacy-0 ", "legacy-1 ", "legacy-2"],
+        metadatas=[
+            {
+                "wing": "wing_lily",
+                "room": "diary",
+                "type": "diary_entry",
+                "chunk_index": i,
+                "parent_entry_id": entry_id,
+                "filed_at": "2026-08-08T14:21:13",
+            }
+            for i in range(3)
+        ],
+    )
+
+    fetched = tool_get_drawer(entry_id)
+    assert "error" not in fetched, f"legacy diary chunks must resolve; got {fetched}"
+    assert fetched["content"] == "legacy-0 legacy-1 legacy-2"
+    assert fetched["chunks"] == 3
+
+    listed = tool_list_drawers(wing="wing_lily", room="diary")
+    assert listed["total"] == 1
+    assert listed["drawers"][0]["drawer_id"] == entry_id
+
+    deleted = tool_delete_drawer(entry_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == 3
+
+
 # ── Delete by source (#1722) ────────────────────────────────────────────
 
 

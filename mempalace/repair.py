@@ -1167,7 +1167,31 @@ def rebuild_index(
         progress(index_read_recovery_guidance())
         return
 
-    backend = ChromaBackend()
+    # Hold the palace writer lease for the complete snapshot -> rebuild/swap
+    # -> cleanup cycle. A writer landing after the snapshot but before the
+    # rebuilt collection becomes authoritative would otherwise be lost from
+    # the rebuilt index and recreate SQLite/HNSW divergence.
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        _rebuild_index_under_lease(
+            backend=ChromaBackend(),
+            palace_path=palace_path,
+            collection_name=collection_name,
+            confirm_truncation_ok=confirm_truncation_ok,
+            progress=progress,
+        )
+
+
+def _rebuild_index_under_lease(
+    *,
+    backend,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool,
+    progress: Callable[[str], None],
+):
+    """Run rebuild_index's snapshot/rebuild body under its writer lease."""
     try:
         col = backend.get_collection(palace_path, collection_name)
         total = col.count()

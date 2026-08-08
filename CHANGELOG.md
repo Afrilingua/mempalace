@@ -36,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **MCP and daemon lifecycle harden multi-agent use.** Read-only mode refuses config and checkpoint-ack tools that rewrite host state; stdio MCP exits on stdin EOF/broken pipe so orphaned sessions release locks; daemon jobs refused the palace lock are deferred instead of failed permanently. (#2126, #2103, #2101, #2072, #2029, #2014)
 - **Entity-candidate extraction no longer hangs on long ASCII runs** (base64, minified blobs) while preserving CJK/non-ASCII text. (#2127, #2065, #2063)
 - **Mining windowing rejects `chunk_overlap` above half the chunk size**, stopping infinite chunk_text loops. (#2056, #2058)
+- **`docker-compose.yml` is valid again.** The `environment:` key was declared with only comments beneath it, which YAML parses as null, so Compose rejected the whole file (`services.mcp.environment must be a mapping`) — every documented Compose command failed before starting. The key is commented out along with its examples, which now use mapping syntax so uncommenting them yields a valid block. (#2188)
 
 ### Documentation
 

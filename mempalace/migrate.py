@@ -570,7 +570,7 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
     topic_renames = _plan_topics_by_wing_renames()
 
     if not d_updates and not c_updates and not topic_renames:
-        print("  All wing names are already normalized — nothing to migrate.")
+        print("  All wing names are already normalized -- nothing to migrate.")
         return False
 
     print("\n  Wing-name migration plan:")
@@ -586,7 +586,7 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
         print(f"    topics_by_wing: {len(topic_renames)} key(s) re-keyed")
 
     if dry_run:
-        print("\n  DRY RUN — no changes made.\n")
+        print("\n  DRY RUN -- no changes made.\n")
         return True
 
     if not confirm:

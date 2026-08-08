@@ -1246,7 +1246,7 @@ def test_cmd_repair_default_mode_dry_run_writes_nothing(mock_config_cls, tmp_pat
         cmd_repair(args)
 
     out = capsys.readouterr().out
-    assert "DRY RUN — no changes will be made." in out
+    assert "DRY RUN -- no changes will be made." in out
     assert "holds 2 rows" in out
     assert "Repair complete" not in out
     # The count comes from read-only SQLite, never from a chromadb client:

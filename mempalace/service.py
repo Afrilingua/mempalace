@@ -273,7 +273,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     dry_run = bool(payload.get("dry_run", True))
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Sync — Gitignore-aware drawer prune")
+    print("  MemPalace Sync -- Gitignore-aware drawer prune")
     print(f"{'=' * 55}")
     print(f"  Palace:   {palace_path}")
     if payload.get("wing"):

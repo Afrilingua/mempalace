@@ -430,7 +430,7 @@ def run_onboarding(
             print()
             if _yn("  Add any of these to your registry?"):
                 for e in detected:
-                    ans = input(f"    {e['name']} — (p)erson, (s)kip? ").strip().lower()
+                    ans = input(f"    {e['name']} -- (p)erson, (s)kip? ").strip().lower()
                     if ans == "p":
                         rel = input(f"    Relationship/role for {e['name']}? ").strip()
                         ctx = (
@@ -439,7 +439,7 @@ def run_onboarding(
                             else (
                                 "work"
                                 if mode == "work"
-                                else input("    Context — (p)ersonal or (w)ork? ")
+                                else input("    Context -- (p)ersonal or (w)ork? ")
                                 .strip()
                                 .lower()
                                 .replace("w", "work")

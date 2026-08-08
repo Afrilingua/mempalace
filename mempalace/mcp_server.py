@@ -2950,7 +2950,7 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _metadata_cache = None
-            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+            logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
             return {
                 "success": True,
                 "drawer_id": drawer_id,
@@ -3883,7 +3883,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
-            logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+            logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
                 "entry_id": entry_id,
@@ -7294,10 +7294,10 @@ def _run_stdio_loop() -> None:
             # clean EOF — same meaning: the client is gone. Never loop on
             # it: an orphaned stdio server holding the mine_palace flock
             # blocked all palace writes for hours (2026-07-10 outage).
-            logger.info("stdin read failed (%s) — client disconnected, shutting down", exc)
+            logger.info("stdin read failed (%s) -- client disconnected, shutting down", exc)
             break
         if not line:
-            logger.info("stdin EOF — client disconnected, shutting down")
+            logger.info("stdin EOF -- client disconnected, shutting down")
             break
 
         line = line.strip()
@@ -7327,7 +7327,7 @@ def _run_stdio_loop() -> None:
             # The client's read end is gone; every future response write
             # would fail the same way, so treat it like stdin EOF and
             # shut down instead of swallowing it in the generic handler.
-            logger.info("stdout write failed (%s) — client disconnected, shutting down", exc)
+            logger.info("stdout write failed (%s) -- client disconnected, shutting down", exc)
             _drop_broken_stdout()
             break
 

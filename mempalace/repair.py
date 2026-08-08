@@ -1646,7 +1646,7 @@ def rebuild_from_sqlite(
     in_place = source_palace == dest_palace
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Rebuild from SQLite")
+    print("  MemPalace Repair -- Rebuild from SQLite")
     print(f"{'=' * 55}\n")
     print(f"  Source: {source_palace}")
     print(f"  Dest:   {dest_palace}")
@@ -1741,7 +1741,7 @@ def _preview_rebuild_from_sqlite(
     Never archives, locks, or writes. Returns ``{}`` if SQLite counts are
     unreadable so a broken preview cannot look like a successful zero-row plan.
     """
-    print("\n  DRY RUN — no changes will be made.")
+    print("\n  DRY RUN -- no changes will be made.")
     if in_place:
         print(
             f"  Would archive {dest_palace} → "
@@ -1787,7 +1787,7 @@ def _preview_legacy_repair(
     Returns ``{}`` when the count is unreadable so a broken preview cannot look
     like a valid plan (#1654, #2095, #2133).
     """
-    print("\n  DRY RUN — no changes will be made.")
+    print("\n  DRY RUN -- no changes will be made.")
     n = sqlite_drawer_count(palace_path, collection_name)
     if n is None:
         _print_unreadable_count_refusal(collection_name=collection_name, palace_path=palace_path)
@@ -1822,8 +1822,8 @@ def _preview_legacy_repair(
             f"  returns fewer than {n} (#1208 truncation guard). It would then, in order:"
         )
     if os.path.exists(backup_path):
-        print(f"    1. DELETE the existing backup at {backup_path} — or refuse outright")
-        print("       if it is not a palace — and copy the live palace in its place")
+        print(f"    1. DELETE the existing backup at {backup_path} -- or refuse outright")
+        print("       if it is not a palace -- and copy the live palace in its place")
     else:
         print(f"    1. copy the palace directory to {backup_path}")
     print(f"    2. DELETE the live '{collection_name}' collection and re-file the extracted rows")
@@ -1895,7 +1895,7 @@ def _rebuild_from_sqlite_locked(
     if in_place:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
-        print(f"  Archiving {dest_palace} → {archive_path}")
+        print(f"  Archiving {dest_palace} -> {archive_path}")
         # os.rename, NOT shutil.move. When any file inside the palace is
         # held open by another process (MCP server, a running mine, another
         # harness), renaming the directory fails atomically UP FRONT on
@@ -2024,7 +2024,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Status")
+    print("  MemPalace Repair -- Status")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
 
@@ -2241,7 +2241,7 @@ def repair_max_seq_id(
     }
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — max_seq_id Un-poison")
+    print("  MemPalace Repair -- max_seq_id Un-poison")
     print(f"{'=' * 55}\n")
     print(f"  Palace:  {palace_path}")
     if segment:
@@ -2292,10 +2292,10 @@ def repair_max_seq_id(
     source = "sidecar" if from_sidecar else "heuristic (collection MAX)"
     print(f"    clean-value source   {source}")
     for seg_id, old_val, new_val in plan:
-        print(f"    {seg_id}  {old_val}  →  {new_val}")
+        print(f"    {seg_id}  {old_val}  ->  {new_val}")
 
     if dry_run:
-        print("\n  DRY RUN — no rows modified.\n" + "=" * 55 + "\n")
+        print("\n  DRY RUN -- no rows modified.\n" + "=" * 55 + "\n")
         return result
 
     if not plan:

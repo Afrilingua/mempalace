@@ -2630,10 +2630,44 @@ def _single_drawer_record(col, drawer_id: str):
     }
 
 
+# Two write paths stamp the logical-group id under different keys:
+# ``tool_add_drawer`` chunks carry ``parent_drawer_id`` (#1539, resolved as a
+# logical drawer by #1782) while ``tool_diary_write`` chunks carry
+# ``parent_entry_id`` (#1539). Both mean the same thing -- "physical chunk of
+# this logical drawer" -- so every read path must resolve either one, or the
+# id a write path hands back is unusable with get/update/delete (#2185).
+# New diary writes stamp both keys; the read paths below still accept the
+# ``parent_entry_id``-only shape so palaces written before this fix keep
+# working with no data migration.
+_PARENT_ID_KEYS = ("parent_drawer_id", "parent_entry_id")
+
+
+def _logical_parent_id(meta):
+    """Return the logical-group id from chunk metadata, whichever key holds it.
+
+    Returns ``None`` for rows that are not chunks of a larger drawer.
+    """
+    for key in _PARENT_ID_KEYS:
+        value = (meta or {}).get(key)
+        if value:
+            return value
+    return None
+
+
+def _logical_parent_where(drawer_id: str) -> dict:
+    """Chroma ``where`` matching every chunk of ``drawer_id`` under either key.
+
+    A chunk carrying both keys (diary writes after #2185) matches both
+    branches of the ``$or`` but is still returned once -- Chroma dedupes by
+    physical id -- so the joined content never repeats a chunk.
+    """
+    return {"$or": [{key: drawer_id} for key in _PARENT_ID_KEYS]}
+
+
 def _logical_chunk_group(col, drawer_id: str):
     try:
         result = col.get(
-            where={"parent_drawer_id": drawer_id},
+            where=_logical_parent_where(drawer_id),
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -2741,7 +2775,7 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     for idx, drawer_id in enumerate(ids):
         doc = documents[idx] if idx < len(documents) else ""
         meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
-        parent_id = meta.get("parent_drawer_id")
+        parent_id = _logical_parent_id(meta)
 
         if parent_id:
             groups.setdefault(parent_id, []).append(
@@ -3861,14 +3895,17 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
         # Oversized entry: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
-        # Every chunk carries ``parent_entry_id`` so search can rejoin
-        # them and ``chunk_index`` for ordered reconstruction (#1539).
-        # Note on ``entry_id`` in the return value: for the chunked
-        # path the returned ``entry_id`` is the LOGICAL group handle
-        # (no drawer is stored under that exact id). The physical
-        # drawer ids are in ``chunk_ids``. Callers wanting to fetch
-        # by id should iterate ``chunk_ids``; callers wanting to
-        # query by metadata can filter on ``parent_entry_id``.
+        # Every chunk carries ``chunk_index`` for ordered reconstruction
+        # and the group id under BOTH ``parent_entry_id`` (the original
+        # #1539 key, kept so existing readers and palaces are unaffected)
+        # and ``parent_drawer_id`` (the key the logical-id read paths were
+        # built around in #1782) -- see ``_PARENT_ID_KEYS`` (#2185).
+        # Note on ``entry_id`` in the return value: for the chunked path
+        # the returned ``entry_id`` is the LOGICAL group handle -- no
+        # drawer is stored under that exact id, but it resolves through
+        # ``mempalace_get_drawer`` / ``update_drawer`` / ``delete_drawer``
+        # to the whole entry, exactly as an oversized ``add_drawer`` id
+        # does. The physical drawer ids remain available in ``chunk_ids``.
         # Use a single batched ``add`` so the embedding pass either
         # commits all chunks or none — avoids a half-written palace
         # if the embedding model fails mid-loop. ``col.add`` (not
@@ -3890,6 +3927,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     **base_metadata,
                     "chunk_index": chunk_idx,
                     "parent_entry_id": entry_id,
+                    "parent_drawer_id": entry_id,
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)

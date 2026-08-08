@@ -77,8 +77,16 @@ def _aligned_query_ids(results, document_count: int) -> list:
 
 
 def _result_drawer_id(meta, stored_drawer_id):
-    """Return the ID that round-trips through ``mempalace_get_drawer``."""
-    return (meta or {}).get("parent_drawer_id") or stored_drawer_id
+    """Return the ID that round-trips through ``mempalace_get_drawer``.
+
+    Chunk metadata carries the logical-group id under ``parent_drawer_id``
+    (``tool_add_drawer``) or ``parent_entry_id`` (``tool_diary_write``);
+    resolving both means a hit on a chunked diary entry reports the id that
+    fetches the WHOLE entry rather than the one chunk that matched (#2185).
+    Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
+    """
+    meta = meta or {}
+    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
 
 
 def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:

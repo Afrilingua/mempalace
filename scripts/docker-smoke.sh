@@ -24,6 +24,14 @@ IMAGE="${1:-mempalace:smoke}"
 VOLUME="mempalace-smoke-$$"
 WORKDIR="$(mktemp -d)"
 
+# The image runs as uid 1000, which will not match the host user on Linux, and
+# bind mounts carry host ownership through unchanged (Docker Desktop's uid
+# mapping hides this on macOS). `mktemp -d` gives 0700, so the container could
+# not even stat inside /work. Model an ordinary project checkout instead: 0755
+# dir, 0644 files — which is what makes the README's `-v /path/to/project:/work`
+# work for a normal repo.
+chmod 0755 "$WORKDIR"
+
 # A sentence we can assert on verbatim. Storing user words exactly is the
 # project's core promise, so the read-back check is the real assertion here.
 NEEDLE="eleven round trips to render one screen"
@@ -78,6 +86,7 @@ cat > "$WORKDIR/notes.md" <<EOF
 We switched from REST to GraphQL because the mobile client was making
 $NEEDLE. We settled on persisted queries.
 EOF
+chmod 0644 "$WORKDIR/notes.md"
 
 # First run also downloads the ~80 MB embedding model into the volume, so this
 # doubles as a check that a cold container can reach and cache it.

@@ -92,3 +92,45 @@ class TestMempalaceConfigEncoding:
         assert conf._file_config.get("people_map", {}).get("Mueller") == UMLAUT_NAME, (
             f"config.json read as cp1252: {conf._file_config!r}"
         )
+
+def _write_cp1252_bytes(path, obj):
+    """Write legacy Windows cp1252 JSON bytes for migration-path tests."""
+    path.write_bytes(json.dumps(obj, ensure_ascii=False).encode("cp1252"))
+
+
+class TestLegacyCodepageMigration:
+    def test_config_json_legacy_cp1252_is_ignored_instead_of_crashing(self, tmp_path):
+        """Legacy non-UTF-8 config.json must follow the existing invalid-config fallback."""
+        _write_cp1252_bytes(
+            tmp_path / "config.json",
+            {"people_map": {"Mueller": UMLAUT_NAME}},
+        )
+
+        conf = MempalaceConfig(config_dir=str(tmp_path))
+
+        assert conf._file_config == {}
+
+    def test_people_map_legacy_cp1252_falls_back_instead_of_crashing(self, tmp_path):
+        """Legacy non-UTF-8 people_map.json must fall back instead of raising."""
+        _write_cp1252_bytes(
+            tmp_path / "people_map.json",
+            {"Mueller": UMLAUT_NAME},
+        )
+
+        conf = MempalaceConfig(config_dir=str(tmp_path))
+
+        assert conf.people_map == {}
+
+    def test_dialect_legacy_cp1252_reports_utf8_migration_error(self, tmp_path):
+        """Hand-edited legacy config should fail with an actionable UTF-8 message."""
+        cfg = tmp_path / "dialect.json"
+        _write_cp1252_bytes(
+            cfg,
+            {"entities": {UMLAUT_NAME: "MUE"}, "skip_names": []},
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"not valid UTF-8.*re-save it as UTF-8",
+        ):
+            Dialect.from_config(str(cfg))

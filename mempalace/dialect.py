@@ -357,8 +357,13 @@ class Dialect:
             "skip_names": ["Gandalf", "Sherlock"]
         }
         """
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"{config_path} is not valid UTF-8 — re-save it as UTF-8"
+            ) from exc
         return cls(
             entities=config.get("entities", {}),
             skip_names=config.get("skip_names", []),

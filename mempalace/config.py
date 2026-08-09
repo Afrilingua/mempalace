@@ -376,7 +376,7 @@ class MempalaceConfig:
             try:
                 with open(self._config_file, "r", encoding="utf-8") as f:
                     self._file_config = json.load(f)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 self._file_config = {}
 
     @property
@@ -552,7 +552,7 @@ class MempalaceConfig:
             try:
                 with open(self._people_map_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 pass
         return self._file_config.get("people_map", {})
 

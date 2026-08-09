@@ -22,7 +22,9 @@ from mempalace.palace import (
     _write_lock_holder,
     MineAlreadyRunning,
     mine_global_lock,
+    mine_lock,
     mine_palace_lock,
+    reap_stale_mine_locks,
 )
 
 
@@ -439,3 +441,155 @@ def test_holder_set_not_orphaned_by_interrupt_after_mark_held(tmp_path, monkeypa
     # The flock was freed and no stale hold remains, so the lock is reusable.
     with mine_palace_lock(palace):
         pass
+
+
+# ---------------------------------------------------------------------------
+# reap_stale_mine_locks — orphaned per-source-file lock garbage collection
+# ---------------------------------------------------------------------------
+#
+# mine_lock's own finally-block cleanup (_cleanup_mine_lock_file) only runs
+# for the specific lock a process just released, and only if that process
+# reaches its own finally block at all. A process killed abruptly (SIGKILL,
+# force-quit, host crash) never runs it, and nothing else in the codebase
+# later revisits that lock file — it orphans permanently. One long-lived
+# installation was found with 5,636 such orphaned lock files, the oldest
+# several months old, none held by any live process. These tests cover the
+# reaper added to reclaim them safely.
+
+
+def _hold_source_lock(source_file: str, ready_flag: str, release_flag: str) -> int:
+    """Acquire mine_lock(source_file), signal readiness, wait for release.
+
+    Runs in a child process for true cross-process locking semantics,
+    mirroring _hold_lock above but for the per-source-file mine_lock
+    rather than the per-palace mine_palace_lock.
+    """
+    with mine_lock(source_file):
+        open(ready_flag, "w").close()
+        for _ in range(500):
+            if os.path.exists(release_flag):
+                return 0
+            time.sleep(0.01)
+        return 0
+
+
+def test_reap_removes_stale_unlocked_lock(tmp_path, monkeypatch):
+    """A lock file that's old and held by nobody is safe to remove."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lock_dir = tmp_path / ".mempalace" / "locks"
+    lock_dir.mkdir(parents=True)
+    stale = lock_dir / "0000000000000000.lock"
+    stale.write_bytes(b"")
+    old_time = time.time() - 7200  # 2h old, past the default 1h threshold
+    os.utime(stale, (old_time, old_time))
+
+    reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
+
+    assert reaped == 1
+    assert skipped == 0
+    assert not stale.exists()
+
+
+def test_reap_leaves_recently_touched_lock_alone(tmp_path, monkeypatch):
+    """A lock younger than the age threshold is left alone even if unheld.
+
+    The flock check is what makes removal *safe*; the age threshold exists
+    only to avoid racing a lock that was just released and may still be
+    mid-rendezvous with a waiter on the same pathname.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lock_dir = tmp_path / ".mempalace" / "locks"
+    lock_dir.mkdir(parents=True)
+    fresh = lock_dir / "1111111111111111.lock"
+    fresh.write_bytes(b"")  # mtime is "now" — well under the threshold
+
+    reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
+
+    assert reaped == 0
+    assert fresh.exists()
+
+
+def test_reap_never_removes_a_lock_held_by_another_process(tmp_path, monkeypatch):
+    """The core safety property: a lock genuinely held by a live process,
+    however old it looks by mtime, is never removed — the age threshold is
+    a courtesy throttle, the flock check is the actual safety mechanism."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source_file = str(tmp_path / "some_source.py")
+    ready = str(tmp_path / "ready")
+    release = str(tmp_path / "release")
+
+    ctx = _get_mp_context()
+    holder = ctx.Process(target=_hold_source_lock, args=(source_file, ready, release))
+    holder.start()
+    try:
+        for _ in range(500):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "holder failed to acquire lock in time"
+
+        lock_dir = tmp_path / ".mempalace" / "locks"
+        lock_files = list(lock_dir.glob("*.lock"))
+        assert lock_files, "expected the held lock file to exist"
+        # Backdate mtime so it would be a reap candidate by age alone —
+        # the flock held by the child process must still protect it.
+        old_time = time.time() - 7200
+        os.utime(lock_files[0], (old_time, old_time))
+
+        reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
+
+        assert reaped == 0
+        assert skipped == 1
+        assert lock_files[0].exists(), "a held lock must never be removed by the reaper"
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=5)
+        assert holder.exitcode == 0
+
+
+def test_reap_skips_mine_palace_prefixed_locks(tmp_path, monkeypatch):
+    """mine_palace_*.lock belongs to the newer per-palace lock (mine_palace_lock)
+    with its own lifecycle and holder tracking — this reaper targets only the
+    per-source-file locks mine_lock creates, and must not touch those."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lock_dir = tmp_path / ".mempalace" / "locks"
+    lock_dir.mkdir(parents=True)
+    palace_lock = lock_dir / "mine_palace_deadbeefdeadbeef.lock"
+    palace_lock.write_bytes(b"")
+    old_time = time.time() - 7200
+    os.utime(palace_lock, (old_time, old_time))
+
+    reaped, skipped = reap_stale_mine_locks(min_age_seconds=3600)
+
+    assert reaped == 0
+    assert palace_lock.exists()
+
+
+def test_reap_missing_lock_dir_is_a_noop(tmp_path, monkeypatch):
+    """No ~/.mempalace/locks directory yet (fresh install) must not raise."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    reaped, skipped = reap_stale_mine_locks()
+    assert (reaped, skipped) == (0, 0)
+
+
+def test_maybe_reap_is_throttled(tmp_path, monkeypatch):
+    """The opportunistic call site runs at most once per interval — a stale
+    lock created between two rapid-fire mine_lock calls must survive the
+    second call because the reap itself was skipped, not because reaping
+    failed."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(palace_mod, "_LOCK_REAP_INTERVAL_SECONDS", 3600)
+
+    with mine_lock(str(tmp_path / "a.py")):
+        pass  # first call: no marker exists yet, this call creates it
+
+    lock_dir = tmp_path / ".mempalace" / "locks"
+    stale = lock_dir / "2222222222222222.lock"
+    stale.write_bytes(b"")
+    old_time = time.time() - 7200
+    os.utime(stale, (old_time, old_time))
+
+    with mine_lock(str(tmp_path / "b.py")):
+        pass  # second call: marker is fresh, reap should be skipped this time
+
+    assert stale.exists(), "reap should have been throttled on the second mine_lock call"

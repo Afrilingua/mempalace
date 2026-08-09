@@ -93,6 +93,7 @@ class TestMempalaceConfigEncoding:
             f"config.json read as cp1252: {conf._file_config!r}"
         )
 
+
 def _write_cp1252_bytes(path, obj):
     """Write legacy Windows cp1252 JSON bytes for migration-path tests."""
     path.write_bytes(json.dumps(obj, ensure_ascii=False).encode("cp1252"))

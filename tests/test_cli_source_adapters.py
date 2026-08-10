@@ -146,10 +146,10 @@ def _isolated_fixture_adapter():
         reset_adapters()
 
 
-def _mine_args(*, source=None, mode=None, dry_run=False):
+def _mine_args(*, source=None, mode=None, dry_run=False, palace=None):
     return argparse.Namespace(
         dir="/source",
-        palace=None,
+        palace=palace,
         source=source,
         mode=mode,
         wing=None,
@@ -197,19 +197,38 @@ def test_cmd_mine_source_rejects_unknown_adapter(capsys):
     assert "unknown source adapter 'not-installed'" in capsys.readouterr().err
 
 
-def test_cmd_mine_source_reports_contention_without_traceback(monkeypatch, capsys):
-    from mempalace.palace import MineAlreadyRunning
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="cross-process lock semantics differ on Windows"
+)
+def test_cmd_mine_source_reports_real_contention_without_traceback(tmp_path, capsys):
+    """The CLI converts a real competing writer lease into a clean exit."""
+    register("fixture", _FixtureAdapter)
+    palace_path = str(tmp_path / "palace")
+    ready = str(tmp_path / "ready")
+    release = str(tmp_path / "release")
+    ctx = multiprocessing.get_context("spawn")
+    holder = ctx.Process(target=_hold_palace_lock, args=(palace_path, ready, release))
+    holder.start()
+    try:
+        for _ in range(500):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "lock holder did not become ready"
 
-    def raise_contention(**_kwargs):
-        raise MineAlreadyRunning("palace is held by pid=123")
+        with pytest.raises(SystemExit) as excinfo:
+            cli.cmd_mine(_mine_args(source="fixture", palace=palace_path))
 
-    monkeypatch.setattr(cli, "mine_source_adapter", raise_contention)
-
-    with pytest.raises(SystemExit) as excinfo:
-        cli.cmd_mine(_mine_args(source="fixture"))
-
-    assert excinfo.value.code == 1
-    assert capsys.readouterr().err == "mempalace: palace is held by pid=123\n"
+        assert excinfo.value.code == 1
+        error = capsys.readouterr().err
+        assert error.startswith(f"mempalace: palace {palace_path} is held by PID ")
+        assert "Traceback" not in error
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()
+        assert holder.exitcode == 0
 
 
 def test_mine_source_dry_run_prevents_direct_collection_and_kg_mutations(monkeypatch):
@@ -281,10 +300,14 @@ def test_dry_run_collection_proxy_returns_backend_result_types():
     assert query_result.embeddings == [[], []]
 
 
-def test_mine_source_dry_run_fresh_palace_creates_no_backend_artifacts(tmp_path):
-    """Dry-running a source adapter must not materialize a new palace."""
+def test_mine_source_dry_run_existing_uninitialized_palace_creates_no_chroma_artifacts(
+    tmp_path, monkeypatch
+):
+    """Dry runs must not initialize Chroma in an existing empty palace dir."""
     register("fixture", _FixtureAdapter)
-    palace = tmp_path / "fresh-palace"
+    palace = tmp_path / "existing-palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
 
     assert (
         cli.mine_source_adapter(
@@ -296,7 +319,41 @@ def test_mine_source_dry_run_fresh_palace_creates_no_backend_artifacts(tmp_path)
         == 1
     )
 
-    assert not palace.exists(), "dry run must not create backend storage"
+    assert list(palace.iterdir()) == []
+    assert not (palace / "chroma.sqlite3").exists()
+
+
+def test_mine_source_dry_run_preserves_initialized_sqlite_exact_artifacts(tmp_path, monkeypatch):
+    """Dry runs must not open or alter an existing sqlite_exact backend."""
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    register("fixture", _FixtureAdapter)
+    palace = tmp_path / "sqlite-palace"
+    backend = SQLiteExactBackend()
+    backend.get_collection(
+        palace=PalaceRef(id=str(palace), local_path=str(palace)),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    backend.close()
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+
+    before = {path.name: path.read_bytes() for path in palace.iterdir()}
+    assert "sqlite_exact.sqlite3" in before
+
+    assert (
+        cli.mine_source_adapter(
+            source_name="fixture",
+            source_path="/source",
+            palace_path=str(palace),
+            dry_run=True,
+        )
+        == 1
+    )
+
+    after = {path.name: path.read_bytes() for path in palace.iterdir()}
+    assert after == before
 
 
 def test_mine_source_rejects_incremental_adapter_before_ingest():

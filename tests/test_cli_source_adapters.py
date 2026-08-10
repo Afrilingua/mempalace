@@ -120,6 +120,16 @@ class _MetadataAdapter(BaseSourceAdapter):
         return AdapterSchema(version="1.0", fields={})
 
 
+class _InvalidResultAdapter(BaseSourceAdapter):
+    name = "invalid-result"
+
+    def ingest(self, *, source, palace):
+        yield object()
+
+    def describe_schema(self):
+        return AdapterSchema(version="1.0", fields={})
+
+
 def _hold_palace_lock(palace_path, ready_flag, release_flag):
     """Hold a writer lease in a separate process for contention coverage."""
     from mempalace.palace import mine_palace_lock
@@ -236,12 +246,11 @@ def test_mine_source_dry_run_prevents_direct_collection_and_kg_mutations(monkeyp
 
     register("direct-mutation", _DirectMutationAdapter)
     monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
-
-    def read_only_collection(_palace_path, *, create):
-        assert create is False
-        raise FileNotFoundError
-
-    monkeypatch.setattr(palace, "get_collection", read_only_collection)
+    # Dry runs must never reach the backend at all (see
+    # test_mine_source_dry_run_never_opens_existing_collection for the
+    # dedicated assertion); failing here catches a regression that
+    # reintroduces a real `get_collection` call in the dry-run path.
+    monkeypatch.setattr(palace, "get_collection", lambda *_a, **_k: pytest.fail("must not open"))
     monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
 
     drawers_written = cli.mine_source_adapter(
@@ -323,6 +332,25 @@ def test_mine_source_dry_run_existing_uninitialized_palace_creates_no_chroma_art
     assert not (palace / "chroma.sqlite3").exists()
 
 
+def test_mine_source_dry_run_fresh_palace_creates_no_backend_artifacts(tmp_path, monkeypatch):
+    """Dry runs must not materialize a nonexistent Chroma palace."""
+    register("fixture", _FixtureAdapter)
+    palace = tmp_path / "fresh-palace"
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+
+    assert (
+        cli.mine_source_adapter(
+            source_name="fixture",
+            source_path="/source",
+            palace_path=str(palace),
+            dry_run=True,
+        )
+        == 1
+    )
+
+    assert not palace.exists()
+
+
 def test_mine_source_dry_run_preserves_initialized_sqlite_exact_artifacts(tmp_path, monkeypatch):
     """Dry runs must not open or alter an existing sqlite_exact backend."""
     from mempalace.backends.base import PalaceRef
@@ -385,6 +413,19 @@ def test_mine_source_accepts_non_incremental_metadata(monkeypatch, recwarn):
     assert drawers_written == 1
     assert collection.upserts[0]["documents"] == ["before metadata"]
     assert "non-incremental item metadata" in str(recwarn.pop(RuntimeWarning).message)
+
+
+def test_mine_source_rejects_unsupported_adapter_results():
+    """Unexpected adapter yields must fail rather than being silently dropped."""
+    register("invalid-result", _InvalidResultAdapter)
+
+    with pytest.raises(TypeError, match="unsupported result type object"):
+        cli.mine_source_adapter(
+            source_name="invalid-result",
+            source_path="/source",
+            palace_path="/fake/palace",
+            dry_run=True,
+        )
 
 
 def test_mine_source_holds_writer_lease_before_opening_handles(monkeypatch):

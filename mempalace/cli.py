@@ -580,6 +580,8 @@ def cmd_mine(args):
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
 
+    from .palace import MineAlreadyRunning, MineValidationError
+
     if source_adapter:
         try:
             drawers_written = mine_source_adapter(
@@ -591,6 +593,9 @@ def cmd_mine(args):
         except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(2)
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
         print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
         return
@@ -604,8 +609,6 @@ def cmd_mine(args):
             palace_dir=palace_path,
             llm_provider=None,
         )
-
-    from .palace import MineAlreadyRunning, MineValidationError
 
     try:
         if mode == "convos":
@@ -681,15 +684,14 @@ class UnsupportedSourceAdapterProtocolError(ValueError):
 
 
 class _DryRunCollectionProxy:
-    """Read-only collection facade that records, but never persists, writes.
+    """Empty collection facade that records, but never persists, writes.
 
     Source adapters are deliberately allowed to access ``drawer_collection``
-    directly.  Passing the live collection during a dry run would therefore
-    make ``--dry-run`` advisory rather than safe.
+    directly.  A dry run must not open the real backend: even read-only-looking
+    opens can create or repair backend artifacts (for example SQLite WAL files).
     """
 
-    def __init__(self, collection=None):
-        self._collection = collection
+    def __init__(self):
         self.operations = []
 
     def add(self, **kwargs):
@@ -705,19 +707,23 @@ class _DryRunCollectionProxy:
         self.operations.append(("update", kwargs))
 
     def query(self, **kwargs):
-        if self._collection is None:
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
-        return self._collection.query(**kwargs)
+        from .backends import QueryResult
+
+        query_input = kwargs.get("query_texts", kwargs.get("query_embeddings"))
+        num_queries = len(query_input) if isinstance(query_input, (list, tuple)) else 1
+        include = kwargs.get("include") or []
+        return QueryResult.empty(
+            num_queries=num_queries,
+            embeddings_requested="embeddings" in include,
+        )
 
     def get(self, **kwargs):
-        if self._collection is None:
-            return {"ids": [], "documents": [], "metadatas": []}
-        return self._collection.get(**kwargs)
+        from .backends import GetResult
+
+        return GetResult.empty()
 
     def count(self):
-        if self._collection is None:
-            return 0
-        return self._collection.count()
+        return 0
 
 
 class _DryRunKnowledgeGraphProxy:
@@ -778,25 +784,16 @@ def mine_source_adapter(
             "mempalace mine does not support yet"
         )
 
-    # A dry run must never create a collection: opening a fresh Chroma palace
-    # can create storage and persist embedder identity before write proxies are
-    # installed.  It may safely retain a read-only view of an existing
-    # collection so adapters can produce an accurate preview.  Non-dry runs
-    # hold one writer lease from handle creation through adapter iteration,
-    # including direct KG mutations by adapters.
+    # A dry run must never open a collection: backend opens can create or
+    # repair storage even when requested as read-only.  Non-dry runs hold one
+    # writer lease from handle creation through adapter iteration, including
+    # direct KG mutations by adapters.
     lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
     with lock:
         knowledge_graph = None
         try:
             if dry_run:
-                try:
-                    drawer_collection = _DryRunCollectionProxy(
-                        get_collection(palace_path, create=False)
-                    )
-                except FileNotFoundError:
-                    # No palace or collection has been initialized yet.  Use
-                    # an empty recording facade rather than materializing one.
-                    drawer_collection = _DryRunCollectionProxy()
+                drawer_collection = _DryRunCollectionProxy()
                 knowledge_graph = _DryRunKnowledgeGraphProxy()
             else:
                 drawer_collection = get_collection(palace_path)

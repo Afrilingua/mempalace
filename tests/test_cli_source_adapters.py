@@ -197,11 +197,27 @@ def test_cmd_mine_source_rejects_unknown_adapter(capsys):
     assert "unknown source adapter 'not-installed'" in capsys.readouterr().err
 
 
+def test_cmd_mine_source_reports_contention_without_traceback(monkeypatch, capsys):
+    from mempalace.palace import MineAlreadyRunning
+
+    def raise_contention(**_kwargs):
+        raise MineAlreadyRunning("palace is held by pid=123")
+
+    monkeypatch.setattr(cli, "mine_source_adapter", raise_contention)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_mine(_mine_args(source="fixture"))
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == "mempalace: palace is held by pid=123\n"
+
+
 def test_mine_source_dry_run_prevents_direct_collection_and_kg_mutations(monkeypatch):
     from mempalace import knowledge_graph, palace
 
     register("direct-mutation", _DirectMutationAdapter)
     monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
+
     def read_only_collection(_palace_path, *, create):
         assert create is False
         raise FileNotFoundError
@@ -228,26 +244,41 @@ def test_mine_source_dry_run_prevents_direct_collection_and_kg_mutations(monkeyp
     ]
 
 
-def test_mine_source_dry_run_reads_existing_collection_without_writing(monkeypatch):
+def test_mine_source_dry_run_never_opens_existing_collection(monkeypatch):
     from mempalace import knowledge_graph, palace
 
-    collection = _FakeCollection()
-    collection.count = lambda: 7
     register("read-aware", _ReadAwareAdapter)
     monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
     monkeypatch.setattr(
-        palace,
-        "get_collection",
-        lambda palace_path, *, create: collection if create is False else pytest.fail("must not create"),
+        palace, "get_collection", lambda *_args, **_kwargs: pytest.fail("must not open")
     )
     monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
 
-    assert cli.mine_source_adapter(
-        source_name="read-aware", source_path="/source", palace_path="/fake/palace", dry_run=True
-    ) == 1
+    assert (
+        cli.mine_source_adapter(
+            source_name="read-aware",
+            source_path="/source",
+            palace_path="/fake/palace",
+            dry_run=True,
+        )
+        == 1
+    )
 
-    assert _ReadAwareAdapter.observed_count == 7
-    assert collection.upserts == []
+    assert _ReadAwareAdapter.observed_count == 0
+
+
+def test_dry_run_collection_proxy_returns_backend_result_types():
+    from mempalace.backends import GetResult, QueryResult
+
+    collection = cli._DryRunCollectionProxy()
+
+    get_result = collection.get()
+    query_result = collection.query(query_texts=["one", "two"], include=["embeddings"])
+
+    assert isinstance(get_result, GetResult)
+    assert isinstance(query_result, QueryResult)
+    assert query_result.ids == [[], []]
+    assert query_result.embeddings == [[], []]
 
 
 def test_mine_source_dry_run_fresh_palace_creates_no_backend_artifacts(tmp_path):
@@ -255,12 +286,15 @@ def test_mine_source_dry_run_fresh_palace_creates_no_backend_artifacts(tmp_path)
     register("fixture", _FixtureAdapter)
     palace = tmp_path / "fresh-palace"
 
-    assert cli.mine_source_adapter(
-        source_name="fixture",
-        source_path="/source",
-        palace_path=str(palace),
-        dry_run=True,
-    ) == 1
+    assert (
+        cli.mine_source_adapter(
+            source_name="fixture",
+            source_path="/source",
+            palace_path=str(palace),
+            dry_run=True,
+        )
+        == 1
+    )
 
     assert not palace.exists(), "dry run must not create backend storage"
 
@@ -321,12 +355,17 @@ def test_mine_source_holds_writer_lease_before_opening_handles(monkeypatch):
     monkeypatch.setattr(palace, "get_collection", get_collection)
     monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
 
-    assert cli.mine_source_adapter(
-        source_name="fixture", source_path="/source", palace_path="/fake/palace"
-    ) == 1
+    assert (
+        cli.mine_source_adapter(
+            source_name="fixture", source_path="/source", palace_path="/fake/palace"
+        )
+        == 1
+    )
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="cross-process lock semantics differ on Windows")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="cross-process lock semantics differ on Windows"
+)
 def test_mine_source_refuses_held_writer_lease_before_opening_handles(tmp_path, monkeypatch):
     """A competing writer prevents adapter ingest and all handle creation."""
     from mempalace import knowledge_graph, palace

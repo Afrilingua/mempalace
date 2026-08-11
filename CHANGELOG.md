@@ -8,21 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [3.7.0] — 2026-08-11
+
 ### Features
 
 - **Embeddings via any OpenAI-compatible `/v1/embeddings` endpoint.** New `embedding_model: "openai-compat"` option computes embeddings on a server (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted endpoint) instead of a local ONNX model — useful for larger/multilingual embedders such as Qwen3-Embedding, or GPU offload. New `OpenAICompatEmbeddingFunction` in [`mempalace/embedding.py`](mempalace/embedding.py) speaks the standard `/v1/embeddings` protocol over stdlib `urllib` (no new dependency), batches requests, re-sorts the response by `index`, and L2-normalizes for the cosine collection. Endpoint settings are resolved by `MempalaceConfig` as a single source of truth — `embedding_api_url` / `embedding_api_model` / `embedding_api_key` in `config.json`, each overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. The embedding function's `name()` encodes the model id so changing it forces `mempalace repair rebuild-index` (different vector space). Mirrors the existing `openai-compat` LLM provider naming; stays local when the endpoint is on your machine/LAN. (#1559)
 - **`mempalace_search` / `mempalace search` — `since`/`before` date window.** Semantic search is poor at temporal queries ("what did we discuss this week?" scores ~0.35 even when matching drawers exist), so the search surfaces now accept the same `[since, before)` window `list_drawers` gained in #1128: inclusive/exclusive ISO bounds compared wall-clock against each drawer's `filed_at`, undated drawers excluded while a bound is active. The window applies on every candidate path (vector, `candidate_strategy="union"`, and the BM25-only fallback); the vector candidate pool widens under an active window (ChromaDB cannot range-compare string metadata server-side), and a full pool is flagged via `date_filter_pool_truncated` instead of passing silently. Shared parsing lives in the new `mempalace.date_window` module, also backing the `list_drawers` filter. (#463)
-
-### Bug Fixes
-
-- **Orphaned per-source-file mine locks are reaped instead of accumulating forever.** `_cleanup_mine_lock_file` reclaims a lock correctly on the happy path, but only for the specific lock its own `mine_lock` context manager just released — a process killed abruptly (SIGKILL, force-quit, host crash) never reaches that cleanup, and nothing else revisited the file afterward. One long-lived installation was found with 5,636 stale entries in `~/.mempalace/locks/`, the oldest several months old, none held by any live process. `mine_lock` now opportunistically reaps locks older than an hour via the same nonblocking-flock-reacquire safety check `_cleanup_mine_lock_file` already uses, throttled to once per 15 minutes so it costs nothing on the common path. `mine_palace_*.lock` (the newer per-palace lock) is untouched — it has its own lifecycle and holder tracking.
-
----
-
-## [3.7.0] — 2026-08-02
-
-### Features
-
+- **Hermes agent memory provider (core).** In-package Hermes `MemoryProvider` files live turns through the shared `file_conversation_exchange()` path (same metadata as convo mining), with a background worker so the agent loop never blocks on Chroma. Wake-up L1 uses the long-lived collection only — a second PersistentClient is not opened, avoiding local SQLite races. Install/backfill/docs remain a stacked follow-up. (#1915, #2215)
+- **Explicit RFC 002 source adapters on `mempalace mine`.** `mempalace mine <source> --source <adapter>` resolves adapters through the registry, holds the palace writer lease for the full ingest, and keeps dry-runs inert (no real backend/KG open). Legacy `--mode` paths are unchanged. (#2068, #2062)
+- **MCP refuses writes when the served library is no longer the one that started.** Detects mempalace (and chromadb when that backend is active) version drift or uninstall after upgrade without restarting the server; opt-out via `MEMPALACE_MCP_ALLOW_STALE_LIBRARY`. (#2081, #899)
 - **Hook write-routing through the daemon.** Background hook saves and mines can honor the shared write-routing policy so multi-session setups serialize mutations through one local owner instead of racing the palace. (#2030, #1963)
 
 ### Performance
@@ -33,6 +29,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **Orphaned per-source-file mine locks are reaped instead of accumulating forever.** `_cleanup_mine_lock_file` reclaims a lock correctly on the happy path, but only for the specific lock its own `mine_lock` context manager just released — a process killed abruptly (SIGKILL, force-quit, host crash) never reaches that cleanup, and nothing else revisited the file afterward. One long-lived installation was found with 5,636 stale entries in `~/.mempalace/locks/`, the oldest several months old, none held by any live process. `mine_lock` now opportunistically reaps locks older than an hour via the same nonblocking-flock-reacquire safety check `_cleanup_mine_lock_file` already uses, throttled to once per 15 minutes so it costs nothing on the common path. `mine_palace_*.lock` (the newer per-palace lock) is untouched — it has its own lifecycle and holder tracking.
+- **Windows MCP stdout capture falls back cleanly** when fd-level redirection is unavailable, and fails closed if protocol stdout cannot be restored after a successful redirect. (#2211, #2210)
+- **Claude Code `subagents/` transcripts are skipped by default** when mining conversations (98%+ noise on typical workspaces); `--include-subagents` opts back in. (#1330, #1217)
+- **Worktree transcript cwd no longer mints a throwaway wing** — wing is derived from the project root above `.claude/worktrees/`. (#2206)
+- **Markdown emphasis/bold no longer scores as emotional content** in the general extractor. (#2199, #2197)
+- **Encoding hardening on Windows locales:** pin `encoding=utf-8` on config/dialect opens; safer mojibake repair that does not destroy clean Portuguese/Vietnamese/Turkish prose; repair-encoding CLI reconfigures stdio like other entry points; remaining non-ASCII CLI symbols replaced for GBK consoles. (#2098, #2208, #2194, #1104, #1034, #2193)
+- **`rebuild_index` holds the palace writer lease** for the full snapshot→rebuild/swap cycle so concurrent writers cannot recreate HNSW divergence mid-repair. (#2195)
+- **`MEMPALACE_PALACE_PATH` is restored after each service entrypoint** so multi-call processes do not leak the first call's palace into the second. (#2192)
+- **systemd unit uses `Restart=always`** and documents `MEMPALACE_MCP_IDLE_HOURS=0` so the idle watchdog does not leave a dedicated server down after a clean exit. (#2203, #2204)
 - **Mining works again on the default Chroma backend.** Once Chroma began declaring `requires_explicit_embeddings`, every write started routing through `EmbeddingCollection`, whose `_embed_texts` built rows with `list(ndarray)` — that unpacks into `np.float32` *scalars*, which chromadb rejects outright (`Expected embeddings to be a list of floats or ints, a list of lists, a numpy array, or a list of numpy arrays`). `mine`, and every other write against a default palace, aborted on the first drawer. Vectors now convert to real Python floats. The suite was structurally blind to this: conftest's autouse embedding fixture replaces `_embed_texts` itself for every module outside `test_embedding` / `test_embeddinggemma`, so the defective function was never executed under test — the regression tests therefore live in `test_embedding.py`, where that stub does not apply. (#2187)
 - **ChatGPT data exports are parsed instead of stored as raw JSON.** A real `conversations.json` is a top-level array of conversations, which no parser claimed, so `mine --mode convos` chunked the raw JSON and lost every speaker turn while reporting success. Each conversation now normalizes to its own transcript, as Claude.ai privacy exports already do, so per-conversation dedup survives a re-export. The ChatGPT parser also type-checks its nested shapes, so an unrelated array carrying a `mapping` key is declined instead of raising. (#2160)
 - **Local backends enforce process-lifetime single-writer ownership.** File-backed and unknown backends require one writer owner for the full process lifetime (daemon holds the lease until workers exit; writable MCP HTTP acquires ownership before bind and refuses startup when blocked). Read-only MCP may coexist; `sqlite_exact` opens genuine query-only/immutable readers; remote Milvus/Zilliz remain multi-process. Addresses multi-writer SQLite/WAL corruption from MCP HTTP + daemon + mine topologies. (#2079, #2045)

@@ -836,6 +836,79 @@ def test_register_file_sentinel_includes_source_mtime():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# file_conversation_exchange — canonical single-exchange write path
+# ---------------------------------------------------------------------------
+
+
+class _RecordingCollection:
+    """Captures upsert kwargs without a real ChromaDB behind it."""
+
+    def __init__(self):
+        self.upserts = []
+
+    def upsert(self, *, ids, documents, metadatas):
+        self.upserts.append({"ids": ids, "documents": documents, "metadatas": metadatas})
+
+
+def _exchange_kwargs(**overrides):
+    kwargs = {
+        "wing": "wing_dev",
+        "room": "conversations",
+        "text": "User: hi\n\nAssistant: hello",
+        "source_file": "hermes-session:s1",
+        "agent": "hermes",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_file_conversation_exchange_extra_metadata_cannot_clobber_canonical():
+    """The docstring promises extras are append-only — colliding keys lose.
+
+    PR #1915 review: ``metadata.update(extra_metadata)`` let a caller
+    silently overwrite ``wing`` / ``filed_at`` / etc.
+    """
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(
+        col,
+        **_exchange_kwargs(),
+        extra_metadata={"wing": "wing_evil", "filed_at": "1970-01-01", "source": "hermes"},
+    )
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["wing"] == "wing_dev"
+    assert meta["filed_at"] != "1970-01-01"
+    # Non-colliding extras still land.
+    assert meta["source"] == "hermes"
+
+
+def test_file_conversation_exchange_invalid_wing_falls_back_to_wing_general():
+    """A bad configured wing must not drop the turn — verbatim first.
+
+    Same validation the MCP write tools apply (sanitize_name), but with a
+    wing_general fallback instead of an error: live filing losing turns
+    over a config typo would violate the 100%-recall promise.
+    """
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs(wing="../escape"))
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["wing"] == "wing_general"
+    assert col.upserts[0]["documents"] == ["User: hi\n\nAssistant: hello"]
+
+
+def test_file_conversation_exchange_invalid_room_falls_back_to_conversations():
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs(room="a/b"))
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["room"] == "conversations"
+
+
 def _write_dry_run_transcript(path: Path) -> None:
     path.write_text(
         "> What is the plan?\n"

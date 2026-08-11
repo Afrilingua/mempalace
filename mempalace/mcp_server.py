@@ -8021,6 +8021,35 @@ def _run_http_loop() -> None:
                 _release_mcp_writer_lock()
 
 
+def _install_shutdown_signal_handlers() -> None:
+    """Route terminal signals through ``sys.exit`` so ``atexit`` runs.
+
+    The palace writer lease is released by an ``atexit`` callback registered
+    when the lock is acquired. CPython's default disposition for SIGTERM and
+    SIGHUP is immediate termination, which skips ``atexit`` and leaves
+    ``mine_palace_*.lock`` naming a dead PID until a contender's liveness
+    check reclaims it (#2205). Calling ``sys.exit(0)`` from the handler
+    unwinds the synchronous stdio/http loop and runs the existing release
+    path. SIGHUP is Unix-only (SSH session disconnect); Windows only gets
+    SIGTERM. Handlers are best-effort — signal registration only works from
+    the main thread and is a no-op when the platform omits the signal.
+    """
+    import signal
+
+    def _shutdown_handler(signum, frame):  # noqa: ARG001
+        raise SystemExit(0)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _shutdown_handler)
+        except (ValueError, OSError):
+            # Not in the main thread, or the platform rejects the install.
+            pass
+
+
 def main():
     """MCP server entry point for the ``mempalace-mcp`` console script.
 
@@ -8042,6 +8071,8 @@ def main():
     # already protects this process from the same ABI mismatch; here we
     # extend the protection to children.
     os.environ.pop("PYTHONPATH", None)
+
+    _install_shutdown_signal_handlers()
 
     if _args.transport == "http":
         _run_http_loop()

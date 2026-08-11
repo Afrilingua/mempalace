@@ -77,6 +77,40 @@ def test_mcp_main_strips_leaked_pythonpath_from_env():
     assert "ENV_AFTER: None" in result.stderr, f"MCP server did not strip PYTHONPATH: {diag}"
 
 
+def test_install_shutdown_signal_handlers_routes_term_to_system_exit():
+    """SIGTERM/SIGHUP must raise SystemExit so atexit can release the lease (#2205)."""
+    import signal
+
+    from mempalace import mcp_server
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        previous[sig] = signal.getsignal(sig)
+
+    try:
+        mcp_server._install_shutdown_signal_handlers()
+        term = signal.SIGTERM
+        handler = signal.getsignal(term)
+        assert callable(handler)
+        with pytest.raises(SystemExit) as exc_info:
+            handler(term, None)
+        assert exc_info.value.code == 0
+
+        sighup = getattr(signal, "SIGHUP", None)
+        if sighup is not None:
+            hup_handler = signal.getsignal(sighup)
+            assert callable(hup_handler)
+            with pytest.raises(SystemExit) as exc_info:
+                hup_handler(sighup, None)
+            assert exc_info.value.code == 0
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
 def _patch_mcp_server(monkeypatch, config, kg):
     """Patch the mcp_server module globals to use test fixtures."""
     from mempalace import mcp_server

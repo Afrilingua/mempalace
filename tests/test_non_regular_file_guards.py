@@ -211,8 +211,11 @@ def test_read_text_no_follow_still_reads_a_large_regular_file_whole(tmp_path):
     payload = "the quick brown fox jumps over the lazy dog\n" * 50_000
     regular = write_regular(tmp_path, "big.md", payload)
     with hard_timeout(TIMEOUT_SECONDS, "_read_text_no_follow on a 2 MB file"):
-        content = _read_text_no_follow(regular, tmp_path)
+        result = _read_text_no_follow(regular, tmp_path)
+    assert result is not None
+    content, mtime = result
     assert content == payload
+    assert mtime == os.path.getmtime(regular)
 
 
 @posix_only
@@ -614,8 +617,11 @@ def test_read_text_no_follow_retries_when_a_lease_break_returns_eagain(tmp_path,
 
     monkeypatch.setattr("mempalace.miner.os.open", _fake_open)
     with hard_timeout(TIMEOUT_SECONDS, "_read_text_no_follow under an injected EAGAIN"):
-        content = _read_text_no_follow(target, tmp_path)
+        result = _read_text_no_follow(target, tmp_path)
+    assert result is not None
+    content, mtime = result
     assert content == payload
+    assert mtime == os.path.getmtime(target)
     assert calls["n"] == 2
 
 

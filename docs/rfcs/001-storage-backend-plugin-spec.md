@@ -6,15 +6,17 @@
 - **Related:** [#266](https://github.com/MemPalace/mempalace/issues/266), [#574](https://github.com/MemPalace/mempalace/pull/574), [#643](https://github.com/MemPalace/mempalace/pull/643), [#665](https://github.com/MemPalace/mempalace/pull/665), [#697](https://github.com/MemPalace/mempalace/pull/697), [#700](https://github.com/MemPalace/mempalace/pull/700), [#381](https://github.com/MemPalace/mempalace/pull/381), [#1679](https://github.com/MemPalace/mempalace/pull/1679)
 - **Spec version:** `1.0`
 
-> **Implementation status (2026-06-07).** The §1–2 contract surface (`PalaceRef`,
+> **Implementation status (2026-08-11).** The §1–2 contract surface (`PalaceRef`,
 > typed results, `BaseBackend` / `BaseCollection`, capability tokens, and most of
 > the §10 seam cleanup) landed ahead of this merge via [#1679](https://github.com/MemPalace/mempalace/pull/1679),
-> which ships in-tree `pgvector`, `qdrant`, and `sqlite_exact` backends. Three
-> areas this spec defines are tracked as follow-up implementation work and are
-> **not** yet built: the embedder-identity contract (§1.5 / §5), the maintenance
-> hooks (§7.3), and search-path metric-awareness (§10, `searcher.py`). Each is
-> flagged in its section. Accepting this RFC pins the contract those follow-ups
-> target; it does not assert the implementation is complete.
+> which ships in-tree `pgvector`, `qdrant`, and `sqlite_exact` backends. The three
+> areas originally deferred as follow-ups have since landed: embedder-identity
+> (§1.5 / §5, [#1731](https://github.com/MemPalace/mempalace/pull/1731) /
+> [#1734](https://github.com/MemPalace/mempalace/pull/1734)), maintenance hooks
+> (§7.3, [#1732](https://github.com/MemPalace/mempalace/pull/1732)), and searcher
+> metric-awareness (§10, [#1727](https://github.com/MemPalace/mempalace/pull/1727)).
+> Accepting this RFC pins the contract; remaining gaps are evolutionary, not
+> blocking.
 
 ## Summary
 
@@ -428,15 +430,22 @@ The `options` kwarg to `get_collection` is a free-form dict. Each backend docume
 
 Per-tenant collection-name prefixing is not a backend concern. It is handled by the resolver layer above backends: `PalaceRef.namespace` carries the tenant identifier. The `collection_prefix` concept from #697 dissolves into this model.
 
-**Isolation contract.** `PalaceRef.id` is the *required* isolation key for every backend: within a single backend instance, a record written for one `id` MUST NOT be returned, modified, or deleted by an operation issued for a different `id`. Cross-palace access is a spec violation.
+**Isolation contract.** `PalaceRef.id` is the *required* isolation key for every backend: within a single backend instance, a record written for one `id` MUST NOT be returned, modified, or deleted by an operation issued for a different `id`. Cross-palace access is a spec violation. This is the non-negotiable blanket MUST; multi-tenant deployments may cite it as their primary partition boundary even when they do not use `namespace`.
 
 `namespace` is *additional* partitioning. A backend that advertises `supports_namespace_isolation` (§2.1) MUST extend the same guarantee to namespaces:
 
 > A record written under one `namespace` MUST NOT be returned, modified, or deleted by an operation issued under a different `namespace` within the same backend instance. Cross-namespace access is a spec violation, not a caller misconfiguration.
 
-This is what hosted multi-tenant deployments cite as the basis for tenant isolation. Authorization (which namespaces a given request may touch) stays on the deployment side; the backend's job is to guarantee no bleed *within* the instance once the namespace is fixed.
+This is what hosted multi-tenant deployments cite as the basis for *namespace*-level tenant isolation. Authorization (which namespaces a given request may touch) stays on the deployment side; the backend's job is to guarantee no bleed *within* the instance once the namespace is fixed.
 
-A backend that does **not** advertise `supports_namespace_isolation` (e.g. `sqlite_exact`, whose isolation is the on-disk path alone) MAY ignore `namespace` entirely; callers MUST NOT rely on `namespace` for tenant isolation on such backends. Making isolation a declared capability rather than a blanket `MUST` is deliberate: path-rooted local backends already isolate by `local_path`, and forcing them to re-implement namespace partitioning would be ceremony with no security gain. The conformance suite (§7.1) exercises the namespace arm only for backends that advertise the token.
+Making namespace isolation a declared capability rather than a blanket `MUST` is deliberate: path-rooted local backends (e.g. `chroma`, `sqlite_exact`) already isolate by `local_path` / `id`, and forcing them to re-implement a second axis would be ceremony with no security gain.
+
+**Conformance arms.** Self-attestation is not enough. The isolation suite (`tests/_backend_conformance.py` / `assert_partition_isolation`) has two distinct arms:
+
+1. **Cross-`id` isolation** — required of every backend. Two `PalaceRef`s that differ only in `id` MUST NOT see each other's records.
+2. **Same-`id` / different-`namespace` isolation** — required of every backend that advertises `supports_namespace_isolation`. Two refs that share `id` (and, when applicable, `local_path`) but differ in `namespace` MUST NOT see each other's records. Distinct from arm 1; a backend that only passes arm 1 does not get to claim the capability.
+
+**No silent drop.** A backend that does **not** advertise `supports_namespace_isolation` MUST NOT silently accept and ignore a populated `namespace` — that is a latent cross-namespace leak, same spirit as `UnsupportedFilterError` for unknown operators. Such backends MUST either raise (e.g. `UnsupportedCapabilityError`) when `PalaceRef.namespace` is non-`None`, or honor the namespace and advertise the capability. Callers targeting path-rooted backends MUST leave `namespace` as `None`.
 
 ---
 
@@ -500,6 +509,9 @@ The suite covers:
 - Delete-then-query consistency
 - `close()` releases handles and further calls raise `BackendClosedError`
 - Concurrent `get_collection` across different palaces is safe
+- Isolation arm 1: cross-`PalaceRef.id` (every backend)
+- Isolation arm 2: same-`id` / different-`namespace` (only when `supports_namespace_isolation` is advertised; self-attestation without this arm is a conformance failure)
+- Non-advertising backends raise on a populated `namespace` rather than silently accepting it (§4.4)
 
 ### 7.2 Parametrized core suite
 

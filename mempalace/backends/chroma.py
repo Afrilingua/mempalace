@@ -2395,6 +2395,7 @@ class ChromaBackend(BaseBackend):
           — still used by callers not yet migrated.
         """
         palace_ref, collection_name, create, options = _normalize_get_collection_args(args, kwargs)
+        self.require_namespace_support(palace_ref)
 
         palace_path = palace_ref.local_path
         if palace_path is None:

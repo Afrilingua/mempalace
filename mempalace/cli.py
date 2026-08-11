@@ -1562,6 +1562,7 @@ def cmd_repair(args):
 
     import shutil
     from .backends.chroma import ChromaBackend
+    from .backups import copy_palace_dir
     from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import (
         RebuildCollectionError,
@@ -1779,7 +1780,7 @@ def cmd_repair(args):
             return
         shutil.rmtree(backup_path)
     print(f"  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path)
+    copy_palace_dir(palace_path, backup_path, log=print)
 
     try:
         filed = _rebuild_collection_via_temp(

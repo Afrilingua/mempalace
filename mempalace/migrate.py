@@ -29,7 +29,7 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
 
-from .backups import prune_backups
+from .backups import copy_palace_dir, prune_backups
 from .config import MempalaceConfig
 
 
@@ -316,7 +316,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = f"{palace_path}.pre-migrate.{timestamp}"
     print(f"\n  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path, symlinks=True)
+    copy_palace_dir(palace_path, backup_path, symlinks=True, log=print)
 
     # Enforce backup retention so repeated migrations cannot fill the disk
     # with full-palace copies. The backup we just created is the newest, so

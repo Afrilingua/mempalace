@@ -42,6 +42,12 @@ def _get_mp_context():
     return multiprocessing.get_context("spawn")
 
 
+def _isolate_home(monkeypatch, tmp_path):
+    """Point ``~`` at ``tmp_path`` on both POSIX (HOME) and Windows (USERPROFILE)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -112,13 +118,13 @@ def test_mine_palace_lock_reentrant_across_threads_same_process(tmp_path):
 
 
 def test_single_acquire_succeeds(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     with mine_palace_lock(str(tmp_path / "palace")):
         pass  # should not raise
 
 
 def test_lock_reusable_after_release(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
     with mine_palace_lock(palace):
         pass
@@ -129,7 +135,7 @@ def test_lock_reusable_after_release(tmp_path, monkeypatch):
 
 def test_same_palace_serializes_across_processes(tmp_path, monkeypatch):
     """Two processes contending for the same palace: second must be rejected."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
     ready = str(tmp_path / "ready")
     release = str(tmp_path / "release")
@@ -157,7 +163,7 @@ def test_same_palace_serializes_across_processes(tmp_path, monkeypatch):
 
 def test_different_palaces_dont_conflict(tmp_path, monkeypatch):
     """Mines against different palaces must NOT block each other."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace_a = str(tmp_path / "palace_a")
     palace_b = str(tmp_path / "palace_b")
     ready = str(tmp_path / "ready_a")
@@ -191,7 +197,7 @@ def test_palace_path_is_normalized(tmp_path, monkeypatch):
     — so we exercise the normalization invariant across a process boundary
     where re-entrance does not apply.)
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     monkeypatch.chdir(tmp_path)
     os.makedirs(tmp_path / "palace", exist_ok=True)
     absolute = str(tmp_path / "palace")
@@ -228,7 +234,7 @@ def test_reentrant_same_thread_passes_through(tmp_path, monkeypatch):
     entire mine pipeline). Without the per-thread re-entrant guard the inner
     acquire would self-deadlock on the outer flock.
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
     with mine_palace_lock(palace):
         # Re-enter from the same thread — must yield without raising or hanging.
@@ -288,7 +294,7 @@ def test_lock_failure_message_names_holder(tmp_path, monkeypatch):
     or stop. The new message includes ``PID N`` so the holder can be
     identified directly.
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
     ready = str(tmp_path / "ready")
     release = str(tmp_path / "release")
@@ -370,8 +376,7 @@ def test_lock_holder_identity_persists_across_release(tmp_path, monkeypatch):
     # ``os.path.expanduser("~")`` reads HOME on POSIX but USERPROFILE on
     # Windows; setting both makes the ``~/.mempalace/locks`` lookup land
     # under ``tmp_path`` regardless of platform.
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
     for _ in range(5):
         with mine_palace_lock(palace):
@@ -393,7 +398,7 @@ def test_lock_holder_identity_persists_across_release(tmp_path, monkeypatch):
 
 def test_mine_global_lock_is_alias_for_back_compat(tmp_path, monkeypatch):
     """Old callers of `mine_global_lock` should still work."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     assert mine_global_lock is mine_palace_lock
     with mine_global_lock(str(tmp_path / "palace")):
         pass  # the alias accepts the same palace_path argument
@@ -411,7 +416,7 @@ def test_holder_set_not_orphaned_by_interrupt_after_mark_held(tmp_path, monkeypa
     and the next re-entrant acquire in this process would pass through and
     write without the flock (two concurrent writers into one palace).
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     palace = str(tmp_path / "palace")
 
     before = set(palace_mod._palace_lock_keys)
@@ -475,7 +480,7 @@ def _hold_source_lock(source_file: str, ready_flag: str, release_flag: str) -> i
 
 def test_reap_removes_stale_unlocked_lock(tmp_path, monkeypatch):
     """A lock file that's old and held by nobody is safe to remove."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     lock_dir = tmp_path / ".mempalace" / "locks"
     lock_dir.mkdir(parents=True)
     stale = lock_dir / "0000000000000000.lock"
@@ -497,7 +502,7 @@ def test_reap_leaves_recently_touched_lock_alone(tmp_path, monkeypatch):
     only to avoid racing a lock that was just released and may still be
     mid-rendezvous with a waiter on the same pathname.
     """
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     lock_dir = tmp_path / ".mempalace" / "locks"
     lock_dir.mkdir(parents=True)
     fresh = lock_dir / "1111111111111111.lock"
@@ -513,7 +518,7 @@ def test_reap_never_removes_a_lock_held_by_another_process(tmp_path, monkeypatch
     """The core safety property: a lock genuinely held by a live process,
     however old it looks by mtime, is never removed — the age threshold is
     a courtesy throttle, the flock check is the actual safety mechanism."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     source_file = str(tmp_path / "some_source.py")
     ready = str(tmp_path / "ready")
     release = str(tmp_path / "release")
@@ -551,7 +556,7 @@ def test_reap_skips_mine_palace_prefixed_locks(tmp_path, monkeypatch):
     """mine_palace_*.lock belongs to the newer per-palace lock (mine_palace_lock)
     with its own lifecycle and holder tracking — this reaper targets only the
     per-source-file locks mine_lock creates, and must not touch those."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     lock_dir = tmp_path / ".mempalace" / "locks"
     lock_dir.mkdir(parents=True)
     palace_lock = lock_dir / "mine_palace_deadbeefdeadbeef.lock"
@@ -567,7 +572,7 @@ def test_reap_skips_mine_palace_prefixed_locks(tmp_path, monkeypatch):
 
 def test_reap_missing_lock_dir_is_a_noop(tmp_path, monkeypatch):
     """No ~/.mempalace/locks directory yet (fresh install) must not raise."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     reaped, skipped = reap_stale_mine_locks()
     assert (reaped, skipped) == (0, 0)
 
@@ -577,7 +582,7 @@ def test_maybe_reap_is_throttled(tmp_path, monkeypatch):
     lock created between two rapid-fire mine_lock calls must survive the
     second call because the reap itself was skipped, not because reaping
     failed."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    _isolate_home(monkeypatch, tmp_path)
     monkeypatch.setattr(palace_mod, "_LOCK_REAP_INTERVAL_SECONDS", 3600)
 
     with mine_lock(str(tmp_path / "a.py")):

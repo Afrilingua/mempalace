@@ -1093,7 +1093,7 @@ def test_status_does_not_cold_load_vector_index(palace_path, seeded_collection, 
 
     sentinel.assert_not_called()
     out = capsys.readouterr().out
-    assert "MemPalace Status — 4 drawers" in out
+    assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
     assert "WING: notes" in out
 
@@ -1128,7 +1128,7 @@ def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_
         status(palace_path)
 
     out = capsys.readouterr().out
-    assert "MemPalace Status — 4 drawers" in out
+    assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
 
 

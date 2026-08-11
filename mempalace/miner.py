@@ -1843,7 +1843,7 @@ def _mine_impl(
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
     if dry_run:
-        print("  DRY RUN — nothing will be filed")
+        print("  DRY RUN -- nothing will be filed")
     if not respect_gitignore:
         print("  .gitignore: DISABLED")
     if include_ignored:
@@ -2183,7 +2183,7 @@ def status(palace_path: str):
 def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {total} drawers")
+    print(f"  MemPalace Status -- {total} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

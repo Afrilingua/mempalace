@@ -166,7 +166,7 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
 
     samples = _gather_origin_samples(project_dir)
     if not samples:
-        print("  Skipping corpus-origin detection — no readable samples.")
+        print("  Skipping corpus-origin detection -- no readable samples.")
         return None
 
     # Tier 1 — always runs. Cheap regex grep, no API.
@@ -431,7 +431,7 @@ def cmd_init(args):
             registry_path = add_to_known_entities(confirmed, wing=wing)
             print(f"  Registry updated: {registry_path}")
     else:
-        print("  No entities detected — proceeding with directory-based rooms.")
+        print("  No entities detected -- proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
@@ -878,7 +878,7 @@ def cmd_sync(args):
     project_dirs = project_dirs or None
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Sync — Gitignore-aware drawer prune")
+    print("  MemPalace Sync -- Gitignore-aware drawer prune")
     print(f"{'=' * 55}")
     print(f"  Palace:   {palace_path}")
     if args.wing:
@@ -1183,7 +1183,7 @@ def cmd_hallways(args):
         config=MempalaceConfig(palace_path=palace_path),
     )
     if not rows:
-        print("No hallways yet — they are built from drawer entities when you mine.")
+        print("No hallways yet -- they are built from drawer entities when you mine.")
         return
     rows.sort(key=lambda h: h.get("co_occurrence_count", 0), reverse=True)
     print(f"  {len(rows)} hallway(s):")
@@ -1651,7 +1651,7 @@ def cmd_repair(args):
             # withholds success until FTS5 rebuild, VACUUM, and quick_check are
             # clean. Its exception already includes the retained destination
             # and archive/source recovery paths.
-            print("\n  Rebuild cleanup failed — see recovery details above.")
+            print("\n  Rebuild cleanup failed -- see recovery details above.")
             sys.exit(1)
         # An empty counts dict is rebuild_from_sqlite's documented signal
         # for a validation refusal (missing source, existing dest,
@@ -1985,12 +1985,12 @@ def cmd_serve(args):
     print(f"  palace   : {palace_path}")
     print(f"  backend  : {(backend or 'default').strip().lower() if backend else 'default'}")
     print(f"  bind     : {host}:{port}  ({'loopback' if loopback else 'network-exposed'})")
-    print(f"  tls      : {'on' if tls_cert else 'off (plaintext — terminate TLS at a proxy)'}")
+    print(f"  tls      : {'on' if tls_cert else 'off (plaintext -- terminate TLS at a proxy)'}")
     print(f"  read-only: {'yes' if args.read_only else 'no'}")
     if token_created:
         print("\n  A new bearer token was generated and stored 0600 at:")
         print(f"    {_server_token_path(palace_path)}")
-        print("  Store it securely — clients need it to connect:")
+        print("  Store it securely -- clients need it to connect:")
         print(f"    {token}")
     print("\nConnect a client:")
     if token:

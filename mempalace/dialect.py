@@ -1063,7 +1063,7 @@ if __name__ == "__main__":
         print("=== COMPRESSION STATS ===")
         print(f"JSON:     ~{stats['original_tokens_est']:,} tokens (est)")
         print(f"AAAK:     ~{stats['summary_tokens_est']:,} tokens (est)")
-        print(f"Ratio:    {stats['size_ratio']}x (lossy — information is lost)")
+        print(f"Ratio:    {stats['size_ratio']}x (lossy -- information is lost)")
         print()
         print("=== AAAK DIALECT OUTPUT ===")
         print(encoded)

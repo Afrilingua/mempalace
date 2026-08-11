@@ -2481,7 +2481,7 @@ def test_cmd_repair_dry_run_leaves_a_real_palace_byte_identical(tmp_path, capsys
     out = capsys.readouterr().out
     assert snapshot() == before
     assert not (tmp_path / "palace.backup").exists()
-    assert "DRY RUN — no changes will be made." in out
+    assert "DRY RUN -- no changes will be made." in out
     assert "holds 4 rows" in out
     assert "Repair complete" not in out
 

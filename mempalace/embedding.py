@@ -89,7 +89,7 @@ def _resolve_providers(device: str) -> tuple[list, str]:
     requested = _PROVIDER_MAP.get(device)
     if requested is None:
         if device not in _WARNED:
-            logger.warning("Unknown embedding_device %r — falling back to cpu", device)
+            logger.warning("Unknown embedding_device %r -- falling back to cpu", device)
             _WARNED.add(device)
         return (["CPUExecutionProvider"], "cpu")
 

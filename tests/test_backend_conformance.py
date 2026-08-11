@@ -45,7 +45,7 @@ def test_local_backends_do_not_claim_namespace_isolation():
 
 @pytest.mark.parametrize("backend_cls", _LOCAL_BACKENDS)
 def test_local_backends_reject_populated_namespace(backend_cls, tmp_path):
-    """RFC 001 §4.4 no-silent-drop: non-advertising backends MUST raise when
+    """RFC 001 section 4.4 no-silent-drop: non-advertising backends MUST raise when
     PalaceRef.namespace is set rather than accept-and-ignore."""
     from mempalace.backends.base import UnsupportedCapabilityError
 

@@ -368,8 +368,21 @@ def initialized_provider(provider, palace_path, tmp_dir):
     config_path = Path(tmp_dir) / "mempalace.json"
     config_path.write_text(json.dumps({"palace_path": palace_path}))
     provider.initialize("test-session-1", hermes_home=str(tmp_dir), platform="cli")
+    # Wait for the optional wake-up warm-up thread so later collection reads
+    # do not race the L1 scan under the same Chroma client.
+    provider._wake_up_done.wait(timeout=10)
     yield provider
     provider.shutdown()
+
+
+def _collection_snapshot(provider):
+    """Read metadatas under the provider lock after the worker drains."""
+    provider._worker_queue.join()
+    provider._wake_up_done.wait(timeout=10)
+    with provider._collection_lock:
+        col = provider._collection
+        assert col is not None
+        return col.get(include=["metadatas"]).get("metadatas") or []
 
 
 def test_initialize_opens_chroma_via_backend(initialized_provider):
@@ -394,11 +407,7 @@ def test_get_tool_schemas_returns_full_surface_after_initialize(initialized_prov
 
 def test_sync_turn_persists_through_worker(initialized_provider):
     initialized_provider.sync_turn("what's the plan?", "ship the PR")
-    initialized_provider._worker_queue.join()  # block until worker drains the task
-
-    col = initialized_provider._collection
-    assert col.count() >= 1
-    metas = col.get(include=["metadatas"]).get("metadatas") or []
+    metas = _collection_snapshot(initialized_provider)
     assert any(m.get("source") == "hermes" for m in metas)
 
 
@@ -410,9 +419,7 @@ def test_sync_turn_writes_canonical_drawer_metadata(initialized_provider):
     date filters — nothing errors, recall just degrades.
     """
     initialized_provider.sync_turn("meeting with Sarah about the Q3 roadmap", "noted")
-    initialized_provider._worker_queue.join()
-
-    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    metas = _collection_snapshot(initialized_provider)
     hermes_metas = [m for m in metas if m.get("source") == "hermes"]
     assert hermes_metas
     meta = hermes_metas[0]
@@ -438,9 +445,7 @@ def test_sync_turn_writes_canonical_drawer_metadata(initialized_provider):
 def test_sync_turn_routes_to_configured_wing(initialized_provider):
     initialized_provider._wing_config = {"wing_dev": {"keywords": ["pytest"]}}
     initialized_provider.sync_turn("running pytest -q", "all passed")
-    initialized_provider._worker_queue.join()
-
-    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    metas = _collection_snapshot(initialized_provider)
     assert any(m.get("wing") == "wing_dev" for m in metas)
 
 

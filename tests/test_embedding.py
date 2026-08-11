@@ -269,3 +269,52 @@ def test_embedding_collection_upsert_accepts_numpy_backed_vectors(tmp_path, monk
         assert col.get(ids=["drawer-1"]).documents == ["verbatim drawer text"]
     finally:
         backend.close()
+
+
+def test_embed_texts_handles_plain_sequence_embedders(monkeypatch):
+    """The ``float(x)`` fallback must convert plain sequences, not just ndarrays.
+
+    ``_embed_texts`` branches on ``hasattr(v, "tolist")``. The numpy side is
+    covered above, but the fallback exists for embedders that hand back plain
+    sequences (custom/BYO EFs, and rows that arrive as tuples), and nothing
+    exercised it — so a regression there would surface only in the field, on a
+    non-default embedder, as the same ChromaDB ``ValueError``.
+
+    Yields ``Decimal`` rather than ``float`` so the assertion proves a real
+    conversion happened rather than passing values through unchanged.
+    """
+    from decimal import Decimal
+
+    from mempalace.backends import embedding_wrapper as ew
+
+    class _PlainSequenceEmbeddingFunction:
+        def __call__(self, input):
+            return [(Decimal("0.5"), Decimal("0.25")) for _ in list(input or [])]
+
+    monkeypatch.setattr(
+        embedding, "get_embedding_function", lambda *_, **__: _PlainSequenceEmbeddingFunction()
+    )
+
+    vectors = ew._embed_texts(["a", "b"])
+
+    assert vectors == [[0.5, 0.25], [0.5, 0.25]]
+    for row in vectors:
+        assert isinstance(row, list)
+        assert all(type(x) is float for x in row), f"got {type(row[0])}, not builtin float"
+
+
+def test_embed_texts_short_circuits_on_empty_input(monkeypatch):
+    """Empty input must return ``[]`` without constructing an embedding function.
+
+    Callers pass empty batches (a drawer set fully filtered by dedup), and
+    loading the EF is the expensive part — on the ONNX default it spins up a
+    native session. Guards the early return so it cannot be refactored away.
+    """
+    from mempalace.backends import embedding_wrapper as ew
+
+    def _explode(*_, **__):
+        raise AssertionError("get_embedding_function must not be called for an empty batch")
+
+    monkeypatch.setattr(embedding, "get_embedding_function", _explode)
+
+    assert ew._embed_texts([]) == []

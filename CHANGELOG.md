@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Embeddings via any OpenAI-compatible `/v1/embeddings` endpoint.** New `embedding_model: "openai-compat"` option computes embeddings on a server (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted endpoint) instead of a local ONNX model — useful for larger/multilingual embedders such as Qwen3-Embedding, or GPU offload. New `OpenAICompatEmbeddingFunction` in [`mempalace/embedding.py`](mempalace/embedding.py) speaks the standard `/v1/embeddings` protocol over stdlib `urllib` (no new dependency), batches requests, re-sorts the response by `index`, and L2-normalizes for the cosine collection. Endpoint settings are resolved by `MempalaceConfig` as a single source of truth — `embedding_api_url` / `embedding_api_model` / `embedding_api_key` in `config.json`, each overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. The embedding function's `name()` encodes the model id so changing it forces `mempalace repair rebuild-index` (different vector space). Mirrors the existing `openai-compat` LLM provider naming; stays local when the endpoint is on your machine/LAN. (#1559)
+
 ---
 
 ## [3.7.0] — 2026-08-02
@@ -21,8 +25,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **EmbeddingGemma groups documents by size before sub-batching.** The tokenizer pads every row of a sub-batch to the longest sequence in it, so arrival order decided the bill: one long verbatim message dragged a whole sub-batch up to its own length. Measured over 43,157 `sweep` drawers from 160 Claude Code transcripts, padded token slots drop 39.7% and the quadratic attention term 45.0%. Vectors move by at most one float32 ULP (1.2e-07 absolute, cosine 0.99999992), which is reduction-order rounding and not a change of meaning. Applies to `embedding_model: embeddinggemma` only; the default MiniLM embedder pads to a fixed width and was never affected. (#2104)
 - **HNSW capacity probes are cached** and invalidated by palace file signature, so repeated MCP status/taxonomy paths no longer re-scan native segment files on every call. (#2051, #1471)
 - **`chunk_text` line numbering is O(N)** via incremental tallies, fixing multi-second hangs on large sources. (#2054, #2055)
-
-- **Embeddings via any OpenAI-compatible `/v1/embeddings` endpoint.** New `embedding_model: "openai-compat"` option computes embeddings on a server (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted endpoint) instead of a local ONNX model — useful for larger/multilingual embedders such as Qwen3-Embedding, or GPU offload. New `OpenAICompatEmbeddingFunction` in [`mempalace/embedding.py`](mempalace/embedding.py) speaks the standard `/v1/embeddings` protocol over stdlib `urllib` (no new dependency), batches requests, re-sorts the response by `index`, and L2-normalizes for the cosine collection. Endpoint settings are resolved by `MempalaceConfig` as a single source of truth — `embedding_api_url` / `embedding_api_model` / `embedding_api_key` in `config.json`, each overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. The embedding function's `name()` encodes the model id so changing it forces `mempalace repair rebuild-index` (different vector space). Mirrors the existing `openai-compat` LLM provider naming; stays local when the endpoint is on your machine/LAN. (#1559)
 
 ### Bug Fixes
 

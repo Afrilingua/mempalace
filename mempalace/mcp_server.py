@@ -3036,6 +3036,10 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": str(e)}
 
 
+class _ProtocolStdoutRestoreFailure(BaseException):
+    """Fatal loss of the MCP protocol stream after fd-level redirection."""
+
+
 def _capture_fd_stdout(fn):
     """Run ``fn()`` with its stdout captured at both the Python and fd level.
 
@@ -3063,29 +3067,67 @@ def _capture_fd_stdout(fn):
     import tempfile
 
     buf = io.StringIO()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    try:
-        saved_fd = os.dup(1)
-    except (OSError, AttributeError):
+
+    def _capture_python_stdout():
         with contextlib.redirect_stdout(buf):
             result = fn()
         return result, buf.getvalue()
 
     try:
-        with tempfile.TemporaryFile() as tmp:
-            os.dup2(tmp.fileno(), 1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except (OSError, AttributeError, ValueError):
+        return _capture_python_stdout()
+
+    try:
+        saved_fd = os.dup(1)
+    except (OSError, AttributeError, ValueError):
+        return _capture_python_stdout()
+
+    redirected = False
+    try:
+        try:
+            tmp_file = tempfile.TemporaryFile()
+        except (OSError, AttributeError, ValueError):
+            return _capture_python_stdout()
+
+        with tmp_file as tmp:
+            try:
+                os.dup2(tmp.fileno(), 1)
+            except (OSError, AttributeError, ValueError):
+                # No callback has run and fd 1 was not replaced. Use the
+                # documented Python-level fallback.
+                return _capture_python_stdout()
+            redirected = True
             try:
                 with contextlib.redirect_stdout(buf):
                     result = fn()
             finally:
-                sys.stdout.flush()
-                os.dup2(saved_fd, 1)
+                flush_error = None
+                try:
+                    sys.stdout.flush()
+                except (OSError, AttributeError, ValueError) as exc:
+                    flush_error = exc
+                try:
+                    os.dup2(saved_fd, 1)
+                except (OSError, AttributeError, ValueError) as exc:
+                    # Ordinary tool and protocol handlers catch Exception. A
+                    # failed restore is process-fatal instead: continuing could
+                    # emit JSON-RPC into the temporary file and hang the client.
+                    # Keep saved_fd open for diagnostics/emergency recovery;
+                    # process exit will release it.
+                    raise _ProtocolStdoutRestoreFailure(
+                        "failed to restore MCP protocol stdout"
+                    ) from exc
+                redirected = False
+                if flush_error is not None:
+                    raise flush_error
             tmp.seek(0)
             fd_text = tmp.read().decode("utf-8", "replace")
         return result, buf.getvalue() + fd_text
     finally:
-        os.close(saved_fd)
+        if not redirected:
+            os.close(saved_fd)
 
 
 def tool_mine(

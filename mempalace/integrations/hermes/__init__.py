@@ -80,7 +80,7 @@ from mempalace.config import (
 )
 from mempalace.convo_miner import file_conversation_exchange
 from mempalace.knowledge_graph import KnowledgeGraph
-from mempalace.layers import MemoryStack
+from mempalace.layers import Layer0
 from mempalace.searcher import search_memories
 
 # When this plugin is loaded by Hermes, ``agent.memory_provider`` is on the
@@ -97,6 +97,90 @@ except ImportError:  # pragma: no cover - Hermes not installed
 
 
 logger = logging.getLogger("mempalace.hermes")
+
+
+def _l1_story_from_collection(
+    collection, wing: str = "", max_drawers: int = 15, max_chars: int = 2400
+) -> str:
+    """Build Layer-1 essential-story text from an *already open* collection.
+
+    ``layers.Layer1`` opens a second ``PersistentClient`` via
+    ``palace.get_collection``. Concurrent with this provider's long-lived
+    client (and its background filing worker) that second client races
+    Chroma's local SQLite and surfaces as disk I/O errors / "Failed to get
+    segments". Keep all Chroma access on the single client the provider owns.
+    """
+    from collections import defaultdict
+    from pathlib import Path as _Path
+
+    docs: list = []
+    metas: list = []
+    batch = 500
+    offset = 0
+    max_scan = 2000
+    while True:
+        kwargs = {"include": ["documents", "metadatas"], "limit": batch, "offset": offset}
+        if wing:
+            kwargs["where"] = {"wing": wing}
+        try:
+            chunk = collection.get(**kwargs)
+        except Exception:
+            break
+        batch_docs = chunk.get("documents") or []
+        batch_metas = chunk.get("metadatas") or []
+        if not batch_docs:
+            break
+        docs.extend(batch_docs)
+        metas.extend(batch_metas)
+        offset += len(batch_docs)
+        if len(batch_docs) < batch or len(docs) >= max_scan:
+            break
+
+    if not docs:
+        return "## L1 -- No memories yet."
+
+    scored = []
+    for doc, meta in zip(docs, metas):
+        meta = meta or {}
+        doc = doc or ""
+        importance = 3.0
+        for key in ("importance", "emotional_weight", "weight"):
+            val = meta.get(key)
+            if val is not None:
+                try:
+                    importance = float(val)
+                except (TypeError, ValueError):
+                    pass
+                break
+        recency = str(meta.get("filed_at") or "")
+        scored.append((importance, recency, meta, doc))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = [(imp, meta, doc) for imp, _r, meta, doc in scored[:max_drawers]]
+
+    by_room: dict = defaultdict(list)
+    for imp, meta, doc in top:
+        by_room[meta.get("room", "general")].append((imp, meta, doc))
+
+    lines = ["## L1 -- ESSENTIAL STORY"]
+    total = 0
+    for room, entries in sorted(by_room.items()):
+        room_line = f"\n[{room}]"
+        lines.append(room_line)
+        total += len(room_line)
+        for _imp, meta, doc in entries:
+            source = _Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
+            snippet = (doc or "").strip().replace("\n", " ")
+            if len(snippet) > 200:
+                snippet = snippet[:197] + "..."
+            entry = f"  - {snippet}"
+            if source:
+                entry += f"  ({source})"
+            if total + len(entry) > max_chars:
+                lines.append("  ... (more in L3 search)")
+                return "\n".join(lines)
+            lines.append(entry)
+            total += len(entry)
+    return "\n".join(lines)
 
 
 # The palace path this provider last bridged into ``MEMPALACE_PALACE_PATH``
@@ -578,6 +662,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._worker_queue: queue.Queue = queue.Queue(maxsize=self.WORKER_QUEUE_MAX)
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
+        self._wake_up_done = threading.Event()
+        self._wake_up_done.set()  # no refresh in flight initially
 
         # initialize() must be serialised against concurrent re-entries so we
         # don't spawn two worker threads sharing one queue.
@@ -689,8 +775,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 self._worker_thread.start()
 
             # Warm the wake-up cache without blocking startup, but only if the
-            # backend is up — otherwise MemoryStack reads a half-set palace.
+            # backend is up. Uses the long-lived collection (no second client).
             if backend_ready:
+                self._wake_up_done.clear()
                 threading.Thread(
                     target=self._refresh_wake_up_cache,
                     daemon=True,
@@ -803,6 +890,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # drawers: ``filed_at`` is part of the drawer-id hash, so the upsert
         # cannot collapse the re-file into the original.
         # Regenerate the AAAK wake-up cache for the next session.
+        self._wake_up_done.clear()
         threading.Thread(
             target=self._refresh_wake_up_cache,
             daemon=True,
@@ -1126,13 +1214,37 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._identity = ""
 
     def _refresh_wake_up_cache(self) -> None:
+        """Rebuild L0+L1 using the long-lived collection only.
+
+        Opening a second PersistentClient (via MemoryStack/Layer1) while this
+        provider already holds one races local Chroma SQLite — disk I/O errors
+        and "Failed to get segments" on the filing worker and subsequent reads.
+        """
         try:
-            stack = MemoryStack(palace_path=self._palace_path)
-            wing = self._config.get("wing") or ""
-            self._wake_up_cache = stack.wake_up(wing=wing) or ""
+            identity = self._identity or ""
+            if not identity:
+                try:
+                    identity = Layer0().render()
+                except Exception:
+                    identity = ""
+            wing = str(self._config.get("wing") or "")
+            with self._collection_lock:
+                col = self._collection
+                if col is None:
+                    self._wake_up_cache = identity
+                    return
+                l1 = _l1_story_from_collection(col, wing=wing)
+            parts = []
+            if identity:
+                parts.append(identity)
+                parts.append("")
+            parts.append(l1)
+            self._wake_up_cache = "\n".join(parts)
         except Exception as exc:
             logger.debug("MemPalace wake-up refresh error: %s", exc)
             self._wake_up_cache = ""
+        finally:
+            self._wake_up_done.set()
 
     def _classify_wing(self, text: str) -> str:
         # If the user pinned a default wing in config, honor it without running
@@ -1151,31 +1263,34 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         assistant_msg = payload.get("assistant", "") or ""
         if not user_msg and not assistant_msg:
             return
-        with self._collection_lock:
-            col = self._collection
-        if col is None:
-            return
+        # Classify outside the lock — pure CPU / config, no Chroma access.
+        text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
+        wing = self._classify_wing(text)
+        session_id = payload.get("session_id") or ""
+        extra: Dict[str, Any] = {"source": "hermes"}
+        if session_id:
+            extra["session_id"] = session_id
+        # Hold the collection lock across the whole upsert so wake-up L1
+        # scans (same client) never interleave with writes mid-compactor.
         try:
-            text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
-            wing = self._classify_wing(text)
-            # Always file under a stable room name ("conversations"). Using
-            # session_id here would mint one room per session — pollutes
-            # ``mempalace_list_rooms`` and splits live writes from backfill
-            # drawers (which also write to "conversations"). The session id
-            # stays available on the dedicated metadata field below.
-            session_id = payload.get("session_id") or ""
-            extra: Dict[str, Any] = {"source": "hermes"}
-            if session_id:
-                extra["session_id"] = session_id
-            file_conversation_exchange(
-                col,
-                wing=wing,
-                room="conversations",
-                text=text,
-                source_file=f"hermes-session:{session_id or 'unknown'}",
-                agent="hermes",
-                extra_metadata=extra,
-            )
+            with self._collection_lock:
+                col = self._collection
+                if col is None:
+                    return
+                # Always file under a stable room name ("conversations"). Using
+                # session_id here would mint one room per session — pollutes
+                # ``mempalace_list_rooms`` and splits live writes from backfill
+                # drawers (which also write to "conversations"). The session id
+                # stays available on the dedicated metadata field below.
+                file_conversation_exchange(
+                    col,
+                    wing=wing,
+                    room="conversations",
+                    text=text,
+                    source_file=f"hermes-session:{session_id or 'unknown'}",
+                    agent="hermes",
+                    extra_metadata=extra,
+                )
         except Exception as exc:
             logger.debug("MemPalace _file_turn error: %s", exc)
 

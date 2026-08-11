@@ -6,6 +6,7 @@ Three ways to ingest:
   Projects:      mempalace mine ~/projects/my_app                  (code, docs, notes)
   Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Claude.ai, ChatGPT, Slack exports)
   Documents:     mempalace mine <docs-dir> --mode extract          (PDF, DOCX, PPTX, XLSX, RTF, EPUB — requires mempalace[extract])
+  Adapters:      mempalace mine <source> --source <adapter-name>  (registered source adapters)
 
 Same palace. Same search. Different ingest strategies.
 
@@ -15,6 +16,7 @@ Commands:
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
+    mempalace mine <source> --source NAME Mine through a registered source adapter
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
@@ -29,10 +31,12 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
-import os
-import sys
-import shlex
 import argparse
+import contextlib
+import os
+import shlex
+import sys
+import warnings
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -680,6 +684,8 @@ def _forward_mine_to_hub(args, palace_path: str) -> bool:
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    mode = getattr(args, "mode", None) or "projects"
+    source_adapter = getattr(args, "source", None)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -691,7 +697,7 @@ def cmd_mine(args):
     if getattr(args, "daemon", False):
         payload = {
             "source": args.dir,
-            "mode": args.mode,
+            "mode": mode,
             "wing": args.wing,
             "agent": args.agent,
             "limit": args.limit,
@@ -702,7 +708,29 @@ def cmd_mine(args):
             "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
             "redetect_origin": getattr(args, "redetect_origin", False),
         }
+        if source_adapter:
+            payload["source_adapter"] = source_adapter
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
+        return
+
+    from .palace import MineAlreadyRunning, MineValidationError
+
+    if source_adapter:
+        try:
+            drawers_written = mine_source_adapter(
+                source_name=source_adapter,
+                source_path=args.dir,
+                palace_path=palace_path,
+                dry_run=args.dry_run,
+            )
+        except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
+        suffix = " would be written" if args.dry_run else " written"
+        print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
         return
 
     # A live HTTP hub for this palace holds the MCP writer lease, so a
@@ -722,10 +750,8 @@ def cmd_mine(args):
             llm_provider=None,
         )
 
-    from .palace import MineAlreadyRunning, MineValidationError
-
     try:
-        if args.mode == "convos":
+        if mode == "convos":
             from .convo_miner import mine_convos
 
             mine_convos(
@@ -738,7 +764,7 @@ def cmd_mine(args):
                 extract_mode=args.extract,
                 include_subagents=getattr(args, "include_subagents", False),
             )
-        elif args.mode == "extract":
+        elif mode == "extract":
             from .format_miner import mine_formats
 
             mine_formats(
@@ -788,6 +814,170 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+class UnknownSourceAdapterError(ValueError):
+    """Raised when an explicit ``--source`` name is absent from the registry."""
+
+
+class UnsupportedSourceAdapterProtocolError(ValueError):
+    """Raised when an adapter requires runner semantics not implemented yet."""
+
+
+class _DryRunCollectionProxy:
+    """Empty collection facade that records, but never persists, writes.
+
+    Source adapters are deliberately allowed to access ``drawer_collection``
+    directly.  A dry run must not open the real backend: even read-only-looking
+    opens can create or repair backend artifacts (for example SQLite WAL files).
+    """
+
+    def __init__(self):
+        self.operations = []
+
+    def add(self, **kwargs):
+        self.operations.append(("add", kwargs))
+
+    def upsert(self, **kwargs):
+        self.operations.append(("upsert", kwargs))
+
+    def delete(self, **kwargs):
+        self.operations.append(("delete", kwargs))
+
+    def update(self, **kwargs):
+        self.operations.append(("update", kwargs))
+
+    def query(self, **kwargs):
+        from .backends import QueryResult
+
+        query_input = kwargs.get("query_texts", kwargs.get("query_embeddings"))
+        num_queries = len(query_input) if isinstance(query_input, (list, tuple)) else 1
+        include = kwargs.get("include") or []
+        return QueryResult.empty(
+            num_queries=num_queries,
+            embeddings_requested="embeddings" in include,
+        )
+
+    def get(self, **kwargs):
+        from .backends import GetResult
+
+        return GetResult.empty()
+
+    def count(self):
+        return 0
+
+
+class _DryRunKnowledgeGraphProxy:
+    """Recording no-op facade for the KG mutation surface published to adapters."""
+
+    def __init__(self):
+        self.operations = []
+
+    def add_entity(self, *args, **kwargs):
+        self.operations.append(("add_entity", args, kwargs))
+
+    def add_triple(self, *args, **kwargs):
+        self.operations.append(("add_triple", args, kwargs))
+
+    def invalidate(self, *args, **kwargs):
+        self.operations.append(("invalidate", args, kwargs))
+
+    def supersede(self, *args, **kwargs):
+        self.operations.append(("supersede", args, kwargs))
+
+
+def mine_source_adapter(
+    *,
+    source_name: str,
+    source_path: str,
+    palace_path: str,
+    dry_run: bool = False,
+) -> int:
+    """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
+
+    This deliberately sits alongside, rather than inside, the legacy mode
+    miners.  Until those miners are migrated to first-party adapters, no-flag
+    and ``--mode`` calls must retain their established dispatch paths.
+    """
+    from .knowledge_graph import KnowledgeGraph
+    from .palace import get_collection, mine_palace_lock
+    from .sources import (
+        DrawerRecord,
+        PalaceContext,
+        SourceRef,
+        SourceItemMetadata,
+        get_adapter,
+        resolve_adapter_for_source,
+    )
+
+    adapter_name = resolve_adapter_for_source(explicit=source_name)
+    try:
+        adapter = get_adapter(adapter_name)
+    except KeyError as exc:
+        raise UnknownSourceAdapterError(
+            f"unknown source adapter {adapter_name!r}; install its adapter package or "
+            "check the adapter name with `mempalace mine --help`"
+        ) from exc
+
+    if "supports_incremental" in adapter.capabilities:
+        raise UnsupportedSourceAdapterProtocolError(
+            f"source adapter {adapter_name!r} requires incremental ingestion, which "
+            "mempalace mine does not support yet"
+        )
+
+    # A dry run must never open a collection: backend opens can create or
+    # repair storage even when requested as read-only.  Non-dry runs hold one
+    # writer lease from handle creation through adapter iteration, including
+    # direct KG mutations by adapters.
+    lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
+    with lock:
+        knowledge_graph = None
+        try:
+            if dry_run:
+                drawer_collection = _DryRunCollectionProxy()
+                knowledge_graph = _DryRunKnowledgeGraphProxy()
+            else:
+                drawer_collection = get_collection(palace_path)
+                knowledge_graph = KnowledgeGraph(
+                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+                )
+            context = PalaceContext(
+                drawer_collection=drawer_collection,
+                knowledge_graph=knowledge_graph,
+                palace_path=palace_path,
+                config=MempalaceConfig(palace_path=palace_path),
+                adapter_name=adapter.name,
+                adapter_version=adapter.adapter_version,
+            )
+            drawers_written = 0
+            for result in adapter.ingest(
+                source=SourceRef(local_path=source_path),
+                palace=context,
+            ):
+                if isinstance(result, SourceItemMetadata):
+                    # Non-incremental adapters may report a cursor or version
+                    # while still doing a complete re-extract.  Incremental
+                    # adapters are rejected before ingest above, so accepting
+                    # this avoids a late partial-ingest failure.
+                    warnings.warn(
+                        f"Source adapter {adapter_name!r} yielded non-incremental item "
+                        "metadata; ignoring it during complete ingest",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                if isinstance(result, DrawerRecord):
+                    drawers_written += 1
+                    context.upsert_drawer(result)
+                    continue
+                raise TypeError(
+                    f"source adapter {adapter_name!r} yielded unsupported result type "
+                    f"{type(result).__name__}"
+                )
+            return drawers_written
+        finally:
+            if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+                knowledge_graph.close()
 
 
 def cmd_sweep(args):
@@ -2303,14 +2493,24 @@ def main():
         default=None,
         help="Storage backend to use for this mine (default: config/env/detected/chroma)",
     )
-    p_mine.add_argument(
+    mine_source_group = p_mine.add_mutually_exclusive_group()
+    mine_source_group.add_argument(
         "--mode",
         choices=["projects", "convos", "extract"],
-        default="projects",
+        default=None,
         help=(
             "Ingest mode: 'projects' for code/docs (default), 'convos' for chat "
             "exports, 'extract' for office documents (PDF/DOCX/RTF/etc., requires "
             "mempalace[extract])"
+        ),
+    )
+    mine_source_group.add_argument(
+        "--source",
+        default=None,
+        metavar="ADAPTER",
+        help=(
+            "Use a registered source adapter. Cannot be combined with --mode; "
+            "no --source preserves legacy projects-mode mining."
         ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")

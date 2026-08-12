@@ -1976,7 +1976,9 @@ def _seed_palace(palace_path, collection_name, rows):
 
     ``rows`` is a list of ``(id, document, metadata)`` tuples.
     """
-    from mempalace.backends.chroma import ChromaBackend
+    import gc
+
+    from mempalace.backends.chroma import ChromaBackend, _clear_chroma_system_cache
 
     backend = ChromaBackend()
     try:
@@ -1991,7 +1993,15 @@ def _seed_palace(palace_path, collection_name, rows):
         # caller proceeds. Without this, an in-place rebuild on Windows
         # fails with WinError 32 on data_level0.bin during the archive
         # rename (cf. PR #1310 test-windows job).
+        #
+        # Also drop the process-global SharedSystemClient cache: closing the
+        # backend releases our PersistentClient handle, but chromadb can keep
+        # the path-keyed System alive and on Windows that blocks renaming the
+        # palace directory (WinError 5 Access is denied). Seen on PR #2228
+        # ``test_rebuild_from_sqlite_raises_on_upsert_failure``.
         backend.close()
+        _clear_chroma_system_cache()
+        gc.collect()
 
 
 def test_extract_via_sqlite_returns_all_rows_with_metadata(tmp_path):

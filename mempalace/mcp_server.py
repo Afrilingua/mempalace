@@ -1373,6 +1373,13 @@ def _get_client():
         _refresh_vector_disabled_flag()
         if inode_changed or mtime_changed:
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
+            # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
+            # caches its System (and the live HNSW segment) keyed by path, so
+            # make_client() below would hand back the STALE segment, which then
+            # persists its outdated index over the peer's writes, driving the
+            # persisted count backwards. Drop chromadb's shared cache first so
+            # make_client() rebuilds the segment from the on-disk state.
+            _force_chroma_cache_reset()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _collection_cache_backend = None

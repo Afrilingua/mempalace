@@ -77,6 +77,40 @@ def test_mcp_main_strips_leaked_pythonpath_from_env():
     assert "ENV_AFTER: None" in result.stderr, f"MCP server did not strip PYTHONPATH: {diag}"
 
 
+def test_install_shutdown_signal_handlers_routes_term_to_system_exit():
+    """SIGTERM/SIGHUP must raise SystemExit so atexit can release the lease (#2205)."""
+    import signal
+
+    from mempalace import mcp_server
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        previous[sig] = signal.getsignal(sig)
+
+    try:
+        mcp_server._install_shutdown_signal_handlers()
+        term = signal.SIGTERM
+        handler = signal.getsignal(term)
+        assert callable(handler)
+        with pytest.raises(SystemExit) as exc_info:
+            handler(term, None)
+        assert exc_info.value.code == 0
+
+        sighup = getattr(signal, "SIGHUP", None)
+        if sighup is not None:
+            hup_handler = signal.getsignal(sighup)
+            assert callable(hup_handler)
+            with pytest.raises(SystemExit) as exc_info:
+                hup_handler(sighup, None)
+            assert exc_info.value.code == 0
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
 def _patch_mcp_server(monkeypatch, config, kg):
     """Patch the mcp_server module globals to use test fixtures."""
     from mempalace import mcp_server
@@ -3275,12 +3309,16 @@ class TestDeleteBySource:
     def test_dry_run_reports_closet_match_count(self, monkeypatch, config, palace_path, kg):
         """Dry run surfaces the closet blast radius (#1722) without deleting."""
         self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
+        self._seed_closets(palace_path)
         from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace import get_closets_collection
 
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
         assert result["dry_run"] is True
         assert result["closet_match_count"] == 2
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed System
+        # cache (#2002), so a handle taken before the call is dead by now.
+        closets_col = get_closets_collection(palace_path, create=False)
         # Nothing removed — all three closets still present.
         assert len(closets_col.get(include=[])["ids"]) == 3
 
@@ -3299,13 +3337,17 @@ class TestDeleteBySource:
         """Deleting by source purges the matching closets too, so the AAAK
         index keeps no stale pointers at the now-deleted drawers (#1722)."""
         self._seed(monkeypatch, config, palace_path, kg)
-        closets_col = self._seed_closets(palace_path)
+        self._seed_closets(palace_path)
         from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace import get_closets_collection
 
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
         assert result["success"] is True
         assert result["deleted"] == 2
         assert result["closets_deleted"] == 2
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed System
+        # cache (#2002), so a handle taken before the call is dead by now.
+        closets_col = get_closets_collection(palace_path, create=False)
         # The two benchmark closets are gone; the real-client closet survives.
         remaining = closets_col.get(include=["metadatas"])
         sources = {m["source_file"] for m in remaining["metadatas"]}
@@ -4768,6 +4810,51 @@ class TestStructuredErrors:
 
         assert len(quarantine_calls) == 1, (
             "_get_client should call _prepare_palace_for_open on reconnect"
+        )
+
+    def test_get_client_resets_chroma_system_cache_on_reconnect(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """``_get_client`` must clear chromadb's path-keyed System/HNSW cache
+        (via ``_force_chroma_cache_reset``) *before* calling ``make_client`` on an
+        inode/mtime reconnect. Otherwise chromadb hands back the stale in-memory
+        HNSW segment, which persists its outdated index over a peer writer's
+        on-disk changes, driving the persisted count backwards (#2002)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        # Prime the cache.
+        mcp_server._get_collection()
+
+        # Simulate a peer writer touching chroma.sqlite3 on disk.
+        old_mtime = mcp_server._palace_db_mtime
+        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+
+        order: list[str] = []
+        real_reset = mcp_server._force_chroma_cache_reset
+        real_make = ChromaBackend.make_client
+
+        def spy_reset():
+            order.append("reset")
+            real_reset()
+
+        @staticmethod
+        def spy_make(path):
+            order.append("make_client")
+            return real_make(path)
+
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", spy_reset)
+        monkeypatch.setattr(ChromaBackend, "make_client", spy_make)
+
+        mcp_server._get_client()
+
+        assert order == ["reset", "make_client"], (
+            "_get_client must reset chromadb's system cache BEFORE reopening the "
+            "client on a staleness reconnect (#2002)"
         )
 
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):

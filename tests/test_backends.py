@@ -1860,6 +1860,67 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
     ]
 
 
+def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatch):
+    """#2028: ``_client`` must drop chromadb's path-keyed ``SharedSystemClient``
+    cache *before* reconstructing ``PersistentClient`` on an inode/mtime change.
+
+    chromadb caches its ``System`` (and live HNSW segment) keyed by path, so a
+    bare reopen reuses the stale segment and persists an outdated index over a
+    peer/rebuild's on-disk changes -- the #2002 data-loss class reached via
+    ``_client`` instead of ``mcp_server._get_client``. The reset must fire only
+    on a genuine external change (not first open) and must precede the reopen.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+
+    events = []
+
+    # Neutralize the on-disk HNSW pre-checks so the test exercises only the
+    # cache-reset / client-rebuild ordering.
+    for _name in (
+        "_fix_missing_collection_type",
+        "_fix_blob_seq_ids",
+        "quarantine_invalid_hnsw_metadata",
+        "quarantine_stale_hnsw",
+    ):
+        monkeypatch.setattr(f"mempalace.backends.chroma.{_name}", lambda path, *a, **k: [])
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    class DummyClient:
+        pass
+
+    def _record_open(path):
+        events.append(("open", path))
+        return DummyClient()
+
+    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", _record_open)
+
+    from chromadb.api.client import SharedSystemClient
+
+    def _record_clear(*args, **kwargs):
+        events.append(("clear", None))
+
+    monkeypatch.setattr(SharedSystemClient, "clear_system_cache", _record_clear)
+
+    backend = ChromaBackend()
+    # ``_db_stat`` is called twice per ``_client`` call (freshness check, then
+    # re-stat after reopen). Same inode on the first call (first open, no prior
+    # freshness -> no reset), changed inode on the second (external change).
+    stats = iter([(1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)])
+    monkeypatch.setattr(backend, "_db_stat", lambda path: next(stats))
+
+    backend._client(str(palace))  # first open: no external change -> no clear
+    backend._client(str(palace))  # inode 1 -> 2: clear, then reopen
+
+    assert events == [
+        ("open", str(palace)),  # first open, no cache reset
+        ("clear", None),  # #2028: reset fires on the inode change...
+        ("open", str(palace)),  # ...strictly before the PersistentClient reopen
+    ], events
+
+
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     """When ChromaDB rejects a collection read due to an EF-name mismatch
     (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the

@@ -1548,6 +1548,33 @@ def _close_client(client) -> None:
         logger.debug("client.close() unavailable or failed", exc_info=True)
 
 
+def _clear_chroma_system_cache() -> None:
+    """Drop chromadb's process-global ``SharedSystemClient`` cache.
+
+    chromadb caches its ``System`` (and the live HNSW segment) keyed by path.
+    A bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
+    System, so after a peer/rebuild has changed ``chroma.sqlite3`` on disk we
+    would rebuild against the stale in-memory segment and persist an outdated
+    index over the on-disk changes -- the same data-loss class as #2002,
+    reached via :meth:`ChromaBackend._client` instead of
+    ``mcp_server._get_client``. This mirrors the reset already performed by
+    ``mcp_server._force_chroma_cache_reset`` and ``repair._close_chroma_handles``.
+
+    The clear is process-global (it evicts every palace's cached System, not
+    just this path); chromadb exposes no per-path eviction. It only fires on the
+    inode/mtime-change branch of ``_client``, never the steady-state hot path,
+    so the redundant rebuild cost is bounded to genuine external-change reopens.
+    """
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear):
+            clear()
+    except Exception:
+        logger.debug("Failed to clear chromadb SharedSystemClient cache", exc_info=True)
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -2292,6 +2319,14 @@ class ChromaBackend(BaseBackend):
                 or (mtime_appeared and palace_path in self._freshness)
             ):
                 ChromaBackend._quarantined_paths.discard(palace_path)
+                # #2028: the same external change means chromadb's path-keyed
+                # System cache is now stale. Reconstructing PersistentClient
+                # below would reuse the cached System (and its in-memory HNSW
+                # segment), so drop the shared cache first -- otherwise the
+                # rebuilt client persists an outdated index over the on-disk
+                # change. Gated on genuine external change (not first open) so
+                # cold opens never pay the global-evict cost.
+                _clear_chroma_system_cache()
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached

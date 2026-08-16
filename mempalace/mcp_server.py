@@ -3405,8 +3405,16 @@ def tool_mine(
         }
 
     src = os.path.expanduser(source) if source else ""
-    if not src or not os.path.isdir(src):
-        return {"success": False, "error": f"source directory not found: {source!r}"}
+    # convos accepts one conversation file as well as a directory — the CLI has
+    # always documented it that way ("Directory to mine, or one conversation
+    # file with --mode convos"), and the hooks rely on it: _ingest_transcript
+    # submits a single .jsonl. Because cmd_mine forwards to the hub whenever one
+    # is live, a directory-only precondition here made that documented form
+    # unreachable in the configuration most users run, so every hook transcript
+    # ingest failed against a running hub (#2281). The other modes still walk a
+    # tree, so they keep the directory requirement.
+    if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
+        return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():
         if mode == "convos":

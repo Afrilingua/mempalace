@@ -5332,6 +5332,7 @@ TOOLS = {
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
+            "mode='convos' also accepts a single conversation file. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
             "the mempalace[extract] extra). Runs synchronously and returns the miner's "
@@ -5344,7 +5345,7 @@ TOOLS = {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Directory to mine.",
+                    "description": "Directory to mine, or one conversation file with mode='convos'.",
                 },
                 "mode": {
                     "type": "string",

@@ -135,11 +135,11 @@ Delete a drawer by ID. Irreversible.
 
 ### `mempalace_mine`
 
-Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | string | **Yes** | Directory to mine |
+| `source` | string | **Yes** | Directory to mine, or one conversation file with `mode='convos'` |
 | `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
 | `wing` | string | No | Target wing (default: source directory name) |
 | `agent` | string | No | Recorded on every drawer (default: `mempalace`) |

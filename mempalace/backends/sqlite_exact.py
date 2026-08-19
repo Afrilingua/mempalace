@@ -330,6 +330,43 @@ def sqlite_wing_room_counts(
         return None
 
 
+def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped (room, wing, hall, n) rows for graph_stats, or ``None``."""
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            collection_id = int(row[0])
+            return list(
+                conn.execute(
+                    """
+                    SELECT json_extract(metadata_json, '$.room'),
+                           json_extract(metadata_json, '$.wing'),
+                           json_extract(metadata_json, '$.hall'),
+                           COUNT(*)
+                    FROM documents
+                    WHERE collection_id = ?
+                    GROUP BY 1, 2, 3
+                    """,
+                    (collection_id,),
+                )
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
     if not where_document:
         return True
@@ -664,23 +701,43 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc)
 
-    def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
+    def _rows(
+        self,
+        cur,
+        *,
+        where=None,
+        where_document=None,
+        limit=None,
+        offset=None,
+        spec: Optional[_IncludeSpec] = None,
+    ) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
+        spec = spec or _IncludeSpec.resolve(None, default_distances=False)
         collection_id = self._collection_id(cur)
-        sql = (
-            "SELECT id, document, metadata_json, embedding\n"
-            "FROM documents\n"
-            "WHERE collection_id = ?\n"
-            "ORDER BY rowid"
-        )
-        params = [collection_id]
-        # Emit SQL LIMIT/OFFSET only on an unfiltered page. With a
-        # where/where_document the post-filter loop below drops rows *after*
-        # this scan, so a SQL LIMIT/OFFSET would cut the wrong rows; those
-        # callers scan in full and paginate in Python. SQLite requires a LIMIT
-        # before OFFSET, so an offset-only page uses "LIMIT -1" (unbounded).
-        if where is None and where_document is None and (limit is not None or offset):
+        push = None if where_document else _equality_where_sql(where)
+        python_where = where is not None and push is None
+        need_doc = spec.documents or bool(where_document)
+        need_meta = spec.metadatas or python_where
+        need_emb = spec.embeddings
+        cols = ["id"]
+        if need_doc:
+            cols.append("document")
+        if need_meta:
+            cols.append("metadata_json")
+        if need_emb:
+            cols.append("embedding")
+        sql = f"SELECT {', '.join(cols)}\nFROM documents\nWHERE collection_id = ?"
+        params: list = [collection_id]
+        if push is not None and where:
+            extra_sql, extra_params = push
+            sql += " AND " + extra_sql
+            params.extend(extra_params)
+        sql += "\nORDER BY rowid"
+        # Equality where is applied in SQL, so LIMIT/OFFSET are safe there too.
+        # Python-side filters still have to scan, then slice.
+        can_limit = (not python_where) and not where_document
+        if can_limit and (limit is not None or offset):
             if limit is not None:
                 sql += "\nLIMIT ?"
                 params.append(int(limit))
@@ -689,23 +746,80 @@ class SQLiteExactCollection(BaseCollection):
             if offset:
                 sql += "\nOFFSET ?"
                 params.append(int(offset))
-        rows = cur.execute(sql, params).fetchall()
+        raw = cur.execute(sql, params).fetchall()
         out = []
-        for doc_id, doc, meta_json, emb_blob in rows:
-            meta = _json_loads(meta_json)
-            if not _matches_where(meta, where):
+        for row in raw:
+            idx = 1
+            doc = ""
+            meta: dict = {}
+            emb_blob = None
+            if need_doc:
+                doc = row[idx] or ""
+                idx += 1
+            if need_meta:
+                meta = _json_loads(row[idx])
+                idx += 1
+            if need_emb:
+                emb_blob = row[idx]
+            if python_where and not _matches_where(meta, where):
                 continue
-            if not _matches_where_document(doc or "", where_document):
+            if where_document and not _matches_where_document(doc, where_document):
                 continue
             out.append(
                 {
-                    "id": doc_id,
-                    "document": doc or "",
+                    "id": row[0],
+                    "document": doc,
                     "metadata": meta,
                     "embedding": emb_blob,
                 }
             )
         return out
+
+    def _rows_by_ids(self, cur, collection_id: int, ids: list[str], spec: _IncludeSpec) -> dict:
+        """Fetch requested columns for ``ids`` via ``IN``, keyed by id."""
+        unique = []
+        seen = set()
+        for doc_id in ids:
+            if doc_id not in seen:
+                seen.add(doc_id)
+                unique.append(doc_id)
+        if not unique:
+            return {}
+        cols = ["id"]
+        if spec.documents:
+            cols.append("document")
+        if spec.metadatas:
+            cols.append("metadata_json")
+        if spec.embeddings:
+            cols.append("embedding")
+        by_id: dict = {}
+        for start in range(0, len(unique), 900):
+            chunk = unique[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {', '.join(cols)} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
+                (collection_id, *chunk),
+            ):
+                idx = 1
+                doc = ""
+                meta: dict = {}
+                emb_blob = None
+                if spec.documents:
+                    doc = row[idx] or ""
+                    idx += 1
+                if spec.metadatas:
+                    meta = _json_loads(row[idx])
+                    idx += 1
+                if spec.embeddings:
+                    emb_blob = row[idx]
+                by_id[row[0]] = {
+                    "id": row[0],
+                    "document": doc,
+                    "metadata": meta,
+                    "embedding": emb_blob,
+                }
+        return by_id
 
     def query(
         self,
@@ -904,33 +1018,51 @@ class SQLiteExactCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        # Fast path for the common unfiltered page (e.g. the prefetch_mined_set
-        # and status sweeps): push LIMIT/OFFSET into the scan instead of
-        # materializing the whole collection and slicing in Python. Safe only
-        # with no post-filter (ids/where/where_document drop rows after the
-        # scan) and non-negative bounds: SQLite does not honor a negative LIMIT
-        # or OFFSET the way a Python slice does, so those keep the slice path.
+        # get(ids=...) must not scan the collection: look up by primary key.
+        if ids is not None and where is None and where_document is None:
+            with self._cursor() as cur:
+                collection_id = self._collection_id(cur)
+                by_id = self._rows_by_ids(cur, collection_id, list(ids), spec)
+            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+            return self._get_result(rows, spec)
+
+        # Unfiltered (or SQL-pushable equality) pages: LIMIT/OFFSET in SQL.
+        # Negative bounds stay on the Python slice path — SQLite does not
+        # honor a negative LIMIT/OFFSET the way a Python slice does.
+        python_where = bool(where_document) or (
+            where is not None and _equality_where_sql(where) is None
+        )
         push_page = (
-            ids is None
-            and where is None
-            and where_document is None
+            not python_where
             and (limit is None or limit >= 0)
             and (offset is None or offset >= 0)
             and (limit is not None or offset)
         )
         with self._cursor() as cur:
             if push_page:
-                rows = self._rows(cur, limit=limit, offset=offset)
+                rows = self._rows(
+                    cur,
+                    where=where,
+                    where_document=where_document,
+                    limit=limit,
+                    offset=offset,
+                    spec=spec,
+                )
             else:
-                rows = self._rows(cur, where=where, where_document=where_document)
+                rows = self._rows(cur, where=where, where_document=where_document, spec=spec)
         if not push_page:
-            if ids is not None:
-                by_id = {row["id"]: row for row in rows}
-                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
             if offset:
                 rows = rows[offset:]
             if limit is not None:
                 rows = rows[:limit]
+        return self._get_result(rows, spec)
+
+    @staticmethod
+    def _get_result(rows: list[dict], spec: _IncludeSpec) -> GetResult:
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],

@@ -187,12 +187,10 @@ def test_sqlite_exact_get_unfiltered_page_pushes_limit_offset(tmp_path):
     assert "OFFSET" in selects[0]
 
 
-def test_sqlite_exact_get_filtered_page_stays_on_full_scan(tmp_path):
+def test_sqlite_exact_get_equality_filter_pushes_limit(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 6)
 
-    # With a filter the rows are dropped after the scan, so LIMIT/OFFSET must
-    # not reach SQL; the page is taken in Python over the filtered rows.
     result, selects = _doc_select_sql(
         col,
         lambda: col.get(where={"wing": "w"}, limit=2, offset=1, include=["metadatas"]),
@@ -200,8 +198,10 @@ def test_sqlite_exact_get_filtered_page_stays_on_full_scan(tmp_path):
 
     assert result.ids == ["d1", "d2"]
     assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    assert "LIMIT" in selects[0]
+    assert "OFFSET" in selects[0]
+    assert "embedding" not in selects[0].split("FROM documents")[0]
+    assert "document" not in selects[0].split("FROM documents")[0]
 
 
 def test_sqlite_exact_get_offset_only_and_limit_only_push(tmp_path):
@@ -283,19 +283,22 @@ def test_sqlite_exact_get_offset_zero_is_a_full_scan(tmp_path):
     assert "OFFSET" not in selects[0]
 
 
-def test_sqlite_exact_get_ids_with_page_slices_in_python(tmp_path):
+def test_sqlite_exact_get_ids_looks_up_by_primary_key(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 5)
 
-    # ids force the Python path even with a page: the requested order is kept,
-    # then offset/limit slice the reordered list with no SQL LIMIT/OFFSET.
-    result, selects = _doc_select_sql(
-        col, lambda: col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
-    )
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
+    finally:
+        conn.set_trace_callback(None)
+
     assert result.ids == ["d3", "d2"]
-    assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    in_selects = [s for s in statements if "FROM documents" in s and "IN (" in s]
+    assert in_selects
+    assert all("ORDER BY rowid" not in s for s in in_selects)
 
 
 def test_sqlite_exact_upsert_delete_and_multi_collection_isolation(tmp_path):
@@ -891,6 +894,53 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     assert result["results"][0]["matched_via"] == "bm25_backend"
 
 
+def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeypatch):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.backends.sqlite_exact import SQLiteExactCollection
+    from mempalace.palace import get_collection, get_closets_collection
+    from mempalace.searcher import search_memories
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(
+        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+    )
+
+    drawers = get_collection(str(tmp_path), create=True)
+    closets = get_closets_collection(str(tmp_path), create=True)
+    drawers.add(
+        ids=["d1"],
+        documents=["meshguard trust path"],
+        metadatas=[{"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0}],
+    )
+    closets.add(
+        ids=["c1"],
+        documents=["topic|meshguard|→d1"],
+        metadatas=[{"source_file": "a.md", "wing": "w"}],
+    )
+
+    called = {"query": 0, "lex": 0}
+    orig_query = SQLiteExactCollection.query
+    orig_lex = SQLiteExactCollection.lexical_search
+
+    def wrapped_query(self, *args, **kwargs):
+        if self._collection_name == "mempalace_closets":
+            called["query"] += 1
+        return orig_query(self, *args, **kwargs)
+
+    def wrapped_lex(self, *args, **kwargs):
+        if self._collection_name == "mempalace_closets":
+            called["lex"] += 1
+        return orig_lex(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteExactCollection, "query", wrapped_query)
+    monkeypatch.setattr(SQLiteExactCollection, "lexical_search", wrapped_lex)
+
+    result = search_memories("meshguard", str(tmp_path), n_results=1)
+    assert "error" not in result
+    assert called["lex"] == 1
+    assert called["query"] == 0
+
+
 def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_path):
     import mempalace.searcher as searcher
 
@@ -1181,3 +1231,39 @@ def test_sqlite_exact_wing_room_counts(tmp_path):
     assert wing_rooms["alpha"]["notes"] == 1
     assert wing_rooms["alpha"]["code"] == 1
     assert wing_rooms["beta"]["notes"] == 1
+
+
+def test_sqlite_exact_get_metadatas_skips_document_and_embedding(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 3)
+
+    result, selects = _doc_select_sql(col, lambda: col.get(limit=2, include=["metadatas"]))
+    assert result.ids == ["d0", "d1"]
+    assert result.documents == []
+    assert result.embeddings is None
+    assert len(selects) == 1
+    select_list = selects[0].split("FROM documents")[0]
+    assert "metadata_json" in select_list
+    assert re.search(r"\bdocument\b", select_list) is None
+    assert "embedding" not in select_list
+
+
+def test_sqlite_exact_room_wing_hall_counts(tmp_path):
+    from mempalace.backends.sqlite_exact import sqlite_room_wing_hall_counts
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"room": "chromadb", "wing": "wing_code", "hall": "db"},
+            {"room": "chromadb", "wing": "wing_project", "hall": "db"},
+            {"room": "auth", "wing": "wing_code", "hall": "security"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    rows = sqlite_room_wing_hall_counts(str(tmp_path), "mempalace_drawers")
+    grouped = {(room, wing, hall): n for room, wing, hall, n in rows}
+    assert grouped[("chromadb", "wing_code", "db")] == 1
+    assert grouped[("chromadb", "wing_project", "db")] == 1
+    assert grouped[("auth", "wing_code", "security")] == 1

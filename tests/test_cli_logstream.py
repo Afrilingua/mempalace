@@ -7,6 +7,7 @@ and error exits. Uses SimpleNamespace args like the rest of test_cli.py.
 
 import json
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -495,3 +496,35 @@ class TestLogstreamWatch:
             )
         )
         assert _watch_payload(capsys)["count"] == 1
+
+    def test_idle_deadline_caps_the_poll(self, palace_path, capsys):
+        """--idle-exit-ms shorter than --poll-timeout-ms must not wait the poll."""
+        t0 = time.monotonic()
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(
+                    palace_path,
+                    agent="nobody-home",
+                    idle_exit_ms=200,
+                    poll_timeout_ms=5000,
+                )
+            )
+        elapsed = time.monotonic() - t0
+        assert exc.value.code == 2
+        assert elapsed < 1.5, f"idle 200ms waited {elapsed:.2f}s (poll was 5s)"
+
+    def test_match_does_not_checkpoint_if_output_fails(
+        self, palace_path, tmp_path, capsys, monkeypatch
+    ):
+        """A broken pipe after a match must not persist the cursor."""
+        state = str(tmp_path / "watch.json")
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        def boom(*_a, **_k):
+            raise OSError("broken pipe")
+
+        monkeypatch.setattr("json.dumps", boom)
+        with pytest.raises(OSError, match="broken pipe"):
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=state))
+        assert not (tmp_path / "watch.json").exists()

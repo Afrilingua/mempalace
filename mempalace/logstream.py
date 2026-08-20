@@ -966,6 +966,10 @@ class Logstream:
         so a caller can implement an idle timeout, emit a heartbeat, or
         checkpoint its cursor without running a second clock.
 
+        ``poll_timeout_ms`` may be a callable returning the timeout for
+        this iteration so a caller can cap it to a remaining idle
+        deadline (an idle of 400ms must not wait out a 300s long-poll).
+
         The cursor advances past every event *examined*, not merely those
         that matched, so a watcher that restarts never rescans what it has
         already judged. ``spec`` takes the set-valued filters described by
@@ -973,8 +977,14 @@ class Logstream:
         """
         pushdown = pushdown_watch_filters(spec)
         while True:
+            timeout = poll_timeout_ms() if callable(poll_timeout_ms) else poll_timeout_ms
+            if timeout is not None and int(timeout) <= 0:
+                # Idle deadline already elapsed: yield immediately so the
+                # caller can exit without waiting out the next long-poll.
+                yield [], cursor
+                continue
             result = self.wait_events(
-                timeout_ms=poll_timeout_ms,
+                timeout_ms=timeout,
                 since_event_id=cursor,
                 limit=limit,
                 poll_interval_s=poll_interval_s,

@@ -4594,8 +4594,10 @@ def _preview_event(event: dict) -> dict:
     Event bodies are stored verbatim and fleet status updates run to several
     KB, so listing many events full-body is a large payload. Preview keeps all
     routing/metadata fields and trims only ``body`` — enough to scan the stream
-    and decide which events to re-fetch in full (a targeted ``since_event_id``
-    call returns the untouched body)."""
+    and decide which events to re-fetch in full. ``since_event_id`` is
+    strictly *after* that id, so passing the truncated event's own id
+    skips it; repeat the original filters with ``preview=false`` (and
+    ``correlation_id`` / ``from_agent`` as needed) instead."""
     body = event.get("body") or ""
     if len(body) <= _PREVIEW_BODY_CHARS:
         return event
@@ -4623,8 +4625,9 @@ def tool_event_list(
 
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
-    stays cheap; re-fetch a specific event's full body with a targeted
-    ``since_event_id``.
+    stays cheap. ``since_event_id`` is strictly after that id, so do not
+    pass the truncated event's own id to re-fetch it — repeat the original
+    filters with ``preview=false``.
     """
     try:
         events = _call_logstream(
@@ -5532,8 +5535,10 @@ TOOLS = {
                     "type": "boolean",
                     "description": (
                         "Truncate each event body to a short excerpt (marks body_truncated +"
-                        " body_length) so scanning many events stays cheap; re-fetch a specific"
-                        " event's full body with a targeted since_event_id (default false)"
+                        " body_length) so scanning many events stays cheap. since_event_id is"
+                        " strictly AFTER that id, so do not pass the truncated event's own id"
+                        " to re-fetch it — repeat the original filters with preview=false"
+                        " (default false)"
                     ),
                 },
             },

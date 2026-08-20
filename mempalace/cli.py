@@ -1574,17 +1574,20 @@ def _logstream_watch(ls, args, as_json):
     idle_s = args.idle_exit_ms / 1000.0 if args.idle_exit_ms and args.idle_exit_ms > 0 else None
     deadline = time.monotonic() + idle_s if idle_s else None
     matched_any = False
+
+    def _poll_timeout_ms():
+        if deadline is None:
+            return args.poll_timeout_ms
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        return min(args.poll_timeout_ms, remaining_ms)
+
     try:
         for matched, cursor in ls.watch_events(
             cursor=cursor,
-            poll_timeout_ms=args.poll_timeout_ms,
+            poll_timeout_ms=_poll_timeout_ms,
             limit=args.limit,
             **spec,
         ):
-            # Checkpoint every advance, including idle ones: the cursor moves
-            # past events that were examined and rejected, and re-judging them
-            # after a restart is pure waste.
-            write_watch_cursor(args.state_file, cursor, agent=args.agent)
             if matched:
                 matched_any = True
                 if idle_s:
@@ -1608,9 +1611,15 @@ def _logstream_watch(ls, args, as_json):
                     for event in matched:
                         _print_event_line(event)
                     sys.stdout.flush()
+                # Matched batches checkpoint *after* stdout so a kill or
+                # broken pipe between the two replays the event instead of
+                # skipping it. Unmatched advances (below) are safe immediately:
+                # those events were examined and rejected.
+                write_watch_cursor(args.state_file, cursor, agent=args.agent)
                 if not args.follow:
                     return
                 continue
+            write_watch_cursor(args.state_file, cursor, agent=args.agent)
             if deadline is not None and time.monotonic() >= deadline:
                 if as_json:
                     print(

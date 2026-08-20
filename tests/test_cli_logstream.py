@@ -520,18 +520,29 @@ class TestLogstreamWatch:
     def test_match_does_not_checkpoint_if_output_fails(
         self, palace_path, tmp_path, capsys, monkeypatch
     ):
-        """A broken pipe after a match must not persist the cursor."""
-        state = str(tmp_path / "watch.json")
+        """A broken pipe after a match must not advance the cursor past it.
+
+        Asserting "no state file" would be pinning the symptom: since the
+        starting position is now checkpointed before the first poll, a file
+        legitimately exists. What must hold is that its cursor is still the
+        pre-match position, so the undelivered event replays on restart —
+        a duplicate, never a skip.
+        """
+        state = tmp_path / "watch.json"
         cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
-        capsys.readouterr()
+        matched_id = json.loads(capsys.readouterr().out)["id"]
 
         def boom(*_a, **_k):
             raise OSError("broken pipe")
 
         monkeypatch.setattr("json.dumps", boom)
         with pytest.raises(OSError, match="broken pipe"):
-            cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=state))
-        assert not (tmp_path / "watch.json").exists()
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=str(state)))
+
+        monkeypatch.undo()
+        stored = json.loads(state.read_text(encoding="utf-8"))["cursor"]
+        assert stored != matched_id, "cursor advanced past an event that was never delivered"
+        assert stored is None, "cursor should still be the pre-match starting position"
 
     def test_fresh_watch_starts_at_the_tip_not_the_beginning(self, palace_path, capsys):
         """A first watch must not replay the whole log.
@@ -705,3 +716,48 @@ class TestLogstreamWatch:
             )
         assert exc.value.code == 1
         assert "initial checkpoint" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_starting_cursor_is_checkpointed_before_the_first_poll(
+        self, palace_path, tmp_path, monkeypatch, capsys
+    ):
+        """Every entry path must checkpoint before polling, not after.
+
+        The starting position arrives three ways — an explicit
+        --since-event-id, the tip, or None (empty log / --from-start) — and
+        all three need the file on disk *before* the first poll. Deferring to
+        the first watch_events yield leaves a window of up to a full poll
+        timeout; an interrupt inside it leaves no file, so the next launch
+        calls itself a first run and jumps to the tip.
+
+        watch_events is stubbed to interrupt immediately, which is what makes
+        this pin the startup write. Letting the real loop run would pass on
+        the loop's own checkpoint instead, since the test poll timeout is
+        milliseconds rather than the five-minute default.
+        """
+        import mempalace.logstream as logstream_module
+
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        first_id = json.loads(capsys.readouterr().out)["id"]
+
+        def interrupt_before_yielding(*_a, **_k):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(logstream_module.Logstream, "watch_events", interrupt_before_yielding)
+
+        for label, overrides, expected in (
+            ("explicit cursor", {"since_event_id": first_id}, first_id),
+            ("tip", {}, first_id),
+            ("from-start", {"from_start": True}, None),
+        ):
+            state = tmp_path / f"{label.replace(' ', '_')}.json"
+            kwargs = {
+                "agent": "mac-claude",
+                "state_file": str(state),
+                "from_start": False,
+                **overrides,
+            }
+            with pytest.raises(SystemExit) as exc:
+                cmd_logstream(_watch_args(palace_path, **kwargs))
+            assert exc.value.code == 130
+            assert state.exists(), f"{label}: interrupted before any checkpoint landed"
+            assert json.loads(state.read_text(encoding="utf-8"))["cursor"] == expected, label

@@ -1612,21 +1612,26 @@ def _logstream_watch(ls, args, as_json):
         # what arrives from now on. Never silent: say what was skipped.
         cursor = ls.latest_event_id()
         skipped_from = cursor
-        # Record the starting position immediately, even when the log is
-        # empty and that position is None. Without the file, the next launch
-        # is indistinguishable from a first run and would jump past anything
-        # that arrived while this watcher was stopped — so unlike later
-        # checkpoints this one must not fail quietly.
-        if args.state_file:
-            try:
-                write_watch_cursor(args.state_file, cursor, agent=args.agent, required=True)
-            except OSError as exc:
-                _logstream_fail(
-                    f"could not write the initial checkpoint to {args.state_file}: {exc}. "
-                    "Refusing to start: without it a restart would skip every event "
-                    "that arrives before then.",
-                    as_json,
-                )
+
+    # One place decides the starting position; one place records it. That
+    # position can arrive three ways — an explicit --since-event-id, the tip
+    # above, or None (an empty log, or --from-start) — and every one of them
+    # needs the same immediate checkpoint when no state file exists yet.
+    # Deferring to the first watch_events yield leaves a window of up to a
+    # full poll timeout in which an interrupt leaves no file behind, and the
+    # next launch calls itself a first run and jumps to the tip, skipping
+    # whatever arrived in between. Unlike later checkpoints this one cannot
+    # fail quietly: losing it costs a skipped event, not a replay.
+    if args.state_file and state_condition == WATCH_STATE_ABSENT:
+        try:
+            write_watch_cursor(args.state_file, cursor, agent=args.agent, required=True)
+        except OSError as exc:
+            _logstream_fail(
+                f"could not write the initial checkpoint to {args.state_file}: {exc}. "
+                "Refusing to start: without it a restart would skip every event "
+                "that arrives before then.",
+                as_json,
+            )
     if not as_json:
         where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
         print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)

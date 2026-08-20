@@ -373,6 +373,10 @@ def _watch_args(palace, **overrides):
         correlation_id=None,
         since_event_id=None,
         state_file=None,
+        # These cases seed events and then watch for them, so they opt into
+        # the replay. The tip default is exercised explicitly by the
+        # first-run tests below.
+        from_start=True,
         follow=False,
         idle_exit_ms=400,
         poll_timeout_ms=60,
@@ -528,3 +532,38 @@ class TestLogstreamWatch:
         with pytest.raises(OSError, match="broken pipe"):
             cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=state))
         assert not (tmp_path / "watch.json").exists()
+
+    def test_fresh_watch_starts_at_the_tip_not_the_beginning(self, palace_path, capsys):
+        """A first watch must not replay the whole log.
+
+        Measured on a real shared brain, a cursorless watch woke holding 41
+        events, the oldest 49 days old — and nothing in the payload tells the
+        agent they are stale, so week-old task.requests read as new work.
+        The SSE live-tail already starts at the tip; the watcher now matches.
+        Backlog belongs to the inbox sweep.
+        """
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude", from_start=False))
+        assert exc.value.code == 2, "fresh watch replayed a pre-existing event"
+
+    def test_from_start_opts_back_into_the_replay(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        cmd_logstream(_watch_args(palace_path, agent="mac-claude", from_start=True))
+        assert _watch_payload(capsys)["count"] == 1
+
+    def test_tip_default_does_not_override_an_explicit_cursor(self, palace_path, capsys):
+        """--since-event-id and a state file must still win over the tip."""
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        first_id = json.loads(capsys.readouterr().out)["id"]
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(palace_path, agent="mac-claude", since_event_id=first_id, from_start=False)
+        )
+        assert _watch_payload(capsys)["count"] == 1

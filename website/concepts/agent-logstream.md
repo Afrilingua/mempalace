@@ -174,7 +174,10 @@ wakes itself on every status it posts. Repeating a filter means "or", which is
 how you narrow to the events that genuinely require you and stop being woken by
 routine traffic. Exit is `0` on a match and `2` on `--idle-exit-ms`, matching
 `wait`'s timeout convention; `--follow` keeps the process alive past the first
-match for daemons.
+match for daemons. A cursorless first run starts at the tip, like the SSE
+live-tail, and says so on stderr — replaying a long fleet log would wake a new
+watcher holding weeks of history it cannot tell is stale. `--from-start` opts
+into the replay.
 
 `mempalace_event_wait` backs off internally (0.25s → 1s), so a tight retry
 loop around it buys nothing. Filter server-side — `to_agent`, `type`,

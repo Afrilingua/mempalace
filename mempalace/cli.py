@@ -1567,9 +1567,25 @@ def _logstream_watch(ls, args, as_json):
         "correlation_ids": normalize_watch_values(args.correlation_id),
     }
     cursor = args.since_event_id or read_watch_cursor(args.state_file)
+    skipped_from = None
+    if cursor is None and not args.from_start:
+        # Start at the tip, like the SSE live-tail does at connect time.
+        # Starting from the beginning of a long fleet log means a fresh
+        # watcher wakes holding weeks of history and cannot tell it is
+        # stale — measured 41 events, the oldest 49 days old, on a real
+        # shared brain. Backlog is the inbox sweep's job; a watcher is for
+        # what arrives from now on. Never silent: say what was skipped.
+        cursor = ls.latest_event_id()
+        skipped_from = cursor
     if not as_json:
         where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
         print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)
+    if skipped_from:
+        print(
+            f"Starting at the tip ({skipped_from}); earlier events are not replayed. "
+            "Use --from-start to replay them, or sweep with `mempalace logstream list`.",
+            file=sys.stderr,
+        )
 
     idle_s = args.idle_exit_ms / 1000.0 if args.idle_exit_ms and args.idle_exit_ms > 0 else None
     deadline = time.monotonic() + idle_s if idle_s else None
@@ -3190,6 +3206,14 @@ def main():
         "--state-file",
         default=None,
         help="Persist the cursor here so a restart resumes exactly where it stopped",
+    )
+    p_ls_watch.add_argument(
+        "--from-start",
+        action="store_true",
+        help=(
+            "Replay the log from the beginning when there is no cursor "
+            "(default: start at the tip, like the SSE live-tail)"
+        ),
     )
     p_ls_watch.add_argument(
         "--follow",

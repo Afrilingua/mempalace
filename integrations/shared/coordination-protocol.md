@@ -126,6 +126,10 @@ mempalace logstream watch \
   `logstream wait`.
 - **`--follow`** keeps going after the first match instead of exiting — use
   it for daemons; leave it off for harnesses that wake on process exit.
+- **A first watch starts at the tip**, matching the SSE live-tail, and says so
+  on stderr. Replaying a long fleet log would wake you holding weeks of
+  history with nothing marking it stale. Backlog is the inbox sweep's job;
+  pass `--from-start` if you really do want the replay.
 
 Notes that save round trips:
 

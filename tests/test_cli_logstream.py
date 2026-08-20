@@ -817,3 +817,58 @@ class TestLogstreamWatch:
             _watch_args(palace_path, agent="mac-claude", state_file=str(state), from_start=False)
         )
         assert _watch_payload(capsys)["count"] == 1, "stranded instead of replaying"
+
+    def test_repeated_filters_are_validated_like_single_ones(self, palace_path, capsys):
+        """Validation must not depend on how many values you passed.
+
+        A single-valued filter is pushed down to list_events and sanitized
+        for free; a repeated one is not, so it was compared raw. That made
+        `--type Task.Request` an error alone but silently accepted alongside
+        a second value — and then it matched nothing, so the watcher waited
+        forever for an event type that cannot exist.
+        """
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(
+                    palace_path,
+                    agent="mac-claude",
+                    type=["Task.Request", "patch.ready"],
+                )
+            )
+        assert exc.value.code == 1
+        assert "Task.Request" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_repeated_status_and_routing_are_validated_too(self, palace_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(palace_path, agent="mac-claude", status=["open", "not_a_status"])
+            )
+        assert exc.value.code == 1
+        assert "not_a_status" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_repeated_routing_values_are_normalized(self, palace_path, capsys):
+        """Whitespace in a repeated value must not quietly stop it matching."""
+        cmd_logstream(
+            _append_args(
+                palace_path,
+                to_agent="mac-claude",
+                from_agent="windows-grok",
+                stream="project/mempalace",
+            )
+        )
+        capsys.readouterr()
+        cmd_logstream(
+            _watch_args(
+                palace_path,
+                agent="mac-claude",
+                stream=["  project/mempalace  ", "project/other"],
+            )
+        )
+        assert _watch_payload(capsys)["count"] == 1
+
+    def test_invalid_limit_is_a_cli_error_not_a_traceback(self, palace_path, capsys):
+        """--json consumers must get an error document, never a stack trace."""
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude", limit=0))
+        assert exc.value.code == 1
+        assert "limit" in json.loads(capsys.readouterr().out)["error"]

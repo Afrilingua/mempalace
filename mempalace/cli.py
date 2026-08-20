@@ -1550,27 +1550,34 @@ def _watch_json(payload, *, follow: bool) -> str:
     )
 
 
-def _logstream_watch(ls, args, as_json):
-    """Run ``logstream watch`` — block until interesting events arrive.
+def _watch_spec(args, as_json) -> dict:
+    """Validate ``logstream watch`` arguments and build its filter spec.
 
-    Split out of ``cmd_logstream`` so that dispatcher stays under the
-    complexity gate: this branch carries cursor persistence, an idle timeout,
-    and follow-vs-exit semantics that no other subcommand needs.
-
-    Exit contract, chosen so a harness can background this process and treat
-    its exit as a wake-up: return (0) when a match was printed, 2 when the
-    idle timeout expired having seen nothing — the same convention
-    ``logstream wait`` uses for a timeout.
+    Kept apart from the watch loop so every bad input is rejected before any
+    polling, any cursor resolution, and any checkpoint write — several of the
+    bugs on this path were arguments that only failed once the loop had
+    already started and persisted state.
     """
-    import time
+    from .logstream import normalize_watch_values, sanitize_watch_spec
 
-    from .logstream import (
-        WATCH_STATE_ABSENT,
-        WATCH_STATE_CORRUPT,
-        normalize_watch_values,
-        read_watch_state,
-        write_watch_cursor,
-    )
+    if args.poll_timeout_ms is not None and args.poll_timeout_ms <= 0:
+        # A configured zero would make watch_events' expired-deadline branch
+        # yield forever without ever polling, burning a core.
+        _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
+    if args.limit is not None and args.limit < 1:
+        # argparse accepts it; list_events would raise mid-loop, where the
+        # only handler is for KeyboardInterrupt — a traceback, and under
+        # --json no error document at all.
+        _logstream_fail("--limit must be a positive integer", as_json)
+    if args.idle_exit_ms is not None and args.idle_exit_ms < 0:
+        # Only 0 means "wait forever". A negative value arriving from config
+        # or from timeout arithmetic would otherwise take that same branch
+        # silently, leaving a harness waiting on a watcher it believes will
+        # time out.
+        _logstream_fail(
+            "--idle-exit-ms must be zero (wait forever) or a positive number of milliseconds",
+            as_json,
+        )
 
     to_agents = list(args.to_agent or [])
     exclude = list(args.exclude_from_agent or [])
@@ -1590,19 +1597,36 @@ def _logstream_watch(ls, args, as_json):
         "exclude_from_agents": normalize_watch_values(exclude),
         "correlation_ids": normalize_watch_values(args.correlation_id),
     }
-    if args.poll_timeout_ms is not None and args.poll_timeout_ms <= 0:
-        # A configured zero would make watch_events' expired-deadline branch
-        # yield forever without ever polling, burning a core.
-        _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
-    if args.idle_exit_ms is not None and args.idle_exit_ms < 0:
-        # Only 0 means "wait forever". A negative value arriving from config
-        # or from timeout arithmetic would otherwise take that same branch
-        # silently, leaving a harness waiting on a watcher it believes will
-        # time out.
-        _logstream_fail(
-            "--idle-exit-ms must be zero (wait forever) or a positive number of milliseconds",
-            as_json,
-        )
+    try:
+        spec = sanitize_watch_spec(spec)
+    except ValueError as exc:
+        _logstream_fail(str(exc), as_json)
+
+    return spec
+
+
+def _logstream_watch(ls, args, as_json):
+    """Run ``logstream watch`` — block until interesting events arrive.
+
+    Split out of ``cmd_logstream`` so that dispatcher stays under the
+    complexity gate: this branch carries cursor persistence, an idle timeout,
+    and follow-vs-exit semantics that no other subcommand needs.
+
+    Exit contract, chosen so a harness can background this process and treat
+    its exit as a wake-up: return (0) when a match was printed, 2 when the
+    idle timeout expired having seen nothing — the same convention
+    ``logstream wait`` uses for a timeout.
+    """
+    import time
+
+    from .logstream import (
+        WATCH_STATE_ABSENT,
+        WATCH_STATE_CORRUPT,
+        read_watch_state,
+        write_watch_cursor,
+    )
+
+    spec = _watch_spec(args, as_json)
 
     stored_cursor, state_condition = read_watch_state(args.state_file)
     # A missing cursor is four different facts, and only one of them may
@@ -1749,6 +1773,12 @@ def _logstream_watch(ls, args, as_json):
         if not as_json:
             print("Stopped.", file=sys.stderr)
         sys.exit(130)
+    except ValueError as exc:
+        # Backstop. Every known bad input is rejected before the loop
+        # starts, but a validation error escaping mid-poll would otherwise
+        # surface as a traceback — and under --json as no error document at
+        # all, which a machine consumer cannot distinguish from a crash.
+        _logstream_fail(str(exc), as_json)
 
 
 def cmd_logstream(args):

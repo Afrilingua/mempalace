@@ -242,6 +242,41 @@ def event_matches_watch(
     )
 
 
+def sanitize_watch_spec(spec: dict) -> dict:
+    """Validate and normalize every value in a watch spec.
+
+    ``list_events`` sanitizes the filters it is given, so a *single-valued*
+    watch filter is checked for free by being pushed down. Multi-valued ones
+    are not pushed down and were therefore compared raw, which made
+    validation depend on how many values you happened to pass:
+    ``--type Task.Request`` alone was rejected, while
+    ``--type Task.Request --type patch.ready`` was silently accepted and then
+    matched nothing, leaving the watcher waiting forever for an event type
+    that cannot exist.
+
+    Sanitizing here — with the same functions ``list_events`` uses — makes
+    the two paths agree, and normalizes values (stripping whitespace) so a
+    padded routing value still matches. Raises ``ValueError`` naming the
+    offending value.
+    """
+    sanitized = {}
+    for key, field in (
+        ("streams", "stream"),
+        ("rooms", "room"),
+        ("to_agents", "to_agent"),
+        ("from_agents", "from_agent"),
+        ("exclude_from_agents", "exclude_from_agent"),
+        ("correlation_ids", "correlation_id"),
+    ):
+        values = spec.get(key)
+        sanitized[key] = {_sanitize_routing(v, field) for v in values} if values else values
+    types = spec.get("types")
+    sanitized["types"] = {_sanitize_event_type(v) for v in types} if types else types
+    statuses = spec.get("statuses")
+    sanitized["statuses"] = {_sanitize_status(v) for v in statuses} if statuses else statuses
+    return sanitized
+
+
 def pushdown_watch_filters(spec: dict) -> dict:
     """The subset of a watch spec that ``list_events`` can evaluate in SQL.
 

@@ -4594,8 +4594,10 @@ def _preview_event(event: dict) -> dict:
     Event bodies are stored verbatim and fleet status updates run to several
     KB, so listing many events full-body is a large payload. Preview keeps all
     routing/metadata fields and trims only ``body`` — enough to scan the stream
-    and decide which events to re-fetch in full (a targeted ``since_event_id``
-    call returns the untouched body)."""
+    and decide which events to re-fetch in full. ``since_event_id`` is
+    strictly *after* that id, so passing the truncated event's own id
+    skips it; repeat the original filters with ``preview=false`` (and
+    ``correlation_id`` / ``from_agent`` as needed) instead."""
     body = event.get("body") or ""
     if len(body) <= _PREVIEW_BODY_CHARS:
         return event
@@ -4623,8 +4625,9 @@ def tool_event_list(
 
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
-    stays cheap; re-fetch a specific event's full body with a targeted
-    ``since_event_id``.
+    stays cheap. ``since_event_id`` is strictly after that id, so do not
+    pass the truncated event's own id to re-fetch it — repeat the original
+    filters with ``preview=false``.
     """
     try:
         events = _call_logstream(
@@ -5487,8 +5490,16 @@ TOOLS = {
     },
     "mempalace_event_list": {
         "description": (
-            "List agent-coordination events with structured filters, oldest first. Use"
-            " since_event_id as the precise resume cursor (strictly after that event)."
+            "List agent-coordination events with structured filters, oldest first (append"
+            " order, not timestamp order). Use since_event_id as the resume cursor: it means"
+            " strictly after that event in append order, so it cannot skip anything. Do NOT"
+            " resume with since_created_at — a peer's event syncs in whenever it arrives, so"
+            " it can already be older than a timestamp cursor and be missed permanently;"
+            " since_created_at is a time window ('what happened today'), not a cursor. Store"
+            " the id of the last event you processed — that is your whole watcher state. Pass"
+            " preview=true when sweeping a busy stream. to_agent=<you> also matches '*'"
+            " broadcasts, so no second call is needed. To wait for something that has not"
+            " happened yet, use mempalace_event_wait instead of polling this."
         ),
         "input_schema": {
             "type": "object",
@@ -5513,8 +5524,10 @@ TOOLS = {
                 "since_created_at": {
                     "type": "string",
                     "description": (
-                        "Return events created at or after this time"
-                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                        "Time window filter, inclusive: events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). NOT a resume cursor"
+                        " — use since_event_id for that; a timestamp cursor silently drops"
+                        " peer events that sync in late. Dedup by id when using this."
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
@@ -5522,8 +5535,10 @@ TOOLS = {
                     "type": "boolean",
                     "description": (
                         "Truncate each event body to a short excerpt (marks body_truncated +"
-                        " body_length) so scanning many events stays cheap; re-fetch a specific"
-                        " event's full body with a targeted since_event_id (default false)"
+                        " body_length) so scanning many events stays cheap. since_event_id is"
+                        " strictly AFTER that id, so do not pass the truncated event's own id"
+                        " to re-fetch it — repeat the original filters with preview=false"
+                        " (default false)"
                     ),
                 },
             },
@@ -5532,8 +5547,14 @@ TOOLS = {
     },
     "mempalace_event_wait": {
         "description": (
-            "Block until a matching coordination event exists or the timeout expires (max 5"
-            " minutes). Returns {timed_out: true, events: []} on timeout instead of an error."
+            "Block until a matching coordination event exists or the timeout expires (default"
+            " 60s, max 5 minutes). Returns {timed_out: true, events: []} on timeout — a normal"
+            " result, not an error. This is the right tool for actively waiting on a"
+            " correlation_id you delegated or claimed. It already backs off internally, so do"
+            " not wrap it in a tight retry loop: on timeout just call it again with"
+            " since_event_id updated to the last event you processed. For long-lived consumers"
+            " (daemons, dashboards) prefer the push stream at GET /logstream/stream, which"
+            " takes the same filters and the same since_event_id resume."
         ),
         "input_schema": {
             "type": "object",
@@ -5558,8 +5579,8 @@ TOOLS = {
                 "since_created_at": {
                     "type": "string",
                     "description": (
-                        "Only match events created at or after this time"
-                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                        "Time window filter, inclusive (optional). NOT a resume cursor — use"
+                        " since_event_id, which cannot skip a late-syncing peer event."
                     ),
                 },
                 "timeout_ms": {

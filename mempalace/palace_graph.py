@@ -66,30 +66,56 @@ _graph_cache_time = 0.0
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
+def sqlite_grouped_counts_reader(config=None):
+    """Return the backend's grouped-counts function, or ``None``.
+
+    ``None`` means the sqlite path cannot serve this palace and the caller
+    should use the collection — which is also how a missing or unreadable
+    palace keeps reporting a real diagnostic instead of an empty graph.
+
+    The backend is resolved from *configuration*, not by sniffing the palace
+    directory for db files: a directory holding artifacts for two backends is
+    a ``BackendMismatchError`` on every normal path, and sniffing would quietly
+    pick one instead of surfacing that.
+    """
+    config = config or MempalaceConfig()
+    if not config.palace_path:
+        return None
+    try:
+        from .palace import resolve_backend_name
+
+        backend = resolve_backend_name(
+            config.palace_path, explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT")
+        )
+        if backend == "chroma":
+            from .backends.chroma import sqlite_room_wing_hall_counts
+
+            db_name = "chroma.sqlite3"
+        elif backend == "sqlite_exact":
+            from .backends.sqlite_exact import _DB_FILENAME as db_name
+            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
+        else:
+            return None
+        if not os.path.isfile(os.path.join(config.palace_path, db_name)):
+            return None
+        return sqlite_room_wing_hall_counts
+    except Exception:
+        logger.debug("backend resolution for the sqlite graph path failed", exc_info=True)
+    return None
+
+
 def _try_sqlite_nodes_edges(config=None):
     """Build graph nodes/edges from backend sqlite metadata, no HNSW.
 
     Returns ``(nodes, edges)`` or ``None`` when the palace is not a sqlite
-    backend we know how to read. Dates are omitted (empty lists) — tunnel
-    ``recent`` stays blank on this path.
+    backend we know how to read, so the caller falls back to client paging.
     """
     config = config or MempalaceConfig()
-    palace = config.palace_path
-    name = config.collection_name
-    if not palace:
+    reader = sqlite_grouped_counts_reader(config)
+    if reader is None:
         return None
-    rows = None
-    chroma_db = os.path.join(palace, "chroma.sqlite3")
-    exact_db = os.path.join(palace, "sqlite_exact.sqlite3")
     try:
-        if os.path.isfile(chroma_db):
-            from .backends.chroma import sqlite_room_wing_hall_counts
-
-            rows = sqlite_room_wing_hall_counts(palace, name)
-        elif os.path.isfile(exact_db):
-            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
-
-            rows = sqlite_room_wing_hall_counts(palace, name)
+        rows = reader(config.palace_path, config.collection_name)
     except Exception:
         logger.debug("sqlite graph path failed; falling back to client paging", exc_info=True)
         return None
@@ -99,15 +125,24 @@ def _try_sqlite_nodes_edges(config=None):
 
 
 def _nodes_edges_from_grouped_rows(rows):
-    """Mirror ``build_graph``'s per-drawer filter from ``(room, wing, hall, n)``."""
-    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
-    for room, wing, hall, n in rows:
+    """Mirror ``build_graph``'s per-drawer filter from grouped rows.
+
+    Rows are ``(room, wing, hall, n)`` with an optional fifth ``last_date``
+    column — backends that cannot supply a date still work, they just leave
+    ``dates`` empty as the client path does for undated drawers.
+    """
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
+        last_date = row[4] if len(row) > 4 else ""
         if not room or room == "general" or not wing:
             continue
         node = room_data[str(room)]
         node["wings"].add(str(wing))
         if hall:
             node["halls"].add(str(hall))
+        if last_date:
+            node["dates"].add(str(last_date))
         node["count"] += int(n)
     edges = []
     nodes = {}
@@ -118,7 +153,7 @@ def _nodes_edges_from_grouped_rows(rows):
             "wings": wings,
             "halls": halls,
             "count": data["count"],
-            "dates": [],
+            "dates": sorted(data["dates"])[-5:] if data["dates"] else [],
         }
         if len(wings) >= 2:
             for i, wa in enumerate(wings):

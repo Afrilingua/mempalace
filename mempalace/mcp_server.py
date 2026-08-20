@@ -2006,11 +2006,16 @@ def _sqlite_graph_stats():
 
 
 def _graph_stats_from_grouped_rows(rows):
-    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows."""
+    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+
+    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
+    stats do not use it, so extra columns are ignored rather than unpacked.
+    """
     from collections import Counter, defaultdict
 
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
-    for room, wing, hall, n in rows:
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
         if not room or room == "general" or not wing:
             continue
         node = room_data[room]
@@ -2044,6 +2049,18 @@ def _graph_stats_from_grouped_rows(rows):
         "rooms_per_wing": dict(wing_counts.most_common()),
         "top_tunnels": top_tunnels,
     }
+
+
+def _graph_sqlite_reader():
+    """The sqlite grouped-counts reader for this palace, or ``None``.
+
+    ``None`` means the graph tools must go through the collection, which is
+    what keeps a missing or broken palace reporting a diagnostic instead of
+    an empty graph.
+    """
+    from .palace_graph import sqlite_grouped_counts_reader
+
+    return sqlite_grouped_counts_reader(_config)
 
 
 def _chroma_room_wing_hall_counts():
@@ -2496,7 +2513,14 @@ def tool_get_aaak_spec():
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
-    # sqlite metadata path does not open HNSW; build_graph falls back itself.
+    # sqlite metadata path does not open HNSW. When it cannot serve, open the
+    # collection here so a missing/broken palace still reports why (#1379
+    # follow-up) instead of looking like a palace with no such room.
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return traverse(start_room, col=col, max_hops=max_hops)
     return traverse(start_room, max_hops=max_hops, config=_config)
 
 
@@ -2507,6 +2531,11 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return find_tunnels(wing_a, wing_b, col=col)
     return find_tunnels(wing_a, wing_b, config=_config)
 
 
@@ -2807,8 +2836,8 @@ def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
     return ids, documents, metadatas
 
 
-def _fill_drawer_previews(col, page: list) -> None:
-    """Hydrate ``content_preview`` for a page of logical drawers only."""
+def _page_physical_ids(page: list) -> list:
+    """The physical row ids backing one page of logical drawers."""
     physical_ids = []
     for drawer in page:
         chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
@@ -2816,12 +2845,11 @@ def _fill_drawer_previews(col, page: list) -> None:
             physical_ids.extend(chunk_ids)
         else:
             physical_ids.append(drawer["drawer_id"])
-    if not physical_ids:
-        return
-    result = col.get(ids=physical_ids, include=["documents"])
-    ids = _chroma_field(result, "ids", []) or []
-    docs = _chroma_field(result, "documents", []) or []
-    docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
+    return physical_ids
+
+
+def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
+    """Set ``content_preview`` from an already-fetched ``{id: document}`` map."""
     for drawer in page:
         chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
         if chunk_ids:
@@ -2829,6 +2857,41 @@ def _fill_drawer_previews(col, page: list) -> None:
         else:
             content = docs_by_id.get(drawer["drawer_id"], "")
         drawer["content_preview"] = _content_preview(content)
+
+
+def _fill_drawer_previews(col, page: list) -> None:
+    """Hydrate ``content_preview`` for a page of logical drawers only."""
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    result = col.get(ids=physical_ids, include=["documents"])
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
+    _apply_drawer_previews(page, docs_by_id)
+
+
+def _fill_drawer_previews_from_sqlite(page: list) -> None:
+    """Same, reading the page's documents straight from ``chroma.sqlite3``.
+
+    The list itself is answered from metadata only — joining documents into
+    that scan would pull the palace's entire verbatim text into memory to
+    render one page. This fetches just the rows on screen.
+    """
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    from .backends.chroma import sqlite_documents_for_ids
+
+    docs_by_id = sqlite_documents_for_ids(
+        _config.palace_path, _config.collection_name, physical_ids
+    )
+    if docs_by_id is None:
+        # sqlite went unreadable between the two reads; previews are a
+        # display detail, so degrade to blank rather than fail the listing.
+        logger.debug("sqlite preview hydration failed; leaving previews empty")
+        return
+    _apply_drawer_previews(page, docs_by_id)
 
 
 def _collapse_drawer_rows(ids, documents, metadatas):
@@ -3600,7 +3663,6 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        ids = documents = metadatas = None
         listed = None
         if _is_chroma_backend() and _config.palace_path:
             from .backends.chroma import sqlite_list_id_metadata
@@ -3609,7 +3671,9 @@ def tool_list_drawers(
                 _config.palace_path, _config.collection_name, where=where
             )
         if listed is not None:
-            ids, documents, metadatas = listed
+            # Documents are fetched for the displayed page only, below.
+            ids, metadatas = listed
+            documents = []
         else:
             col = _get_collection()
             if not col:
@@ -3625,7 +3689,9 @@ def tool_list_drawers(
             ]
 
         page = drawers[offset : offset + limit]
-        if listed is None:
+        if listed is not None:
+            _fill_drawer_previews_from_sqlite(page)
+        else:
             col = _get_collection()
             if col:
                 _fill_drawer_previews(col, page)

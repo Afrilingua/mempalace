@@ -665,3 +665,34 @@ class TestWatchCursorFile:
             path = tmp_path / f"cursor_{abs(hash(payload))}.json"
             path.write_text(payload, encoding="utf-8")
             assert read_watch_cursor(str(path)) is None
+
+    def test_conditions_distinguish_absent_empty_and_corrupt(self, tmp_path):
+        """ "No cursor" is four facts; only ``absent`` may start at the tip."""
+        from mempalace.logstream import (
+            WATCH_STATE_ABSENT,
+            WATCH_STATE_CORRUPT,
+            WATCH_STATE_EMPTY,
+            WATCH_STATE_OK,
+            read_watch_state,
+            write_watch_cursor,
+        )
+
+        assert read_watch_state(str(tmp_path / "nope.json")) == (None, WATCH_STATE_ABSENT)
+        assert read_watch_state(None) == (None, WATCH_STATE_ABSENT)
+
+        good = tmp_path / "good.json"
+        write_watch_cursor(str(good), "evt_abc")
+        assert read_watch_state(str(good)) == ("evt_abc", WATCH_STATE_OK)
+
+        # Empty-log sentinel: the file exists and says so explicitly.
+        empty = tmp_path / "empty.json"
+        write_watch_cursor(str(empty), None)
+        assert read_watch_state(str(empty)) == (None, WATCH_STATE_EMPTY)
+
+        broken = tmp_path / "broken.json"
+        broken.write_text("{not json", encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+        broken.write_text("null", encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+        broken.write_text('{"other": 1}', encoding="utf-8")
+        assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)

@@ -120,7 +120,10 @@ mempalace logstream watch \
   routine status traffic stops waking you.
 - **`--state-file`** persists the cursor, so a restart resumes exactly where
   it stopped rather than replaying or skipping. It advances past events that
-  were examined and rejected, not only matches.
+  were examined and rejected, not only matches. When the cursor cannot be
+  read, or the watcher first started against an empty log, it replays rather
+  than jumping to the tip — a restart may cost you a duplicate, never a
+  missed delegation.
 - **Exit codes** are the wake signal: `0` when it printed a match, `2` when
   `--idle-exit-ms` expired having seen nothing, `130` when interrupted. Only
   `0` means "you have mail" — an interrupted watcher must never claim it.

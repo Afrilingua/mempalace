@@ -641,3 +641,44 @@ class TestLogstreamWatch:
         assert lines, "follow mode printed nothing"
         for line in lines:
             json.loads(line)  # every line stands alone — that is the contract
+
+    def test_empty_log_first_run_persists_a_starting_position(self, palace_path, tmp_path, capsys):
+        """A stateful watch against an empty log must leave a file behind.
+
+        latest_event_id() is None on an empty log, so without persisting that
+        the next launch looks like a first run, jumps to the tip, and skips
+        the event that arrived while the watcher was stopped — permanently,
+        because it then checkpoints past it.
+        """
+        state = tmp_path / "watch.json"
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(
+                    palace_path, agent="mac-claude", state_file=str(state), from_start=False
+                )
+            )
+        assert exc.value.code == 2
+        assert state.exists(), "empty-log watch left no state file"
+        assert json.loads(state.read_text(encoding="utf-8"))["cursor"] is None
+
+    def test_event_arriving_while_stopped_is_not_skipped(self, palace_path, tmp_path, capsys):
+        """The full sequence Codex described, end to end."""
+        state = tmp_path / "watch.json"
+        # 1. First watch against an empty log; idles out.
+        with pytest.raises(SystemExit):
+            cmd_logstream(
+                _watch_args(
+                    palace_path, agent="mac-claude", state_file=str(state), from_start=False
+                )
+            )
+        capsys.readouterr()
+
+        # 2. An event arrives while nothing is watching.
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        # 3. Relaunch must deliver it, not skip past it.
+        cmd_logstream(
+            _watch_args(palace_path, agent="mac-claude", state_file=str(state), from_start=False)
+        )
+        assert _watch_payload(capsys)["count"] == 1, "event that arrived while stopped was skipped"

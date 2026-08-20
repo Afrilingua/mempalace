@@ -1564,7 +1564,13 @@ def _logstream_watch(ls, args, as_json):
     """
     import time
 
-    from .logstream import normalize_watch_values, read_watch_cursor, write_watch_cursor
+    from .logstream import (
+        WATCH_STATE_ABSENT,
+        WATCH_STATE_CORRUPT,
+        normalize_watch_values,
+        read_watch_state,
+        write_watch_cursor,
+    )
 
     to_agents = list(args.to_agent or [])
     exclude = list(args.exclude_from_agent or [])
@@ -1589,19 +1595,15 @@ def _logstream_watch(ls, args, as_json):
         # yield forever without ever polling, burning a core.
         _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
 
-    stored_cursor = read_watch_cursor(args.state_file)
-    # read_watch_cursor returns None both for "no state file yet" and for
-    # "state file exists but could not be read". Those must not be treated
-    # alike: jumping to the tip after a *failed* read silently skips
-    # everything appended since the last good checkpoint, and the next
-    # checkpoint makes that loss permanent. A corrupt state file costs a
-    # replay, exactly as read_watch_cursor's contract promises.
-    recovery_failed = (
-        bool(args.state_file) and stored_cursor is None and os.path.exists(args.state_file)
-    )
+    stored_cursor, state_condition = read_watch_state(args.state_file)
+    # A missing cursor is four different facts, and only one of them may
+    # start at the tip. Treating a corrupt file or an empty-log restart as a
+    # first run skips everything that arrived since, then checkpoints past
+    # it — the loss is silent and permanent.
+    recovery_failed = state_condition == WATCH_STATE_CORRUPT
     cursor = args.since_event_id or stored_cursor
     skipped_from = None
-    if cursor is None and not args.from_start and not recovery_failed:
+    if cursor is None and not args.from_start and state_condition == WATCH_STATE_ABSENT:
         # Start at the tip, like the SSE live-tail does at connect time.
         # Starting from the beginning of a long fleet log means a fresh
         # watcher wakes holding weeks of history and cannot tell it is
@@ -1610,6 +1612,11 @@ def _logstream_watch(ls, args, as_json):
         # what arrives from now on. Never silent: say what was skipped.
         cursor = ls.latest_event_id()
         skipped_from = cursor
+        # Record the starting position immediately, even when the log is
+        # empty and that position is None. Without the file, the next launch
+        # is indistinguishable from a first run and would jump past anything
+        # that arrived while this watcher was stopped.
+        write_watch_cursor(args.state_file, cursor, agent=args.agent)
     if not as_json:
         where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
         print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)

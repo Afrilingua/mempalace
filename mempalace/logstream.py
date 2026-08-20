@@ -265,28 +265,60 @@ def pushdown_watch_filters(spec: dict) -> dict:
     return pushdown
 
 
-def read_watch_cursor(path: str) -> Optional[str]:
-    """Return the cursor stored in a watch state file, or ``None``.
+# Watch state-file conditions. "No cursor" is not one fact but four, and
+# conflating them loses events: see read_watch_state.
+WATCH_STATE_ABSENT = "absent"
+WATCH_STATE_OK = "ok"
+WATCH_STATE_EMPTY = "empty"
+WATCH_STATE_CORRUPT = "corrupt"
 
-    A missing, empty, or corrupt state file is not an error: the caller
-    simply starts from wherever it was told to, or from the present. A
-    watcher that refused to start because its bookkeeping file was truncated
-    by a crash would be worse than one that re-reads a few events.
+
+def read_watch_state(path: str) -> tuple:
+    """Return ``(cursor, condition)`` for a watch state file.
+
+    A cursor of ``None`` is ambiguous and the ambiguity is dangerous, so the
+    condition disambiguates it:
+
+    ``absent``
+        No state file. A genuine first run — the caller may start at the tip.
+    ``ok``
+        A usable cursor; resume strictly after it.
+    ``empty``
+        The file exists and records ``cursor: null`` — the watcher started
+        against an empty log and has not seen an event yet. **Not** a first
+        run: treating it as one and jumping to the tip would skip whatever
+        arrived while the watcher was stopped, and the next checkpoint would
+        make that permanent.
+    ``corrupt``
+        Unreadable, truncated, or valid JSON that is not an object. Costs a
+        replay, never a skip — refusing to start would cost every event
+        after it, and skipping would lose them silently.
     """
-    if not path:
-        return None
+    if not path or not os.path.exists(path):
+        return None, WATCH_STATE_ABSENT
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, ValueError):
-        return None
-    # Valid JSON that is not an object (``null``, ``[]``, a bare string) is
-    # just as corrupt as a truncated file, and must degrade the same way —
-    # calling .get() on it would raise and stop the watcher from starting.
+        return None, WATCH_STATE_CORRUPT
     if not isinstance(payload, dict):
-        return None
+        return None, WATCH_STATE_CORRUPT
     cursor = payload.get("cursor")
-    return cursor if isinstance(cursor, str) and cursor else None
+    if isinstance(cursor, str) and cursor:
+        return cursor, WATCH_STATE_OK
+    if "cursor" in payload:
+        return None, WATCH_STATE_EMPTY
+    return None, WATCH_STATE_CORRUPT
+
+
+def read_watch_cursor(path: str) -> Optional[str]:
+    """The cursor from a watch state file, or ``None``.
+
+    Convenience wrapper over :func:`read_watch_state` for callers that do not
+    need to tell a first run from a corrupt file. Watchers should prefer
+    ``read_watch_state``, because those two cases must not behave alike.
+    """
+    return read_watch_state(path)[0]
 
 
 def write_watch_cursor(path: str, cursor: str, agent: str = None) -> None:
@@ -298,9 +330,12 @@ def write_watch_cursor(path: str, cursor: str, agent: str = None) -> None:
     swallowed: losing the checkpoint costs a replay, while crashing the
     watcher costs every event after it.
     """
-    if not path or not cursor:
+    if not path:
         return
-    payload = {"cursor": cursor, "updated_at": _utc_now_iso()}
+    # ``cursor`` may be None: a watcher that started against an empty log
+    # must still leave a file behind, or its next launch looks like a first
+    # run and skips whatever arrived in between.
+    payload = {"cursor": cursor or None, "updated_at": _utc_now_iso()}
     if agent:
         payload["agent"] = agent
     tmp = f"{path}.tmp"

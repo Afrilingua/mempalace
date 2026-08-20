@@ -66,6 +66,76 @@ _graph_cache_time = 0.0
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
+def _try_sqlite_nodes_edges(config=None):
+    """Build graph nodes/edges from backend sqlite metadata, no HNSW.
+
+    Returns ``(nodes, edges)`` or ``None`` when the palace is not a sqlite
+    backend we know how to read. Dates are omitted (empty lists) — tunnel
+    ``recent`` stays blank on this path.
+    """
+    config = config or MempalaceConfig()
+    palace = config.palace_path
+    name = config.collection_name
+    if not palace:
+        return None
+    rows = None
+    chroma_db = os.path.join(palace, "chroma.sqlite3")
+    exact_db = os.path.join(palace, "sqlite_exact.sqlite3")
+    try:
+        if os.path.isfile(chroma_db):
+            from .backends.chroma import sqlite_room_wing_hall_counts
+
+            rows = sqlite_room_wing_hall_counts(palace, name)
+        elif os.path.isfile(exact_db):
+            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
+
+            rows = sqlite_room_wing_hall_counts(palace, name)
+    except Exception:
+        logger.debug("sqlite graph path failed; falling back to client paging", exc_info=True)
+        return None
+    if rows is None:
+        return None
+    return _nodes_edges_from_grouped_rows(rows)
+
+
+def _nodes_edges_from_grouped_rows(rows):
+    """Mirror ``build_graph``'s per-drawer filter from ``(room, wing, hall, n)``."""
+    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    for room, wing, hall, n in rows:
+        if not room or room == "general" or not wing:
+            continue
+        node = room_data[str(room)]
+        node["wings"].add(str(wing))
+        if hall:
+            node["halls"].add(str(hall))
+        node["count"] += int(n)
+    edges = []
+    nodes = {}
+    for room, data in room_data.items():
+        wings = sorted(data["wings"])
+        halls = sorted(data["halls"])
+        nodes[room] = {
+            "wings": wings,
+            "halls": halls,
+            "count": data["count"],
+            "dates": [],
+        }
+        if len(wings) >= 2:
+            for i, wa in enumerate(wings):
+                for wb in wings[i + 1 :]:
+                    for hall in halls:
+                        edges.append(
+                            {
+                                "room": room,
+                                "wing_a": wa,
+                                "wing_b": wb,
+                                "hall": hall,
+                                "count": data["count"],
+                            }
+                        )
+    return nodes, edges
+
+
 def invalidate_graph_cache():
     """Clear the graph cache. Called from mcp_server.py on writes."""
     global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
@@ -110,7 +180,18 @@ def build_graph(col=None, config=None):
         if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
             return _graph_cache_nodes, _graph_cache_edges
 
+    # Only when the caller did not pass a collection: MCP tools. Tests that
+    # inject ``col=`` keep the client paging path against that collection.
     if col is None:
+        sqlite_graph = _try_sqlite_nodes_edges(config)
+        if sqlite_graph is not None:
+            nodes, edges = sqlite_graph
+            if nodes:
+                with _graph_cache_lock:
+                    _graph_cache_nodes = nodes
+                    _graph_cache_edges = edges
+                    _graph_cache_time = time.time()
+            return nodes, edges
         col = _get_collection(config)
     if not col:
         return {}, []

@@ -2047,45 +2047,11 @@ def _graph_stats_from_grouped_rows(rows):
 
 
 def _chroma_room_wing_hall_counts():
-    import sqlite3 as _sqlite3
-
     if not _config.palace_path:
         return None
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
-        return None
-    collection_name = _config.collection_name
-    conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
-    try:
-        conn.execute("PRAGMA busy_timeout = 3000")
-        if (
-            conn.execute("SELECT 1 FROM collections WHERE name = ?", (collection_name,)).fetchone()
-            is None
-        ):
-            return None
-        return conn.execute(
-            """
-            SELECT
-                COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                         CAST(rm.float_value AS TEXT), '') AS room,
-                COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                         CAST(wm.float_value AS TEXT), '') AS wing,
-                COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
-                         CAST(hm.float_value AS TEXT), '') AS hall,
-                COUNT(*) AS n
-            FROM embeddings e
-            JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
-            JOIN collections c ON s.collection = c.id
-            LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
-            LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
-            LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
-            WHERE c.name = ?
-            GROUP BY room, wing, hall
-            """,
-            (collection_name,),
-        ).fetchall()
-    finally:
-        conn.close()
+    from .backends.chroma import sqlite_room_wing_hall_counts
+
+    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
 
 
 def tool_status():
@@ -2530,10 +2496,8 @@ def tool_get_aaak_spec():
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return traverse(start_room, col=col, max_hops=max_hops)
+    # sqlite metadata path does not open HNSW; build_graph falls back itself.
+    return traverse(start_room, max_hops=max_hops, config=_config)
 
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
@@ -2543,10 +2507,7 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return find_tunnels(wing_a, wing_b, col=col)
+    return find_tunnels(wing_a, wing_b, config=_config)
 
 
 def tool_graph_stats():
@@ -3625,10 +3586,6 @@ def tool_list_drawers(
     except ValueError as e:
         return {"error": str(e)}
 
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-
     try:
         where = None
         conditions = []
@@ -3643,7 +3600,21 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+        ids = documents = metadatas = None
+        listed = None
+        if _is_chroma_backend() and _config.palace_path:
+            from .backends.chroma import sqlite_list_id_metadata
+
+            listed = sqlite_list_id_metadata(
+                _config.palace_path, _config.collection_name, where=where
+            )
+        if listed is not None:
+            ids, documents, metadatas = listed
+        else:
+            col = _get_collection()
+            if not col:
+                return _collection_error_or_no_palace()
+            ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
 
         if since_dt is not None or before_dt is not None:
@@ -3654,7 +3625,10 @@ def tool_list_drawers(
             ]
 
         page = drawers[offset : offset + limit]
-        _fill_drawer_previews(col, page)
+        if listed is None:
+            col = _get_collection()
+            if col:
+                _fill_drawer_previews(col, page)
 
         return {
             "drawers": page,

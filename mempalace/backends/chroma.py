@@ -1203,6 +1203,148 @@ def _sqlite_wing_room_counts(
     return total, wing_rooms
 
 
+def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped (room, wing, hall, n) from ``chroma.sqlite3``, or ``None``."""
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            return conn.execute(
+                """
+                SELECT
+                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                             CAST(rm.float_value AS TEXT), '') AS room,
+                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                             CAST(wm.float_value AS TEXT), '') AS wing,
+                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
+                             CAST(hm.float_value AS TEXT), '') AS hall,
+                    COUNT(*) AS n
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
+                WHERE c.name = ?
+                GROUP BY room, wing, hall
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def sqlite_list_id_metadata(
+    palace_path: str,
+    collection_name: str,
+    where: Optional[dict] = None,
+) -> Optional[tuple[list[str], list[str], list[dict]]]:
+    """All drawer ids + metadata from sqlite, without opening HNSW.
+
+    ``where`` supports equality on ``wing``/``room`` and ``$and`` of those,
+    matching ``tool_list_drawers``. Returns ``None`` when sqlite cannot be
+    trusted so the caller can fall back to ``col.get`` paging.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    wing_eq = room_eq = None
+    if where:
+        if not isinstance(where, dict):
+            return None
+        if list(where.keys()) == ["$and"]:
+            for child in where["$and"] or []:
+                if not isinstance(child, dict) or len(child) != 1:
+                    return None
+                key, val = next(iter(child.items()))
+                if key == "wing":
+                    wing_eq = val
+                elif key == "room":
+                    room_eq = val
+                else:
+                    return None
+        elif len(where) == 1 and not next(iter(where.keys())).startswith("$"):
+            key, val = next(iter(where.items()))
+            if key == "wing":
+                wing_eq = val
+            elif key == "room":
+                room_eq = val
+            else:
+                return None
+        else:
+            return None
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            rows = conn.execute(
+                """
+                SELECT e.embedding_id, m.key, m.string_value, m.int_value, m.float_value
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata m ON m.id = e.id
+                WHERE c.name = ?
+                ORDER BY e.id
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    by_id: dict[str, dict] = {}
+    docs_by_id: dict[str, str] = {}
+    order: list[str] = []
+    for embedding_id, key, sval, ival, fval in rows:
+        doc_id = str(embedding_id)
+        if doc_id not in by_id:
+            by_id[doc_id] = {}
+            order.append(doc_id)
+        if not key:
+            continue
+        value = sval if sval is not None else (ival if ival is not None else fval)
+        if value is None:
+            continue
+        if str(key) == "chroma:document":
+            docs_by_id[doc_id] = str(value)
+        else:
+            by_id[doc_id][str(key)] = value
+    ids: list[str] = []
+    metas: list[dict] = []
+    documents: list[str] = []
+    for doc_id in order:
+        meta = by_id[doc_id]
+        if wing_eq is not None and meta.get("wing") != wing_eq:
+            continue
+        if room_eq is not None and meta.get("room") != room_eq:
+            continue
+        ids.append(doc_id)
+        metas.append(meta)
+        documents.append(docs_by_id.get(doc_id, ""))
+    return ids, documents, metas
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 

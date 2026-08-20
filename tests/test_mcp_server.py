@@ -1362,12 +1362,12 @@ with mine_palace_lock(sys.argv[1]):
         monkeypatch.setattr(mcp_server, "_get_collection", _no_client_open)
 
         stats = mcp_server.tool_graph_stats()
-        # "general" room and the wing-less drawer are excluded, matching
-        # build_graph's per-drawer filter.
-        assert stats["total_rooms"] == 2
+        # "general" is a real room; the wing-less drawer is still excluded.
+        # Existing tripwires above guarantee the collection/HNSW path stays unopened.
+        assert stats["total_rooms"] == 3
         assert stats["tunnel_rooms"] == 1
         assert stats["total_edges"] == 1
-        assert stats["rooms_per_wing"] == {"wing_code": 2, "wing_project": 1}
+        assert stats["rooms_per_wing"] == {"wing_code": 3, "wing_project": 1}
         assert stats["top_tunnels"] == [
             {"room": "chromadb", "wings": ["wing_code", "wing_project"], "count": 2}
         ]
@@ -7921,3 +7921,40 @@ class TestSearchDateFilters:
         assert "before" in schema["properties"]
         assert schema["properties"]["since"]["type"] == "string"
         assert schema["properties"]["before"]["type"] == "string"
+
+
+def test_2288_grouped_graph_stats_count_distinct_room_instances(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_load_graph_tunnels",
+        lambda config=None: [{"id": "t1"}, {"id": "t2"}],
+    )
+    rows = [
+        ("fact", "desercion", "facts", 1, "2026-01-01"),
+        ("general", "desercion-pascual", "misc", 1, "2026-01-01"),
+        ("general", "desertion", "misc", 2, "2026-01-02"),
+        # Same placement, different hall: this must not add a room instance.
+        ("general", "desertion", "other", 3, "2026-01-03"),
+        ("heatstgnn-model-selection", "desertion", "models", 1, "2026-01-01"),
+        ("diary", "desertion", "journal", 1, "2026-01-01"),
+        ("general", "matlab-drive", "misc", 1, "2026-01-01"),
+        ("documentation", "octopus", "docs", 1, "2026-01-01"),
+        ("plans", "octopus", "plans", 1, "2026-01-01"),
+        ("controller", "octopus", "control", 1, "2026-01-01"),
+    ]
+    stats = mcp_server._graph_stats_from_grouped_rows(rows)
+
+    assert stats["total_rooms"] == 7
+    assert stats["total_room_instances"] == 9
+    assert stats["tunnel_rooms"] == stats["passive_tunnel_rooms"] == 1
+    assert stats["explicit_tunnels"] == 2
+    assert stats["total_connections"] == stats["total_edges"] + 2
+    assert set(stats["rooms_per_wing"]) == {
+        "desercion",
+        "desercion-pascual",
+        "desertion",
+        "matlab-drive",
+        "octopus",
+    }

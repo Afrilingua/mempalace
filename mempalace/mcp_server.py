@@ -94,6 +94,7 @@ from .palace_graph import (  # noqa: E402
     list_tunnels,
     delete_tunnel,
     follow_tunnels,
+    _load_tunnels as _load_graph_tunnels,
 )
 from .hallways import (  # noqa: E402
     list_hallways,
@@ -1980,7 +1981,7 @@ def _sqlite_graph_stats():
     (non-chroma backend, missing/unbootstrapped palace, sqlite error). The
     reconstruction mirrors ``palace_graph.build_graph`` /
     ``palace_graph.graph_stats`` exactly: a node is a room with a non-empty
-    wing and a usable room name (the catch-all ``"general"`` is excluded), and
+    wing and a usable room name (including the catch-all ``"general"``), and
     edges are the per-hall cross-wing crossings of multi-wing rooms.
     """
     rows = None
@@ -2006,25 +2007,30 @@ def _sqlite_graph_stats():
 
 
 def _graph_stats_from_grouped_rows(rows):
-    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+    """Rebuild ``graph_stats`` from grouped sqlite metadata rows.
 
-    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
-    stats do not use it, so extra columns are ignored rather than unpacked.
+    Rows are ``(room, wing, hall, n)`` with an optional fifth ``last_date``
+    column. Because grouping includes ``hall``, one room placement can occupy
+    multiple SQL rows; room instances therefore use a distinct ``(wing, room)`` set.
     """
     from collections import Counter, defaultdict
 
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    room_instances = set()
     for row in rows:
         room, wing, hall, n = row[0], row[1], row[2], row[3]
-        if not room or room == "general" or not wing:
+        if not room or not wing:
             continue
-        node = room_data[room]
-        node["wings"].add(str(wing))
+        room_key = str(room)
+        wing_key = str(wing)
+        room_instances.add((wing_key, room_key))
+        node = room_data[room_key]
+        node["wings"].add(wing_key)
         if hall:
             node["halls"].add(str(hall))
         node["count"] += int(n)
 
-    tunnel_rooms = 0
+    passive_tunnel_rooms = 0
     total_edges = 0
     wing_counts = Counter()
     for data in room_data.values():
@@ -2032,20 +2038,25 @@ def _graph_stats_from_grouped_rows(rows):
         for wing in data["wings"]:
             wing_counts[wing] += 1
         if n_wings >= 2:
-            tunnel_rooms += 1
+            passive_tunnel_rooms += 1
             total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
 
     top_tunnels = [
         {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
-        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
-            :10
-        ]
+        for room, data in sorted(
+            room_data.items(), key=lambda item: (-len(item[1]["wings"]), item[0])
+        )[:10]
         if len(data["wings"]) >= 2
     ]
+    explicit_tunnel_count = len(_load_graph_tunnels(_config))
     return {
         "total_rooms": len(room_data),
-        "tunnel_rooms": tunnel_rooms,
+        "total_room_instances": len(room_instances),
+        "tunnel_rooms": passive_tunnel_rooms,
+        "passive_tunnel_rooms": passive_tunnel_rooms,
+        "explicit_tunnels": explicit_tunnel_count,
         "total_edges": total_edges,
+        "total_connections": total_edges + explicit_tunnel_count,
         "rooms_per_wing": dict(wing_counts.most_common()),
         "top_tunnels": top_tunnels,
     }

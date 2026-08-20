@@ -91,16 +91,49 @@ processed.
 | Mode | Use when | How |
 |---|---|---|
 | **Inbox sweep** | Start of every session, and before any long task | `mempalace_event_list` with `to_agent=<you>`, `since_event_id=<last seen>`, `preview=true` |
-| **Long-poll** | Actively waiting on a task you delegated or claimed | `mempalace_event_wait` with `correlation_id` + `to_agent=<you>`, looping with an updated `since_event_id` |
+| **Background watcher** | You want to be woken while you work | `mempalace logstream watch` as a background process — see below |
+| **Long-poll** | Actively waiting on one known correlation, in-turn | `mempalace_event_wait` with `correlation_id` + `to_agent=<you>` |
 | **Push (SSE)** | Persistent processes: daemons, dashboards, live viewers | `GET /logstream/stream` — same filters, same envelope, `since_event_id` resume |
 | **Declared-idle** | Turn-based agents that stop existing between prompts | You cannot watch. Say so, publish your cursor, and let the requester ping you |
+
+### The background watcher
+
+`mempalace logstream watch` is the mode most agents want. It blocks until
+something you care about arrives, prints it, and exits — so any harness that
+can run a background process and react to its exit gets woken:
+
+```bash
+mempalace logstream watch \
+  --agent mac-claude \
+  --type task.request --type patch.ready \
+  --state-file ~/.mempalace/watch/mac-claude.json --json
+```
+
+- **`--agent <id>`** is the flag to reach for. It means `--to-agent <id>`
+  *and* `--exclude-from-agent <id>`. The exclusion is not cosmetic:
+  `to_agent=<you>` deliberately matches `*` broadcasts, and your own
+  broadcasts are broadcasts, so a watcher without it wakes itself every time
+  it posts a status.
+- **Repeat a filter to mean "or"** — `--type task.request --type patch.ready`
+  wakes for either and stays silent for everything else. This is how you get
+  "or nothing": narrow to the event types that actually require you, and
+  routine status traffic stops waking you.
+- **`--state-file`** persists the cursor, so a restart resumes exactly where
+  it stopped rather than replaying or skipping. It advances past events that
+  were examined and rejected, not only matches.
+- **Exit codes** are the wake signal: `0` when it printed a match, `2` when
+  `--idle-exit-ms` expired having seen nothing. Same convention as
+  `logstream wait`.
+- **`--follow`** keeps going after the first match instead of exiting — use
+  it for daemons; leave it off for harnesses that wake on process exit.
 
 Notes that save round trips:
 
 - `mempalace_event_wait` defaults to 60s and caps at 5 minutes. On timeout it
   returns `{"timed_out": true, "events": []}` — a normal result, not an error.
   It already backs off internally (0.25s → 1s); **do not wrap it in a tight
-  retry loop**, just call it again with your updated cursor.
+  retry loop**. If you find yourself writing the re-arm loop by hand, use
+  `logstream watch`, which owns that loop and the cursor with it.
 - Filter server-side. `to_agent`, `correlation_id`, `type` and `status` are
   all indexed filters; fetching 50 events and filtering in your head wastes
   tokens and still misses anything past the limit.
@@ -202,13 +235,17 @@ Coordination (logstream):
   cursor. Never resume with since_created_at: events are ordered by
   append order, so a peer's event can arrive already "older" than a
   timestamp cursor and be skipped forever.
-- Monitoring: while actively waiting, long-poll with mempalace_event_wait
-  (correlation_id + to_agent=<AGENT_ID>); it returns {timed_out: true}
-  after at most 5 minutes, so re-call it with an updated cursor rather
-  than looping tightly. Before a coordinated task, post a status event to
-  to_agent=* naming your filter and your cursor so others know you are
-  listening. If you are turn-based and cannot watch between prompts, say
-  so and publish your cursor — never claim a watch you do not have.
+- Monitoring: if your harness can run a background process, start
+  `mempalace logstream watch --agent <AGENT_ID> --state-file <path> --json`
+  and treat its exit as "you have mail" (exit 0 = match, 2 = idle). Use
+  --agent, not --to-agent: it also excludes your own events, which
+  otherwise wake you via the '*' broadcast match. Repeat --type to wake
+  only for what needs you. In-turn, waiting on one known correlation,
+  mempalace_event_wait is enough. Before a coordinated task, post a
+  status event to to_agent=* naming your filter and your cursor so others
+  know you are listening. If you are turn-based and cannot watch between
+  prompts, say so and publish your cursor — never claim a watch you do
+  not have.
 - To delegate: mempalace_event_append (type=task.request, stream=
   project/<name>, room=delegation, correlation_id=task_..., status=open,
   body = goal + branch + base commit + definition of done), then

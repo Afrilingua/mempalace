@@ -1531,6 +1531,102 @@ def _print_event_line(event):
     )
 
 
+def _logstream_watch(ls, args, as_json):
+    """Run ``logstream watch`` — block until interesting events arrive.
+
+    Split out of ``cmd_logstream`` so that dispatcher stays under the
+    complexity gate: this branch carries cursor persistence, an idle timeout,
+    and follow-vs-exit semantics that no other subcommand needs.
+
+    Exit contract, chosen so a harness can background this process and treat
+    its exit as a wake-up: return (0) when a match was printed, 2 when the
+    idle timeout expired having seen nothing — the same convention
+    ``logstream wait`` uses for a timeout.
+    """
+    import json
+    import time
+
+    from .logstream import normalize_watch_values, read_watch_cursor, write_watch_cursor
+
+    to_agents = list(args.to_agent or [])
+    exclude = list(args.exclude_from_agent or [])
+    if args.agent:
+        # The whole point of --agent: to_agent=<me> also matches '*'
+        # broadcasts, and your own broadcasts are broadcasts — so a watcher
+        # without this exclusion wakes itself every time it posts a status.
+        to_agents.append(args.agent)
+        exclude.append(args.agent)
+    spec = {
+        "streams": normalize_watch_values(args.stream),
+        "rooms": normalize_watch_values(args.room),
+        "types": normalize_watch_values(args.type),
+        "statuses": normalize_watch_values(args.status),
+        "to_agents": normalize_watch_values(to_agents),
+        "from_agents": normalize_watch_values(args.from_agent),
+        "exclude_from_agents": normalize_watch_values(exclude),
+        "correlation_ids": normalize_watch_values(args.correlation_id),
+    }
+    cursor = args.since_event_id or read_watch_cursor(args.state_file)
+    if not as_json:
+        where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
+        print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)
+
+    idle_s = args.idle_exit_ms / 1000.0 if args.idle_exit_ms and args.idle_exit_ms > 0 else None
+    deadline = time.monotonic() + idle_s if idle_s else None
+    matched_any = False
+    try:
+        for matched, cursor in ls.watch_events(
+            cursor=cursor,
+            poll_timeout_ms=args.poll_timeout_ms,
+            limit=args.limit,
+            **spec,
+        ):
+            # Checkpoint every advance, including idle ones: the cursor moves
+            # past events that were examined and rejected, and re-judging them
+            # after a restart is pure waste.
+            write_watch_cursor(args.state_file, cursor, agent=args.agent)
+            if matched:
+                matched_any = True
+                if idle_s:
+                    deadline = time.monotonic() + idle_s
+                if as_json:
+                    print(
+                        json.dumps(
+                            {
+                                "events": matched,
+                                "count": len(matched),
+                                "cursor": cursor,
+                                "timed_out": False,
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                else:
+                    print(f"{len(matched)} event(s):")
+                    for event in matched:
+                        _print_event_line(event)
+                    sys.stdout.flush()
+                if not args.follow:
+                    return
+                continue
+            if deadline is not None and time.monotonic() >= deadline:
+                if as_json:
+                    print(
+                        json.dumps(
+                            {"events": [], "count": 0, "cursor": cursor, "timed_out": True},
+                            indent=2,
+                        )
+                    )
+                else:
+                    print("Idle timeout; no matching events.")
+                sys.exit(0 if matched_any else 2)
+    except KeyboardInterrupt:
+        if not as_json:
+            print("Stopped.", file=sys.stderr)
+
+
 def cmd_logstream(args):
     import json
 
@@ -1598,6 +1694,8 @@ def cmd_logstream(args):
                         _print_event_line(event)
             if result.get("timed_out"):
                 sys.exit(2)
+        elif args.logstream_action == "watch":
+            _logstream_watch(ls, args, as_json)
         elif args.logstream_action == "sync":
             from .logsync import load_peers, sync_all, sync_with_peer
 
@@ -3033,6 +3131,78 @@ def main():
         "--limit", type=int, default=50, help="Max events to return on match (default 50)"
     )
     p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_watch = logstream_sub.add_parser(
+        "watch",
+        help="Background watcher: block until interesting events arrive, then wake (exit 2 on idle)",
+    )
+    p_ls_watch.add_argument(
+        "--agent",
+        default=None,
+        help=(
+            "Your identity. Shorthand for --to-agent <id> --exclude-from-agent <id>: "
+            "wake for what is addressed to you (broadcasts included) but never for "
+            "your own events"
+        ),
+    )
+    p_ls_watch.add_argument(
+        "--stream", action="append", default=None, help="Stream (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--room", action="append", default=None, help="Room (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--type", action="append", default=None, help="Event type (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--status", action="append", default=None, help="Status (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--to-agent", action="append", default=None, help="Target agent (repeatable; '*' matches)"
+    )
+    p_ls_watch.add_argument(
+        "--from-agent", action="append", default=None, help="Writer agent (repeatable)"
+    )
+    p_ls_watch.add_argument(
+        "--exclude-from-agent",
+        action="append",
+        default=None,
+        help="Never wake for events written by this agent (repeatable)",
+    )
+    p_ls_watch.add_argument(
+        "--correlation-id", action="append", default=None, help="Correlation id (repeatable)"
+    )
+    p_ls_watch.add_argument(
+        "--since-event-id",
+        default=None,
+        help="Start strictly after this event id (overrides --state-file)",
+    )
+    p_ls_watch.add_argument(
+        "--state-file",
+        default=None,
+        help="Persist the cursor here so a restart resumes exactly where it stopped",
+    )
+    p_ls_watch.add_argument(
+        "--follow",
+        action="store_true",
+        help="Keep watching after a match instead of exiting on the first one",
+    )
+    p_ls_watch.add_argument(
+        "--idle-exit-ms",
+        type=int,
+        default=0,
+        help="Give up after this long with no match (0 = wait forever)",
+    )
+    p_ls_watch.add_argument(
+        "--poll-timeout-ms",
+        type=int,
+        default=300000,
+        help="Long-poll length per iteration (default 300000, the server maximum)",
+    )
+    p_ls_watch.add_argument(
+        "--limit", type=int, default=50, help="Max events per poll (default 50)"
+    )
+    p_ls_watch.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_ls_ack = logstream_sub.add_parser(
         "ack", help="Acknowledge an event (appends event.ack, never mutates)"

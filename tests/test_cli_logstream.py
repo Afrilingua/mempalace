@@ -352,3 +352,146 @@ def _sha256(text):
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ── logstream watch ───────────────────────────────────────────────────────
+
+
+def _watch_args(palace, **overrides):
+    fields = dict(
+        palace=palace,
+        logstream_action="watch",
+        agent=None,
+        stream=None,
+        room=None,
+        type=None,
+        status=None,
+        to_agent=None,
+        from_agent=None,
+        exclude_from_agent=None,
+        correlation_id=None,
+        since_event_id=None,
+        state_file=None,
+        follow=False,
+        idle_exit_ms=400,
+        poll_timeout_ms=60,
+        limit=50,
+        json=True,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _watch_payload(capsys):
+    out = capsys.readouterr().out.strip()
+    assert out, "watch printed nothing"
+    return json.loads(out)
+
+
+class TestLogstreamWatch:
+    def test_wakes_on_a_matching_event_and_exits_zero(self, palace_path, capsys):
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        # No SystemExit: a clean return is exit 0, the "you have mail" signal
+        # a harness backgrounds this process to receive.
+        cmd_logstream(_watch_args(palace_path, agent="mac-claude"))
+        payload = _watch_payload(capsys)
+        assert payload["count"] == 1
+        assert payload["timed_out"] is False
+        assert payload["cursor"]
+
+    def test_idle_timeout_exits_two(self, palace_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="nobody-home"))
+        assert exc.value.code == 2
+        assert _watch_payload(capsys)["timed_out"] is True
+
+    def test_agent_shorthand_does_not_wake_on_your_own_broadcast(self, palace_path, capsys):
+        """--agent exists for this case.
+
+        to_agent=<me> also matches '*' broadcasts, and your own broadcasts are
+        broadcasts, so a watcher without the exclusion wakes itself every time
+        it posts a status.
+        """
+        cmd_logstream(
+            _append_args(
+                palace_path,
+                from_agent="mac-claude",
+                to_agent="*",
+                type="status.update",
+            )
+        )
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude"))
+        assert exc.value.code == 2, "watcher woke itself on its own broadcast"
+
+    def test_explicit_to_agent_still_sees_broadcasts(self, palace_path, capsys):
+        """Without --agent there is no exclusion, so '*' still reaches you."""
+        cmd_logstream(_append_args(palace_path, from_agent="mac-claude", to_agent="*"))
+        capsys.readouterr()
+
+        cmd_logstream(_watch_args(palace_path, to_agent=["mac-claude"]))
+        assert _watch_payload(capsys)["count"] == 1
+
+    def test_type_filter_is_an_or_and_ignores_the_rest(self, palace_path, capsys):
+        for event_type in ("status.update", "status.update", "patch.ready"):
+            cmd_logstream(
+                _append_args(
+                    palace_path,
+                    type=event_type,
+                    from_agent="windows-grok",
+                    to_agent="mac-claude",
+                )
+            )
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(
+                palace_path,
+                agent="mac-claude",
+                type=["task.request", "patch.ready"],
+            )
+        )
+        payload = _watch_payload(capsys)
+        assert [e["type"] for e in payload["events"]] == ["patch.ready"]
+
+    def test_state_file_persists_the_cursor_and_prevents_replay(
+        self, palace_path, tmp_path, capsys
+    ):
+        state = str(tmp_path / "watch.json")
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=state))
+        first = _watch_payload(capsys)
+        assert first["count"] == 1
+        assert json.load(open(state, encoding="utf-8"))["cursor"] == first["cursor"]
+
+        # Second run resumes from the file: the same event must not replay.
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=state))
+        assert exc.value.code == 2
+
+    def test_since_event_id_overrides_the_state_file(self, palace_path, tmp_path, capsys):
+        state = str(tmp_path / "watch.json")
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        first_id = json.loads(capsys.readouterr().out)["id"]
+
+        cmd_logstream(_watch_args(palace_path, agent="mac-claude", state_file=state))
+        capsys.readouterr()
+
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+        # Rewind explicitly: the flag wins over the stored cursor.
+        cmd_logstream(
+            _watch_args(
+                palace_path,
+                agent="mac-claude",
+                state_file=state,
+                since_event_id=first_id,
+            )
+        )
+        assert _watch_payload(capsys)["count"] == 1

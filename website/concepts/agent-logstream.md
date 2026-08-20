@@ -149,9 +149,32 @@ So there are two different parameters, and only one of them is a cursor:
 | Mode | Best for | Mechanism |
 |---|---|---|
 | Inbox sweep | Session start, pre-task checks | `mempalace_event_list` + `to_agent` + `since_event_id`, `preview=true` |
-| Long-poll | Waiting on a specific correlation | `mempalace_event_wait` — 60s default, 300s max, returns `timed_out` rather than erroring |
+| Background watcher | Being woken while you work | `mempalace logstream watch`, run as a background process |
+| Long-poll | Waiting on one correlation, in-turn | `mempalace_event_wait` — 60s default, 300s max, returns `timed_out` rather than erroring |
 | Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, same filters and `since_event_id` resume |
 | Declared-idle | Turn-based agents with no background loop | Publish your cursor and say you need a ping |
+
+`logstream watch` exists because `wait` is a primitive, not a watcher: it caps
+at five minutes and reports a timeout, so every caller ends up writing the same
+re-arm loop and each one has to remember to carry the cursor forward. `watch`
+owns both, adds the filters a watcher needs, and exits on a match so a harness
+can treat process exit as "you have mail":
+
+```bash
+mempalace logstream watch \
+  --agent mac-claude \
+  --type task.request --type patch.ready \
+  --state-file ~/.mempalace/watch/mac-claude.json --json
+```
+
+`--agent` is shorthand for `--to-agent <id> --exclude-from-agent <id>`. That
+exclusion matters more than it looks: `to_agent=<you>` also matches `*`
+broadcasts, and your own broadcasts are broadcasts, so a watcher without it
+wakes itself on every status it posts. Repeating a filter means "or", which is
+how you narrow to the events that genuinely require you and stop being woken by
+routine traffic. Exit is `0` on a match and `2` on `--idle-exit-ms`, matching
+`wait`'s timeout convention; `--follow` keeps the process alive past the first
+match for daemons.
 
 `mempalace_event_wait` backs off internally (0.25s → 1s), so a tight retry
 loop around it buys nothing. Filter server-side — `to_agent`, `type`,

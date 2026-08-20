@@ -31,6 +31,8 @@ Usage:
 """
 
 import json
+import logging
+import os
 import random
 import re
 import secrets
@@ -43,6 +45,8 @@ from pathlib import Path
 from typing import Optional
 
 from .config import sanitize_iso_temporal, strip_lone_surrogates
+
+logger = logging.getLogger("mempalace_logstream")
 
 LOGSTREAM_DB_FILENAME = "logstream.sqlite3"
 
@@ -166,6 +170,147 @@ def _sanitize_metadata(value) -> str:
     if len(encoded.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValueError(f"metadata exceeds maximum size of {MAX_METADATA_BYTES} bytes")
     return encoded
+
+
+# ── Watch filters (RFC 003 follow-up: background watchers) ──────────────
+#
+# ``list_events`` filters are single-valued and positive-only, because they
+# map straight onto indexed SQL equality. A watcher needs two things that
+# shape cannot express:
+#
+#   * "wake me for task.request OR patch.ready" — several values per field
+#   * "everything addressed to me EXCEPT my own broadcasts" — a negation
+#
+# The second is not a nicety. ``to_agent=<me>`` deliberately also matches
+# broadcast events (``to_agent='*'``), and an agent's own broadcasts are
+# broadcasts — so a naive watcher wakes itself every time it posts a status.
+#
+# Watch therefore pushes down whatever single-valued filters it can (keeping
+# the SQL selective) and applies the multi-valued and negative parts here.
+
+
+def normalize_watch_values(value) -> Optional[set]:
+    """Coerce a watch filter argument to a set of strings, or ``None``.
+
+    ``None`` means "any" — an absent filter, not an empty one. An argument
+    holding only blanks collapses to ``None`` for the same reason, so a
+    stray ``--type ""`` cannot silently match nothing forever.
+    """
+    if value is None:
+        return None
+    values = [value] if isinstance(value, str) else list(value)
+    out = {str(v) for v in values if v not in (None, "")}
+    return out or None
+
+
+def event_matches_watch(
+    event: dict,
+    *,
+    streams=None,
+    rooms=None,
+    types=None,
+    statuses=None,
+    to_agents=None,
+    from_agents=None,
+    exclude_from_agents=None,
+    correlation_ids=None,
+) -> bool:
+    """Client-side half of a watch filter. Every argument is a set or ``None``.
+
+    Exclusion beats every positive match: an event from an excluded writer is
+    rejected even when it satisfies the rest of the filter.
+    """
+    if exclude_from_agents and event.get("from_agent") in exclude_from_agents:
+        return False
+
+    def _ok(allowed, actual, broadcast_matches=False):
+        if not allowed:
+            return True
+        if actual in allowed:
+            return True
+        # ``to_agent='*'`` reaches everyone, mirroring list_events' SQL.
+        return broadcast_matches and actual == "*"
+
+    return (
+        _ok(streams, event.get("stream"))
+        and _ok(rooms, event.get("room"))
+        and _ok(types, event.get("type"))
+        and _ok(statuses, event.get("status"))
+        and _ok(correlation_ids, event.get("correlation_id"))
+        and _ok(from_agents, event.get("from_agent"))
+        and _ok(to_agents, event.get("to_agent"), broadcast_matches=True)
+    )
+
+
+def pushdown_watch_filters(spec: dict) -> dict:
+    """The subset of a watch spec that ``list_events`` can evaluate in SQL.
+
+    Only single-valued fields push down. Narrowing the query is an
+    optimization, never a correctness dependency — whatever stays behind is
+    re-checked by :func:`event_matches_watch` on every candidate row.
+    """
+    pushdown = {}
+    for key, column in (
+        ("streams", "stream"),
+        ("rooms", "room"),
+        ("types", "type"),
+        ("statuses", "status"),
+        ("correlation_ids", "correlation_id"),
+        ("to_agents", "to_agent"),
+        ("from_agents", "from_agent"),
+    ):
+        values = spec.get(key)
+        if values and len(values) == 1:
+            pushdown[column] = next(iter(values))
+    return pushdown
+
+
+def read_watch_cursor(path: str) -> Optional[str]:
+    """Return the cursor stored in a watch state file, or ``None``.
+
+    A missing, empty, or corrupt state file is not an error: the caller
+    simply starts from wherever it was told to, or from the present. A
+    watcher that refused to start because its bookkeeping file was truncated
+    by a crash would be worse than one that re-reads a few events.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            cursor = json.load(handle).get("cursor")
+    except (OSError, ValueError):
+        return None
+    return cursor if isinstance(cursor, str) and cursor else None
+
+
+def write_watch_cursor(path: str, cursor: str, agent: str = None) -> None:
+    """Persist a watch cursor atomically, best effort.
+
+    Written to a temp file and renamed so a crash mid-write cannot leave a
+    half-file that reads back as a *different, earlier* cursor — that would
+    silently replay events the watcher had already handled. Failures are
+    swallowed: losing the checkpoint costs a replay, while crashing the
+    watcher costs every event after it.
+    """
+    if not path or not cursor:
+        return
+    payload = {"cursor": cursor, "updated_at": _utc_now_iso()}
+    if agent:
+        payload["agent"] = agent
+    tmp = f"{path}.tmp"
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, path)
+    except OSError:
+        logger.debug("could not persist watch cursor to %s", path, exc_info=True)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 class Logstream:
@@ -799,6 +944,48 @@ class Logstream:
                 delay = base * (0.75 + random.random() * 0.25)
             time.sleep(min(delay, remaining))
             attempt += 1
+
+    def watch_events(
+        self,
+        *,
+        cursor: str = None,
+        poll_timeout_ms: int = MAX_WAIT_TIMEOUT_MS,
+        limit: int = DEFAULT_LIST_LIMIT,
+        poll_interval_s: float = None,
+        **spec,
+    ):
+        """Yield ``(matched_events, cursor)`` forever as new events arrive.
+
+        The long-poll primitive :meth:`wait_events` caps at
+        ``MAX_WAIT_TIMEOUT_MS`` and reports a timeout, which makes it a
+        building block rather than a watcher: every caller ends up writing
+        the same re-arm loop, and each one has to remember to carry the
+        cursor forward. This owns both.
+
+        An idle poll yields ``([], cursor)`` rather than blocking silently,
+        so a caller can implement an idle timeout, emit a heartbeat, or
+        checkpoint its cursor without running a second clock.
+
+        The cursor advances past every event *examined*, not merely those
+        that matched, so a watcher that restarts never rescans what it has
+        already judged. ``spec`` takes the set-valued filters described by
+        :func:`event_matches_watch`.
+        """
+        pushdown = pushdown_watch_filters(spec)
+        while True:
+            result = self.wait_events(
+                timeout_ms=poll_timeout_ms,
+                since_event_id=cursor,
+                limit=limit,
+                poll_interval_s=poll_interval_s,
+                **pushdown,
+            )
+            events = result.get("events") or []
+            if not events:
+                yield [], cursor
+                continue
+            cursor = events[-1]["id"]
+            yield [e for e in events if event_matches_watch(e, **spec)], cursor
 
     # ── Replication (RFC 004 step 0: logstream multi-master) ─────────────
 

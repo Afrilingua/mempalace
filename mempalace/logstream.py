@@ -277,9 +277,15 @@ def read_watch_cursor(path: str) -> Optional[str]:
         return None
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            cursor = json.load(handle).get("cursor")
+            payload = json.load(handle)
     except (OSError, ValueError):
         return None
+    # Valid JSON that is not an object (``null``, ``[]``, a bare string) is
+    # just as corrupt as a truncated file, and must degrade the same way —
+    # calling .get() on it would raise and stop the watcher from starting.
+    if not isinstance(payload, dict):
+        return None
+    cursor = payload.get("cursor")
     return cursor if isinstance(cursor, str) and cursor else None
 
 
@@ -979,8 +985,11 @@ class Logstream:
         while True:
             timeout = poll_timeout_ms() if callable(poll_timeout_ms) else poll_timeout_ms
             if timeout is not None and int(timeout) <= 0:
-                # Idle deadline already elapsed: yield immediately so the
-                # caller can exit without waiting out the next long-poll.
+                # Only reachable when an idle deadline has already elapsed —
+                # a *configured* timeout of zero would make this branch spin
+                # without ever polling, so callers must reject that up front
+                # (the CLI does). Yield at once so the caller can exit
+                # instead of waiting out another long-poll.
                 yield [], cursor
                 continue
             result = self.wait_events(

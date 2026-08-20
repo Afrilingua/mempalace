@@ -651,3 +651,17 @@ class TestWatchCursorFile:
         path = str(tmp_path / "cursor.json")
         write_watch_cursor(path, "evt_abc")
         assert [p.name for p in tmp_path.iterdir()] == ["cursor.json"]
+
+    def test_non_object_json_is_treated_as_corrupt(self, tmp_path):
+        """Valid JSON that is not an object must degrade, not raise.
+
+        ``json.load(...).get()`` on ``null`` / ``[]`` / a bare string raises
+        AttributeError, which would stop the watcher from starting — the
+        exact opposite of the recovery contract.
+        """
+        from mempalace.logstream import read_watch_cursor
+
+        for payload in ("null", "[]", '"evt_abc"', "42"):
+            path = tmp_path / f"cursor_{abs(hash(payload))}.json"
+            path.write_text(payload, encoding="utf-8")
+            assert read_watch_cursor(str(path)) is None

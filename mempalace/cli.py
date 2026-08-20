@@ -1531,6 +1531,25 @@ def _print_event_line(event):
     )
 
 
+def _watch_json(payload, *, follow: bool) -> str:
+    """Serialize one ``logstream watch`` record.
+
+    A single-shot watch prints exactly one document, so it is pretty-printed
+    and ``json.load``-able as-is. Under ``--follow`` there are many records
+    on one stream: indented documents concatenated back-to-back are *not*
+    valid JSON, and ``json.load`` / ``jq`` reject them with trailing data —
+    which defeats the point of a machine-readable flag on the mode meant for
+    daemons. Follow mode therefore emits NDJSON, one compact record per line.
+    """
+    import json
+
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        if follow
+        else json.dumps(payload, indent=2, ensure_ascii=False)
+    )
+
+
 def _logstream_watch(ls, args, as_json):
     """Run ``logstream watch`` — block until interesting events arrive.
 
@@ -1543,7 +1562,6 @@ def _logstream_watch(ls, args, as_json):
     idle timeout expired having seen nothing — the same convention
     ``logstream wait`` uses for a timeout.
     """
-    import json
     import time
 
     from .logstream import normalize_watch_values, read_watch_cursor, write_watch_cursor
@@ -1566,9 +1584,24 @@ def _logstream_watch(ls, args, as_json):
         "exclude_from_agents": normalize_watch_values(exclude),
         "correlation_ids": normalize_watch_values(args.correlation_id),
     }
-    cursor = args.since_event_id or read_watch_cursor(args.state_file)
+    if args.poll_timeout_ms is not None and args.poll_timeout_ms <= 0:
+        # A configured zero would make watch_events' expired-deadline branch
+        # yield forever without ever polling, burning a core.
+        _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
+
+    stored_cursor = read_watch_cursor(args.state_file)
+    # read_watch_cursor returns None both for "no state file yet" and for
+    # "state file exists but could not be read". Those must not be treated
+    # alike: jumping to the tip after a *failed* read silently skips
+    # everything appended since the last good checkpoint, and the next
+    # checkpoint makes that loss permanent. A corrupt state file costs a
+    # replay, exactly as read_watch_cursor's contract promises.
+    recovery_failed = (
+        bool(args.state_file) and stored_cursor is None and os.path.exists(args.state_file)
+    )
+    cursor = args.since_event_id or stored_cursor
     skipped_from = None
-    if cursor is None and not args.from_start:
+    if cursor is None and not args.from_start and not recovery_failed:
         # Start at the tip, like the SSE live-tail does at connect time.
         # Starting from the beginning of a long fleet log means a fresh
         # watcher wakes holding weeks of history and cannot tell it is
@@ -1584,6 +1617,13 @@ def _logstream_watch(ls, args, as_json):
         print(
             f"Starting at the tip ({skipped_from}); earlier events are not replayed. "
             "Use --from-start to replay them, or sweep with `mempalace logstream list`.",
+            file=sys.stderr,
+        )
+    if recovery_failed:
+        print(
+            f"State file {args.state_file} is unreadable; replaying from the start "
+            "rather than skipping to the tip, so nothing since the last good "
+            "checkpoint is lost.",
             file=sys.stderr,
         )
 
@@ -1610,15 +1650,14 @@ def _logstream_watch(ls, args, as_json):
                     deadline = time.monotonic() + idle_s
                 if as_json:
                     print(
-                        json.dumps(
+                        _watch_json(
                             {
                                 "events": matched,
                                 "count": len(matched),
                                 "cursor": cursor,
                                 "timed_out": False,
                             },
-                            indent=2,
-                            ensure_ascii=False,
+                            follow=args.follow,
                         ),
                         flush=True,
                     )
@@ -1639,17 +1678,21 @@ def _logstream_watch(ls, args, as_json):
             if deadline is not None and time.monotonic() >= deadline:
                 if as_json:
                     print(
-                        json.dumps(
+                        _watch_json(
                             {"events": [], "count": 0, "cursor": cursor, "timed_out": True},
-                            indent=2,
+                            follow=args.follow,
                         )
                     )
                 else:
                     print("Idle timeout; no matching events.")
                 sys.exit(0 if matched_any else 2)
     except KeyboardInterrupt:
+        # Exit 0 is the documented "a match was printed" signal, so an
+        # interrupted watcher must not use it — a supervisor would report
+        # mail that never arrived. 128 + SIGINT, the shell convention.
         if not as_json:
             print("Stopped.", file=sys.stderr)
+        sys.exit(130)
 
 
 def cmd_logstream(args):

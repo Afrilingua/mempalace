@@ -567,3 +567,77 @@ class TestLogstreamWatch:
             _watch_args(palace_path, agent="mac-claude", since_event_id=first_id, from_start=False)
         )
         assert _watch_payload(capsys)["count"] == 1
+
+    def test_interrupted_watch_does_not_report_mail(self, palace_path, monkeypatch, capsys):
+        """Ctrl-C must not exit 0.
+
+        Exit 0 is the documented "a match was printed" signal, so a
+        supervisor that SIGINTs a watcher would otherwise be told it has
+        mail that never arrived.
+        """
+        import mempalace.logstream as logstream_module
+
+        def interrupt(*_a, **_k):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(logstream_module.Logstream, "watch_events", interrupt)
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude"))
+        assert exc.value.code == 130
+
+    def test_nonpositive_poll_timeout_is_rejected(self, palace_path, capsys):
+        """A configured zero must be rejected up front, not merely survived.
+
+        With no idle deadline it would spin watch_events' expired-deadline
+        branch forever without ever polling. Asserting only "nonzero exit"
+        would pass for the wrong reason, since an idle timeout also exits
+        nonzero — so this pins the validation error itself.
+        """
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(palace_path, agent="mac-claude", poll_timeout_ms=0, idle_exit_ms=200)
+            )
+        assert exc.value.code == 1
+        assert "poll-timeout-ms" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_unreadable_state_file_replays_instead_of_skipping(self, palace_path, tmp_path, capsys):
+        """A failed cursor read must not be treated as a first run.
+
+        read_watch_cursor returns None for both "no state file yet" and
+        "state file exists but is corrupt". Jumping to the tip on the second
+        silently skips everything since the last good checkpoint, and the
+        next checkpoint makes that loss permanent — the opposite of the
+        documented "a corrupt state file costs a replay".
+        """
+        state = tmp_path / "watch.json"
+        state.write_text("null", encoding="utf-8")  # valid JSON, not an object
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(palace_path, agent="mac-claude", state_file=str(state), from_start=False)
+        )
+        payload = _watch_payload(capsys)
+        assert payload["count"] == 1, "corrupt state file skipped the backlog instead of replaying"
+
+    def test_follow_json_is_ndjson_not_concatenated_documents(self, palace_path, tmp_path, capsys):
+        """--follow --json must be parseable.
+
+        Repeated indented documents on one stream are not valid JSON; jq and
+        json.load reject them with trailing data, which defeats the point of
+        a machine-readable flag on the mode intended for daemons.
+        """
+        for _ in range(2):
+            cmd_logstream(
+                _append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok")
+            )
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit):
+            cmd_logstream(
+                _watch_args(palace_path, agent="mac-claude", follow=True, idle_exit_ms=300)
+            )
+        lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+        assert lines, "follow mode printed nothing"
+        for line in lines:
+            json.loads(line)  # every line stands alone — that is the contract

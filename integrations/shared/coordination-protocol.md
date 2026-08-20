@@ -122,8 +122,11 @@ mempalace logstream watch \
   it stopped rather than replaying or skipping. It advances past events that
   were examined and rejected, not only matches.
 - **Exit codes** are the wake signal: `0` when it printed a match, `2` when
-  `--idle-exit-ms` expired having seen nothing. Same convention as
-  `logstream wait`.
+  `--idle-exit-ms` expired having seen nothing, `130` when interrupted. Only
+  `0` means "you have mail" — an interrupted watcher must never claim it.
+- **`--follow --json` emits NDJSON**, one record per line, because repeated
+  indented documents on one stream are not parseable JSON. A single-shot
+  watch prints one pretty document instead.
 - **`--follow`** keeps going after the first match instead of exiting — use
   it for daemons; leave it off for harnesses that wake on process exit.
 - **A first watch starts at the tip**, matching the SSE live-tail, and says so

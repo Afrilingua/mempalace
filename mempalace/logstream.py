@@ -294,11 +294,20 @@ def read_watch_state(path: str) -> tuple:
         replay, never a skip — refusing to start would cost every event
         after it, and skipping would lose them silently.
     """
-    if not path or not os.path.exists(path):
+    if not path:
         return None, WATCH_STATE_ABSENT
+    # Deliberately no os.path.exists() preflight. It answers False both for
+    # "no such file" and for "cannot traverse the parent directory", so a
+    # checkpoint that exists but is momentarily unreachable would be read as
+    # a first run and skip every event since the stored cursor. Opening
+    # directly lets FileNotFoundError mean absent and every other OSError
+    # (permissions, a directory in the way, I/O error) mean corrupt — which
+    # replays. It also closes the exists()/open() race.
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
+    except FileNotFoundError:
+        return None, WATCH_STATE_ABSENT
     except (OSError, ValueError):
         return None, WATCH_STATE_CORRUPT
     if not isinstance(payload, dict):
@@ -321,14 +330,20 @@ def read_watch_cursor(path: str) -> Optional[str]:
     return read_watch_state(path)[0]
 
 
-def write_watch_cursor(path: str, cursor: str, agent: str = None) -> None:
-    """Persist a watch cursor atomically, best effort.
+def write_watch_cursor(path: str, cursor: str, agent: str = None, required: bool = False) -> None:
+    """Persist a watch cursor atomically.
 
     Written to a temp file and renamed so a crash mid-write cannot leave a
     half-file that reads back as a *different, earlier* cursor — that would
-    silently replay events the watcher had already handled. Failures are
-    swallowed: losing the checkpoint costs a replay, while crashing the
-    watcher costs every event after it.
+    silently replay events the watcher had already handled.
+
+    Ordinary checkpoints are best effort, because losing one costs a replay
+    while crashing the watcher costs every event after it. That trade-off
+    inverts for the *first* checkpoint of a fresh watch: if it never lands,
+    the next launch sees no state file, calls itself a first run, and starts
+    at the tip — skipping everything that arrived in between, permanently.
+    Pass ``required=True`` there so the failure is raised rather than
+    swallowed.
     """
     if not path:
         return
@@ -352,6 +367,8 @@ def write_watch_cursor(path: str, cursor: str, agent: str = None) -> None:
             os.unlink(tmp)
         except OSError:
             pass
+        if required:
+            raise
 
 
 class Logstream:

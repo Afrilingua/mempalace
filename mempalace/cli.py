@@ -1615,8 +1615,18 @@ def _logstream_watch(ls, args, as_json):
         # Record the starting position immediately, even when the log is
         # empty and that position is None. Without the file, the next launch
         # is indistinguishable from a first run and would jump past anything
-        # that arrived while this watcher was stopped.
-        write_watch_cursor(args.state_file, cursor, agent=args.agent)
+        # that arrived while this watcher was stopped — so unlike later
+        # checkpoints this one must not fail quietly.
+        if args.state_file:
+            try:
+                write_watch_cursor(args.state_file, cursor, agent=args.agent, required=True)
+            except OSError as exc:
+                _logstream_fail(
+                    f"could not write the initial checkpoint to {args.state_file}: {exc}. "
+                    "Refusing to start: without it a restart would skip every event "
+                    "that arrives before then.",
+                    as_json,
+                )
     if not as_json:
         where = args.agent or ", ".join(sorted(spec["to_agents"] or [])) or "everything"
         print(f"Watching {where} from {cursor or 'now'}; Ctrl-C to stop.", file=sys.stderr)

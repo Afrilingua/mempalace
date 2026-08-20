@@ -682,3 +682,26 @@ class TestLogstreamWatch:
             _watch_args(palace_path, agent="mac-claude", state_file=str(state), from_start=False)
         )
         assert _watch_payload(capsys)["count"] == 1, "event that arrived while stopped was skipped"
+
+    def test_refuses_to_start_when_the_initial_checkpoint_cannot_be_written(
+        self, palace_path, tmp_path, monkeypatch, capsys
+    ):
+        """Continuing after a failed first checkpoint guarantees a later skip."""
+        import mempalace.logstream as logstream_module
+
+        def denied(*_a, **kw):
+            if kw.get("required"):
+                raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(logstream_module, "write_watch_cursor", denied)
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(
+                    palace_path,
+                    agent="mac-claude",
+                    state_file=str(tmp_path / "nope" / "watch.json"),
+                    from_start=False,
+                )
+            )
+        assert exc.value.code == 1
+        assert "initial checkpoint" in json.loads(capsys.readouterr().out)["error"]

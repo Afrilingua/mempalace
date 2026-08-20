@@ -696,3 +696,58 @@ class TestWatchCursorFile:
         assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
         broken.write_text('{"other": 1}', encoding="utf-8")
         assert read_watch_state(str(broken)) == (None, WATCH_STATE_CORRUPT)
+
+    def test_unreachable_file_is_corrupt_not_absent(self, tmp_path, monkeypatch):
+        """A checkpoint we cannot open must replay, never restart at the tip.
+
+        ``os.path.exists`` answers False both for "no such file" and for
+        "cannot traverse the parent directory", so a preflight check turns a
+        momentarily unreachable checkpoint into a fake first run and skips
+        every event since the stored cursor.
+        """
+        from mempalace.logstream import (
+            WATCH_STATE_ABSENT,
+            WATCH_STATE_CORRUPT,
+            read_watch_state,
+        )
+
+        # A directory where a file is expected: open() raises OSError on
+        # every platform (IsADirectoryError on POSIX, PermissionError on NT).
+        as_dir = tmp_path / "cursor.json"
+        as_dir.mkdir()
+        assert read_watch_state(str(as_dir)) == (None, WATCH_STATE_CORRUPT)
+
+        # Permission denied, simulated so the test is platform-independent.
+        real_open = open
+
+        def denied(path, *a, **k):
+            if str(path).endswith("locked.json"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", denied)
+        assert read_watch_state(str(tmp_path / "locked.json")) == (None, WATCH_STATE_CORRUPT)
+
+        # A genuinely missing file is still absent, i.e. a real first run.
+        monkeypatch.undo()
+        assert read_watch_state(str(tmp_path / "gone.json")) == (None, WATCH_STATE_ABSENT)
+
+    def test_required_checkpoint_raises_instead_of_swallowing(self, tmp_path, monkeypatch):
+        """Best effort is safe only when a lost checkpoint costs a replay.
+
+        For the first checkpoint of a fresh watch it costs a skip instead, so
+        that one must surface the failure.
+        """
+        from mempalace.logstream import write_watch_cursor
+
+        target = str(tmp_path / "sub" / "cursor.json")
+
+        def denied(path, *a, **k):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("builtins.open", denied)
+        # Ordinary checkpoint: swallowed, the watcher keeps running.
+        write_watch_cursor(target, "evt_abc")
+        # Initial checkpoint: raised, so the caller can refuse to start.
+        with pytest.raises(OSError):
+            write_watch_cursor(target, "evt_abc", required=True)

@@ -761,3 +761,59 @@ class TestLogstreamWatch:
             assert exc.value.code == 130
             assert state.exists(), f"{label}: interrupted before any checkpoint landed"
             assert json.loads(state.read_text(encoding="utf-8"))["cursor"] == expected, label
+
+    def test_bad_cursor_fails_cleanly_without_poisoning_the_state_file(
+        self, palace_path, tmp_path, capsys
+    ):
+        """A typo'd --since-event-id must not be persisted.
+
+        The startup checkpoint happens before the first poll, and list_events
+        raises on an unknown anchor — so without validation the bad id lands
+        on disk, the poll crashes, and every later run without the flag
+        reloads it and crashes again until someone deletes the file by hand.
+        """
+        state = tmp_path / "watch.json"
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(
+                _watch_args(
+                    palace_path,
+                    agent="mac-claude",
+                    state_file=str(state),
+                    since_event_id="evt_does_not_exist",
+                    from_start=False,
+                )
+            )
+        assert exc.value.code == 1
+        assert "evt_does_not_exist" in json.loads(capsys.readouterr().out)["error"]
+        assert not state.exists(), "an invalid cursor was persisted"
+
+    def test_negative_idle_timeout_is_rejected_not_read_as_forever(self, palace_path, capsys):
+        """Only 0 means "wait forever".
+
+        A negative value took the same branch, silently disabling the idle
+        deadline and leaving a harness waiting on a watcher it believed would
+        time out.
+        """
+        with pytest.raises(SystemExit) as exc:
+            cmd_logstream(_watch_args(palace_path, agent="mac-claude", idle_exit_ms=-1))
+        assert exc.value.code == 1
+        assert "idle-exit-ms" in json.loads(capsys.readouterr().out)["error"]
+
+    def test_stored_cursor_that_vanished_replays_instead_of_refusing(
+        self, palace_path, tmp_path, capsys
+    ):
+        """A stored cursor whose event is gone is corrupt state, not user error.
+
+        Refusing to start would strand the watcher exactly as an unreadable
+        file would. Only an explicitly supplied --since-event-id is treated
+        as user error worth refusing.
+        """
+        state = tmp_path / "watch.json"
+        state.write_text(json.dumps({"cursor": "evt_from_a_rebuilt_log"}), encoding="utf-8")
+        cmd_logstream(_append_args(palace_path, to_agent="mac-claude", from_agent="windows-grok"))
+        capsys.readouterr()
+
+        cmd_logstream(
+            _watch_args(palace_path, agent="mac-claude", state_file=str(state), from_start=False)
+        )
+        assert _watch_payload(capsys)["count"] == 1, "stranded instead of replaying"

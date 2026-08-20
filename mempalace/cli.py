@@ -1594,6 +1594,15 @@ def _logstream_watch(ls, args, as_json):
         # A configured zero would make watch_events' expired-deadline branch
         # yield forever without ever polling, burning a core.
         _logstream_fail("--poll-timeout-ms must be a positive number of milliseconds", as_json)
+    if args.idle_exit_ms is not None and args.idle_exit_ms < 0:
+        # Only 0 means "wait forever". A negative value arriving from config
+        # or from timeout arithmetic would otherwise take that same branch
+        # silently, leaving a harness waiting on a watcher it believes will
+        # time out.
+        _logstream_fail(
+            "--idle-exit-ms must be zero (wait forever) or a positive number of milliseconds",
+            as_json,
+        )
 
     stored_cursor, state_condition = read_watch_state(args.state_file)
     # A missing cursor is four different facts, and only one of them may
@@ -1622,6 +1631,31 @@ def _logstream_watch(ls, args, as_json):
     # next launch calls itself a first run and jumps to the tip, skipping
     # whatever arrived in between. Unlike later checkpoints this one cannot
     # fail quietly: losing it costs a skipped event, not a replay.
+    if cursor is not None:
+        # Verify the anchor before it is written anywhere. list_events raises
+        # on an unknown since_event_id, and the required startup write below
+        # happens first — so a typo'd or stale --since-event-id would be
+        # persisted, then crash the first poll, and every later run without
+        # the flag would reload it and crash again until someone deleted the
+        # file by hand. Fail cleanly instead, leaving no state behind.
+        try:
+            ls.list_events(since_event_id=cursor, limit=1)
+        except ValueError as exc:
+            if args.since_event_id:
+                # Explicitly supplied and wrong: user error, so refuse
+                # without leaving anything behind to reload next time.
+                _logstream_fail(f"{exc}. Nothing was written to the state file.", as_json)
+            # A *stored* cursor whose event has gone (log rebuilt, replica
+            # reset) is corrupt state rather than user error, and refusing to
+            # start would strand the watcher exactly as an unreadable file
+            # would. Replay instead: a duplicate, never a missed delegation.
+            print(
+                f"Stored cursor {cursor} no longer exists in this log; replaying from the "
+                "start rather than refusing to run.",
+                file=sys.stderr,
+            )
+            cursor = None
+
     if args.state_file and state_condition == WATCH_STATE_ABSENT:
         try:
             write_watch_cursor(args.state_file, cursor, agent=args.agent, required=True)

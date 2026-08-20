@@ -1267,3 +1267,107 @@ def test_sqlite_exact_room_wing_hall_counts(tmp_path):
     assert grouped[("chromadb", "wing_code", "db")] == 1
     assert grouped[("chromadb", "wing_project", "db")] == 1
     assert grouped[("auth", "wing_code", "security")] == 1
+
+
+def test_sqlite_exact_locus_columns_and_index(tmp_path):
+    from mempalace.backends.sqlite_exact import _LOCUS_FIELDS, _LOCUS_INDEX
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["alpha note"],
+        metadatas=[{"wing": "alpha", "room": "notes", "hall": "db"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    conn = col._handle.conn
+    from mempalace.backends.sqlite_exact import _document_column_names
+
+    cols = _document_column_names(conn)
+    assert set(_LOCUS_FIELDS) <= cols
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(documents)").fetchall()}
+    assert _LOCUS_INDEX in indexes
+    row = conn.execute("SELECT wing, room, hall FROM documents WHERE id = 'a'").fetchone()
+    assert tuple(row) == ("alpha", "notes", "db")
+
+
+def test_sqlite_exact_equality_where_uses_locus_column(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[{"wing": "keep", "hall": "db"}, {"wing": "drop", "hall": "other"}],
+        embeddings=[[1.0, 0.0], [1.0, 0.0]],
+    )
+    result, selects = _doc_select_sql(
+        col, lambda: col.get(where={"wing": "keep"}, include=["metadatas"])
+    )
+    assert result.ids == ["keep"]
+    assert selects
+    assert "json_extract" not in selects[0]
+    assert "wing =" in selects[0] or "wing=?" in selects[0].replace(" ", "")
+
+    hall = col.get(where={"hall": "db"}, include=["metadatas"])
+    assert hall.ids == ["keep"]
+
+
+def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
+    import numpy as np
+    from mempalace.backends.sqlite_exact import _LOCUS_FIELDS, _LOCUS_INDEX
+
+    db = tmp_path / "sqlite_exact.sqlite3"
+    conn = sqlite3.connect(str(db))
+    blob = np.asarray([1.0, 0.0], dtype=np.float32).tobytes()
+    conn.executescript(
+        """
+        CREATE TABLE collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE documents (
+            collection_id INTEGER NOT NULL,
+            id TEXT NOT NULL,
+            document TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            dim INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (collection_id, id)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO collections(id, name, created_at) VALUES (1, 'mempalace_drawers', 't')"
+    )
+    conn.execute(
+        """
+        INSERT INTO documents
+            (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+        VALUES (1, 'a', 'alpha note', ?, ?, 2, 't', 't')
+        """,
+        ('{"hall":"db","room":"notes","wing":"alpha"}', blob),
+    )
+    conn.commit()
+    conn.close()
+
+    _backend, col = _collection(tmp_path, create=False)
+    handle = col._handle.conn
+    from mempalace.backends.sqlite_exact import _document_column_names
+
+    cols = _document_column_names(handle)
+    assert set(_LOCUS_FIELDS) <= cols
+    indexes = {row[1] for row in handle.execute("PRAGMA index_list(documents)").fetchall()}
+    assert _LOCUS_INDEX in indexes
+    assert tuple(
+        handle.execute("SELECT wing, room, hall FROM documents WHERE id='a'").fetchone()
+    ) == (
+        "alpha",
+        "notes",
+        "db",
+    )
+    from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
+
+    total, wings = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
+    assert total == 1
+    assert wings["alpha"]["notes"] == 1

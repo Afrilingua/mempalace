@@ -216,6 +216,36 @@ def _matches_where(meta: dict, where: Optional[dict]) -> bool:
 
 _FACET_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
+# Palace loci. VIRTUAL generated columns + one composite index give
+# structured access (status, list_drawers where, graph_stats) without
+# rewriting the embedding blob table. Mirrors mempalace-structural's
+# "search the wing/room, not the whole palace" — as a sqlite index.
+_LOCUS_FIELDS = ("wing", "room", "hall")
+_LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
+
+
+def _json_field_sql(key: str) -> str:
+    """SQL expression for a metadata key; locus fields are real columns."""
+    if key in _LOCUS_FIELDS:
+        return key
+    return f"json_extract(metadata_json, '$.{key}')"
+
+
+def _document_column_names(conn: sqlite3.Connection) -> set[str]:
+    """Column names including VIRTUAL generated columns.
+
+    ``PRAGMA table_info`` omits VIRTUAL generated columns on some SQLite
+    builds; ``table_xinfo`` reports them (hidden=2).
+    """
+    try:
+        rows = conn.execute("PRAGMA table_xinfo(documents)").fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute("PRAGMA table_info(documents)").fetchall()
+    return {row[1] for row in rows}
+
+
+def _documents_has_locus_columns(conn: sqlite3.Connection) -> bool:
+    return set(_LOCUS_FIELDS) <= _document_column_names(conn)
 
 
 def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
@@ -258,7 +288,7 @@ def _equality_where_sql(where: Optional[dict]) -> Optional[tuple[str, list]]:
     for key, expected in where.items():
         if key.startswith("$") or isinstance(expected, dict) or not _FACET_FIELD_RE.match(key):
             return None
-        clauses.append(f"json_extract(metadata_json, '$.{key}') = ?")
+        clauses.append(f"{_json_field_sql(key)} = ?")
         params.append(expected)
     return (" AND ".join(clauses) if clauses else "1=1"), params
 
@@ -308,11 +338,12 @@ def sqlite_wing_room_counts(
             ).fetchone()
             total = int(total_row[0]) if total_row and total_row[0] is not None else 0
             wing_rooms: dict[str, dict[str, int]] = {}
+            locus = _documents_has_locus_columns(conn)
+            wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
+            room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
             for wing, room, n in conn.execute(
-                """
-                SELECT json_extract(metadata_json, '$.wing'),
-                       json_extract(metadata_json, '$.room'),
-                       COUNT(*)
+                f"""
+                SELECT {wing_expr}, {room_expr}, COUNT(*)
                 FROM documents
                 WHERE collection_id = ?
                 GROUP BY 1, 2
@@ -347,13 +378,14 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
             if row is None:
                 return None
             collection_id = int(row[0])
+            locus = _documents_has_locus_columns(conn)
+            room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
+            wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
+            hall_expr = "hall" if locus else "json_extract(metadata_json, '$.hall')"
             return list(
                 conn.execute(
-                    """
-                    SELECT json_extract(metadata_json, '$.room'),
-                           json_extract(metadata_json, '$.wing'),
-                           json_extract(metadata_json, '$.hall'),
-                           COUNT(*)
+                    f"""
+                    SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*)
                     FROM documents
                     WHERE collection_id = ?
                     GROUP BY 1, 2, 3
@@ -947,9 +979,7 @@ class SQLiteExactCollection(BaseCollection):
     ) -> tuple[list[str], np.ndarray, list[dict]]:
         rows = cur.execute(
             """
-            SELECT id, embedding,
-                   json_extract(metadata_json, '$.wing'),
-                   json_extract(metadata_json, '$.room'),
+            SELECT id, embedding, wing, room,
                    json_extract(metadata_json, '$.source_file')
             FROM documents
             WHERE collection_id = ?
@@ -1113,12 +1143,13 @@ class SQLiteExactCollection(BaseCollection):
         extra_sql, params = push
         with self._cursor() as cur:
             collection_id = self._collection_id(cur)
+            expr = _json_field_sql(field)
             rows = cur.execute(
                 f"""
-                SELECT json_extract(metadata_json, '$.{field}') AS k, COUNT(*)
+                SELECT {expr} AS k, COUNT(*)
                 FROM documents
                 WHERE collection_id = ?
-                  AND json_extract(metadata_json, '$.{field}') IS NOT NULL
+                  AND {expr} IS NOT NULL
                   AND ({extra_sql})
                 GROUP BY 1
                 ORDER BY 2 DESC, 1
@@ -1464,6 +1495,7 @@ class SQLiteExactBackend(BaseBackend):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(collections)").fetchall()}
         if "dimension" not in columns:
             conn.execute("ALTER TABLE collections ADD COLUMN dimension INTEGER")
+        self._ensure_locus_columns(conn)
         try:
             conn.execute(
                 """
@@ -1487,6 +1519,34 @@ class SQLiteExactBackend(BaseBackend):
                 """
             )
         conn.commit()
+
+    @staticmethod
+    def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
+        """Add VIRTUAL wing/room/hall columns and a composite index.
+
+        VIRTUAL generated columns are metadata-only (no table rewrite), so a
+        1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
+        metadata_json once and stores the loci. Existing palaces migrate
+        here on the next writable open.
+        """
+        cols = _document_column_names(conn)
+        for field in _LOCUS_FIELDS:
+            if field in cols:
+                continue
+            try:
+                conn.execute(
+                    f"ALTER TABLE documents ADD COLUMN {field} TEXT "
+                    f"GENERATED ALWAYS AS (json_extract(metadata_json, '$.{field}')) VIRTUAL"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_LOCUS_INDEX}
+                ON documents(collection_id, wing, room, hall)
+            """
+        )
 
     def get_collection(
         self,

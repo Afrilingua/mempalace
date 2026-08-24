@@ -277,24 +277,32 @@ Four things to get right, in the order people get them wrong:
   `--to-agent <id> --exclude-from-agent <id>`. The exclusion is load-bearing:
   `to_agent=<you>` also matches `*` broadcasts, and your own broadcasts are
   broadcasts — a watcher without it wakes itself on every status it posts.
-- **React to the exit code, not the output.** `0` means "you have mail" —
-  wake the agent and have it sweep its inbox. `2` means `--idle-exit-ms`
-  expired with nothing; `130` means interrupted. Only `0` starts work.
-- **Always pass `--state-file`.** That file carries the cursor, so a restart
-  resumes exactly where the last run stopped — it may replay one event, it
-  never silently misses one. A cursorless first run starts at the live tip
-  rather than replaying weeks of fleet history (`--from-start` if you really
-  want the replay).
+- **The exit code is the wake signal; the output is the mail.** `0` means
+  a match was printed — hand the printed batch (with `--json`, ready-made
+  JSON) to the agent, or let the agent sweep from **its own** last-processed
+  event id. `2` means `--idle-exit-ms` expired with nothing; `130` means
+  interrupted. Only `0` starts work.
+- **Always pass `--state-file` — but it is the watcher's cursor, not the
+  agent's.** The file lets a restarted watcher resume exactly where it
+  stopped: it may replay one event, it never silently misses one. On a
+  match, though, it checkpoints *past* the printed batch before exiting —
+  and `since_event_id` is exclusive — so an agent that sweeps from the
+  watcher's state file skips the very event that woke it. The agent's inbox
+  cursor is the last event *it processed*, tracked separately. A cursorless
+  first run starts at the live tip rather than replaying weeks of fleet
+  history (`--from-start` if you really want the replay).
 - **Repeat `--type` to mean "or".** Filter to the events that genuinely need
   you (`task.request`, `patch.ready`) so routine status traffic doesn't burn
   wake-ups.
 
 How the loop plugs into a harness:
 
-- **A CLI agent** (Claude Code, Codex) backgrounds the command and treats
-  process exit as the signal to check `mempalace_event_list` with its
-  cursor. Harnesses that re-invoke the agent when a background task
-  finishes get this for free.
+- **A CLI agent** (Claude Code, Codex) backgrounds the command; on exit
+  `0` it feeds the watcher's printed events to the agent, or has the agent
+  sweep `mempalace_event_list` from the agent's own last-processed event
+  id — never from the watcher's state file, which has already advanced
+  past the match. Harnesses that re-invoke the agent when a background
+  task finishes get the wake-up for free.
 - **A daemon or dashboard** passes `--follow`, which stays alive past the
   first match and emits one JSON event per line (NDJSON) with `--json`.
 - **A turn-based assistant** that stops existing between prompts cannot

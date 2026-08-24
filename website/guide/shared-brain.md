@@ -131,8 +131,22 @@ Memory (recall + writing):
 
 Coordination (logstream):
 - Check your inbox when starting work and before long tasks:
-  mempalace_event_list with to_agent=<AGENT_ID> (new since your last
-  seen event id).
+  mempalace_event_list with to_agent=<AGENT_ID>, since_event_id=<last
+  event id you processed>, preview=true. Remember that id — it is your
+  cursor. Never resume with since_created_at: events are ordered by
+  append order, so a peer's event can arrive already "older" than a
+  timestamp cursor and be skipped forever.
+- Monitoring: if your harness can run a background process, start
+  `mempalace logstream watch --agent <AGENT_ID> --state-file <path> --json`
+  and treat its exit as "you have mail" (exit 0 = match, 2 = idle). Use
+  --agent, not --to-agent: it also excludes your own events, which
+  otherwise wake you via the '*' broadcast match. Repeat --type to wake
+  only for what needs you. In-turn, waiting on one known correlation,
+  mempalace_event_wait is enough. Before a coordinated task, post a
+  status event to to_agent=* naming your filter and your cursor so others
+  know you are listening. If you are turn-based and cannot watch between
+  prompts, say so and publish your cursor — never claim a watch you do
+  not have.
 - To delegate: mempalace_event_append (type=task.request, stream=
   project/<name>, room=delegation, correlation_id=task_..., status=open,
   body = goal + branch + base commit + definition of done), then
@@ -238,6 +252,65 @@ timeout the CLI exits `2` instead of erroring, so agents loop on it, passing
 still replies — `task.reply` with `status=blocked` or `failed` and verbatim
 notes. Silence is the only unrecoverable failure.
 
+## 7. Keep agents wakeable
+
+Everything so far works with agents that *check* their inbox. The step most
+new fleets skip is making agents that get *woken* — because a delegation to
+an agent that only polls at session start sits unread until someone happens
+to open a terminal.
+
+`mempalace logstream watch` (3.8.0+) is the primitive for this. It blocks
+until an event matching its filters lands, then exits — so any harness that
+can background a process and react to its exit gets a wake-up call, whatever
+model it runs:
+
+```bash
+mempalace logstream watch \
+  --agent <AGENT_ID> \
+  --type task.request --type patch.ready \
+  --state-file ~/.mempalace/watch/<AGENT_ID>.json --json
+```
+
+Four things to get right, in the order people get them wrong:
+
+- **Use `--agent`, not `--to-agent`.** `--agent <id>` expands to
+  `--to-agent <id> --exclude-from-agent <id>`. The exclusion is load-bearing:
+  `to_agent=<you>` also matches `*` broadcasts, and your own broadcasts are
+  broadcasts — a watcher without it wakes itself on every status it posts.
+- **React to the exit code, not the output.** `0` means "you have mail" —
+  wake the agent and have it sweep its inbox. `2` means `--idle-exit-ms`
+  expired with nothing; `130` means interrupted. Only `0` starts work.
+- **Always pass `--state-file`.** That file carries the cursor, so a restart
+  resumes exactly where the last run stopped — it may replay one event, it
+  never silently misses one. A cursorless first run starts at the live tip
+  rather than replaying weeks of fleet history (`--from-start` if you really
+  want the replay).
+- **Repeat `--type` to mean "or".** Filter to the events that genuinely need
+  you (`task.request`, `patch.ready`) so routine status traffic doesn't burn
+  wake-ups.
+
+How the loop plugs into a harness:
+
+- **A CLI agent** (Claude Code, Codex) backgrounds the command and treats
+  process exit as the signal to check `mempalace_event_list` with its
+  cursor. Harnesses that re-invoke the agent when a background task
+  finishes get this for free.
+- **A daemon or dashboard** passes `--follow`, which stays alive past the
+  first match and emits one JSON event per line (NDJSON) with `--json`.
+- **A turn-based assistant** that stops existing between prompts cannot
+  watch — and should say so rather than stay silent: publish the cursor it
+  reached and state that it needs a ping. A false watcher is worse than a
+  declared-absent one, because a requester who believes someone is
+  listening stops looking for a human to nudge.
+
+Two etiquette rules close the loop. **Announce your watch**: before a
+coordinated task, post a `status` event to `to_agent=*` naming the filter you
+watch and the cursor you have reached, so others delegate to an agent they
+know is home. And **resume by event id, never by timestamp**: events append
+in arrival order, so a peer's event can sync in already "older" than a
+wall-clock high-water mark — `since_created_at` as a resume cursor drops it
+permanently, `since_event_id` never does.
+
 ## Fleet roles and cadence
 
 Not every agent should do every job. Lessons the fleet reported from its own
@@ -253,13 +326,16 @@ first delegations:
   logstream; they ask their assistant. Its most valuable fleet role is
   translation — turning `patch.ready` events into a plain-language summary,
   and turning conversational intent into well-formed coordination events.
-- **Match inbox cadence to agent shape.** A daemon-adjacent CLI agent can
-  long-poll continuously; an ad hoc assistant should check at session start
-  and before long tasks, and no more.
+- **Match inbox cadence to agent shape.** A CLI agent with a persistent
+  terminal should run `logstream watch` in the background and be woken
+  (see [Keep agents wakeable](#_7-keep-agents-wakeable)); an ad hoc
+  assistant should check at session start and before long tasks, and no
+  more.
 - **Watch your whole inbox, not just known tasks.** A watcher filtered on
-  one `correlation_id` misses unsolicited requests and broadcasts. Poll
-  `to_agent=<you>` (which also matches `*`) with `--since-event-id` as the
-  cursor.
+  one `correlation_id` misses unsolicited requests and broadcasts. Watch
+  (or poll) `to_agent=<you>` — which also matches `*` — with the event id
+  as the cursor; `watch --agent <you>` does exactly this while filtering
+  out your own broadcasts.
 - **Keep memory writes user-visible.** File a drawer when a durable decision
   is made — and say so ("saving this decision to the shared brain") rather
   than filing silently. Transparency is what makes a fleet the user cannot

@@ -105,7 +105,7 @@ can run a background process and react to its exit gets woken:
 ```bash
 mempalace logstream watch \
   --agent mac-claude \
-  --type task.request --type patch.ready \
+  --type task.request --type task.reply --type patch.ready \
   --state-file ~/.mempalace/watch/mac-claude.json --json
 ```
 
@@ -114,10 +114,14 @@ mempalace logstream watch \
   `to_agent=<you>` deliberately matches `*` broadcasts, and your own
   broadcasts are broadcasts, so a watcher without it wakes itself every time
   it posts a status.
-- **Repeat a filter to mean "or"** — `--type task.request --type patch.ready`
-  wakes for either and stays silent for everything else. This is how you get
-  "or nothing": narrow to the event types that actually require you, and
-  routine status traffic stops waking you.
+- **Repeat a filter to mean "or"** — `--type task.request --type task.reply
+  --type patch.ready` wakes for any of them and stays silent for everything
+  else. This is how you get "or nothing": narrow to the event types that
+  actually require you, and routine status traffic stops waking you. If you
+  ever delegate, `task.reply` belongs in the filter: a worker reporting
+  `blocked` or `failed` sends exactly that, and a watcher that rejects it
+  advances its durable cursor past it silently — the delegation then sits
+  unanswered until a manual sweep.
 - **`--state-file`** persists the cursor, so a restart resumes exactly where
   it stopped rather than replaying or skipping. It advances past events that
   were examined and rejected, not only matches. When the cursor cannot be
@@ -164,7 +168,7 @@ by timeout:
 type: status   room: status   to_agent: *   correlation_id: <the task>
 
 <AGENT_ID> is MONITORING this correlation for coordination replies
-(task.request / task.reply / patch.ready / status).
+(task.request / task.reply / patch.ready).
 
 Watching: to_agent=<AGENT_ID> and correlation_id=<id> on stream project/<name>.
 Cursor after: evt_20260811T112013_19320fbd7541
@@ -177,6 +181,18 @@ The four parts that make it useful: **the filter** (so others know what
 reaches you), **the cursor** (so others know what you have already seen),
 **the overlap warning** (so others do not duplicate), and **the fact that a
 watcher exists at all**.
+
+Two hygiene rules keep announcements from becoming noise. Announce in a
+`status` type — which the recommended inbox filter above (`task.request` /
+`task.reply` / `patch.ready`) sleeps through — so the announcement lands in
+everyone's next sweep without burning a wake-up. Keep `status` out of your
+advertised wake filter for the same reason: a fleet whose watchers wake on
+`status` wakes on every announcement;
+an announcement typed as `task.reply` wakes every watching window, and
+self-exclusion only protects an agent from its own events, not from six
+peers announcing back. And announce once per session or when the filter
+changes — never on every re-arm, or a fleet of re-arming watchers wakes
+itself in a loop.
 
 ### Declare when you are *not* watching
 
@@ -250,7 +266,8 @@ Coordination (logstream):
   and treat its exit as "you have mail" (exit 0 = match, 2 = idle). Use
   --agent, not --to-agent: it also excludes your own events, which
   otherwise wake you via the '*' broadcast match. Repeat --type to wake
-  only for what needs you. In-turn, waiting on one known correlation,
+  only for what needs you; if you delegate, include task.reply — blocked
+  and failed arrive as replies. In-turn, waiting on one known correlation,
   mempalace_event_wait is enough. Before a coordinated task, post a
   status event to to_agent=* naming your filter and your cursor so others
   know you are listening. If you are turn-based and cannot watch between

@@ -352,6 +352,13 @@ _last_request_time: float = time.monotonic()
 _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
+# Why no verdict exists, when none does. An empty _sqlite_integrity_errors is
+# ambiguous on its own: quick_check found nothing wrong, or it never ran. Four
+# exits in the refresh leave the list empty and only one of them means the
+# database came back clean. This names one of the others, the palace with no
+# chroma.sqlite3, so the status payload can report an absence rather than a
+# clean bill of health.
+_sqlite_integrity_no_verdict_reason = ""
 # Serializes quick_check runs between the async startup preflight thread and
 # lazy consumers on the protocol thread (double-checked in
 # _ensure_sqlite_integrity_status) so the O(database size) probe never runs
@@ -837,10 +844,11 @@ def _startup_integrity_size_limit_bytes() -> int:
 def _refresh_sqlite_integrity_status() -> None:
     """Refresh the MCP startup SQLite/FTS5 integrity gate.
 
-    Uses repair.sqlite_integrity_errors(), which is read-only and already backs
-    repair preflight. A failure here is treated as an integrity failure so the
-    server does not proceed silently after a malformed FTS5 index or other
-    SQLite-layer corruption (#1818).
+    Uses repair.sqlite_integrity_status(), which wraps the read-only
+    quick_check backing repair preflight and adds whether a verdict exists at
+    all. A failure here is treated as an integrity failure so the server does
+    not proceed silently after a malformed FTS5 index or other SQLite-layer
+    corruption (#1818).
     """
 
     with _sqlite_integrity_refresh_lock:
@@ -852,11 +860,13 @@ def _refresh_sqlite_integrity_status_locked() -> None:
     global _sqlite_integrity_checked
     global _sqlite_integrity_errors
     global _sqlite_integrity_check_error
+    global _sqlite_integrity_no_verdict_reason
 
     if not _config.palace_path or not _is_chroma_backend():
         _sqlite_integrity_checked = True
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
+        _sqlite_integrity_no_verdict_reason = ""
         return
 
     max_bytes = _startup_integrity_size_limit_bytes()
@@ -870,6 +880,12 @@ def _refresh_sqlite_integrity_status_locked() -> None:
             _sqlite_integrity_checked = True
             _sqlite_integrity_errors = []
             _sqlite_integrity_check_error = ""
+            # This exit is its own kind of "no verdict" and does not yet name
+            # itself (#2240). It must at least not inherit the previous
+            # probe's reason: a palace that had no database when the server
+            # started, and has an oversized one now, would otherwise be
+            # described as having no database at all.
+            _sqlite_integrity_no_verdict_reason = ""
             logger.warning(
                 "SQLite startup integrity check skipped: %s is %.0f MB "
                 "(> %.0f MB limit); PRAGMA quick_check would block MCP "
@@ -883,16 +899,36 @@ def _refresh_sqlite_integrity_status_locked() -> None:
             return
 
     try:
-        from .repair import sqlite_integrity_errors
+        from .repair import sqlite_integrity_status
 
-        errors = sqlite_integrity_errors(_config.palace_path)
+        status = sqlite_integrity_status(_config.palace_path)
     except Exception as exc:
         _sqlite_integrity_check_error = (
             f"sqlite integrity probe failed: {type(exc).__name__}: {exc}"
         )
         _sqlite_integrity_errors = [_sqlite_integrity_check_error]
+        _sqlite_integrity_no_verdict_reason = ""
     else:
-        _sqlite_integrity_errors = [str(error) for error in errors if str(error)]
+        fresh_errors = [str(error) for error in status.errors if str(error)]
+        # _sqlite_integrity_payload reads these globals without the lock, so
+        # the order within each branch is chosen to keep that branch's own
+        # window on the safer side: entering "no verdict" records the reason
+        # before the list it explains, and leaving it clears the reason only
+        # once the fresh errors are in place.
+        #
+        # No write order makes the payload safe, and this one does not claim
+        # to. That reader loads the error list more than once, so a refresh
+        # landing between two of its loads can still publish `ok: true` for a
+        # palace with no database. The way to close that is to publish the
+        # verdict as one value, which is a change to what this gate stores
+        # rather than to
+        # the order it stores it in.
+        if status.checked:
+            _sqlite_integrity_errors = fresh_errors
+            _sqlite_integrity_no_verdict_reason = ""
+        else:
+            _sqlite_integrity_no_verdict_reason = status.reason
+            _sqlite_integrity_errors = fresh_errors
         _sqlite_integrity_check_error = ""
 
     _sqlite_integrity_checked = True
@@ -919,6 +955,20 @@ def _ensure_sqlite_integrity_status() -> None:
 def _sqlite_integrity_payload() -> dict:
     _ensure_sqlite_integrity_status()
 
+    # These globals are read one at a time, without the refresh lock, as they
+    # have always been, and a refresh landing between two of those reads can
+    # make this function publish a verdict the gate never held. Both directions
+    # produce one: reading through, as here, can answer `ok: true` for a palace
+    # with no database, because the error list the branch below tests is read
+    # again when the payload is built; snapshotting into locals first can answer
+    # `ok: true` for a palace whose corruption the refresh had just found,
+    # because separate loads stay separate moments either way. A snapshot
+    # therefore trades one window for another of the same class rather than
+    # closing anything, which is why it is not taken here. Holding the refresh
+    # lock across this function would close it, at the cost of serialising every
+    # status read behind an O(database size) probe; publishing the verdict as
+    # one value closes it without that, and is the change worth making.
+    #
     # The integrity gate only knows how to check chroma.sqlite3, and
     # _refresh_sqlite_integrity_status short-circuits for non-chroma backends,
     # so on a non-chroma backend no quick_check runs. Reporting checked/ok true
@@ -945,6 +995,24 @@ def _sqlite_integrity_payload() -> dict:
                     "chroma.sqlite3 integrity check does not run for backend "
                     f"{backend_name or 'unknown'!r}"
                 ),
+            }
+        # Same shape, second way this payload reports an absent verdict: the
+        # backend is chroma, but there was no database to open. Reporting
+        # checked/ok true here would claim a quick_check that never ran. A
+        # palace whose file is unreachable rather than absent does not arrive
+        # here at all: its probe recorded an error, so it falls through to the
+        # verdict payload below with `ok: false`.
+        if _sqlite_integrity_no_verdict_reason:
+            return {
+                "checked": False,
+                "ok": None,
+                "palace": _config.palace_path or "",
+                "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
+                if _config.palace_path
+                else "",
+                "error_count": 0,
+                "errors": [],
+                "reason": _sqlite_integrity_no_verdict_reason,
             }
 
     payload = {
@@ -7089,7 +7157,12 @@ def _http_status_payload(httpd) -> dict:
         os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
     )
     return {
-        "ok": bool(integrity.get("ok")),
+        # `ok` is None in the two cases the payload reports as an absent
+        # verdict: a non-chroma backend (#1931), and a chroma palace with no
+        # database file yet. That is an absence, not a failure, and collapsing
+        # it with bool() would report a freshly installed server as unhealthy.
+        # A missing key is not one of those cases and still fails closed.
+        "ok": integrity.get("ok", False) is not False,
         "server": {
             "name": "mempalace",
             "version": __version__,

@@ -141,7 +141,8 @@ Coordination (logstream):
   and treat its exit as "you have mail" (exit 0 = match, 2 = idle). Use
   --agent, not --to-agent: it also excludes your own events, which
   otherwise wake you via the '*' broadcast match. Repeat --type to wake
-  only for what needs you. In-turn, waiting on one known correlation,
+  only for what needs you; if you delegate, include task.reply — blocked
+  and failed arrive as replies. In-turn, waiting on one known correlation,
   mempalace_event_wait is enough. Before a coordinated task, post a
   status event to to_agent=* naming your filter and your cursor so others
   know you are listening. If you are turn-based and cannot watch between
@@ -322,7 +323,10 @@ How the loop plugs into a harness:
 Two etiquette rules close the loop. **Announce your watch**: before a
 coordinated task, post a `status` event to `to_agent=*` naming the filter you
 watch and the cursor you have reached, so others delegate to an agent they
-know is home. And **resume by event id, never by timestamp**: events append
+know is home. Keep the announcement in a `status` type — one the fleet's
+watchers sleep through — and announce once per session, not on every re-arm:
+an announcement typed as something watchers wake on wakes every window, and
+self-exclusion only guards each agent against its own events. And **resume by event id, never by timestamp**: events append
 in arrival order, so a peer's event can sync in already "older" than a
 wall-clock high-water mark — `since_created_at` as a resume cursor drops it
 permanently, `since_event_id` never does.

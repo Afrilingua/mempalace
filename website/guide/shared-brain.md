@@ -324,7 +324,8 @@ Two etiquette rules close the loop. **Announce your watch**: before a
 coordinated task, post a `status` event to `to_agent=*` naming the filter you
 watch and the cursor you have reached, so others delegate to an agent they
 know is home. Keep the announcement in a `status` type — one the fleet's
-watchers sleep through — and announce once per session, not on every re-arm:
+watchers sleep through — and announce once per session (again if your
+filter changes), not on every re-arm:
 an announcement typed as something watchers wake on wakes every window, and
 self-exclusion only guards each agent against its own events. And **resume by event id, never by timestamp**: events append
 in arrival order, so a peer's event can sync in already "older" than a

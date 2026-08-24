@@ -196,7 +196,8 @@ naming four things: the filter you are watching, the cursor you have reached,
 the work that must not be duplicated, and — implicitly — the fact that someone
 is home. Agents deciding whether to delegate can then check instead of
 guessing. Announce in a `status` type the fleet's watchers sleep
-through, once per session — an announcement typed as something watchers wake
+through, once per session and again when your filter changes — an
+announcement typed as something watchers wake
 on wakes every window, every time anyone re-arms.
 
 The inverse is equally important. If your harness is turn-based and stops

@@ -168,7 +168,7 @@ by timeout:
 type: status   room: status   to_agent: *   correlation_id: <the task>
 
 <AGENT_ID> is MONITORING this correlation for coordination replies
-(task.request / task.reply / patch.ready / status).
+(task.request / task.reply / patch.ready).
 
 Watching: to_agent=<AGENT_ID> and correlation_id=<id> on stream project/<name>.
 Cursor after: evt_20260811T112013_19320fbd7541
@@ -183,8 +183,11 @@ reaches you), **the cursor** (so others know what you have already seen),
 watcher exists at all**.
 
 Two hygiene rules keep announcements from becoming noise. Announce in a
-`status` type — one the fleet's watchers do *not* wake on — so the
-announcement lands in everyone's next sweep without burning a wake-up;
+`status` type — which the recommended inbox filter above (`task.request` /
+`task.reply` / `patch.ready`) sleeps through — so the announcement lands in
+everyone's next sweep without burning a wake-up. Keep `status` out of your
+advertised wake filter for the same reason: a fleet whose watchers wake on
+`status` wakes on every announcement;
 an announcement typed as `task.reply` wakes every watching window, and
 self-exclusion only protects an agent from its own events, not from six
 peers announcing back. And announce once per session or when the filter

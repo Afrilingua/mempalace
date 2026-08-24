@@ -2227,6 +2227,31 @@ class TestWriteTools:
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
 
+    def test_delete_drawer_purges_matching_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Deleting a drawer purges its source's closets too, so the AAAK
+        index keeps no stale pointer at the now-deleted drawer (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_delete_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_delete_drawer("drawer_proj_backend_aaa")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 1
+
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed
+        # System cache (#2002), so a handle taken before the call is dead now.
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert closets_col.get(include=[])["ids"] == []
+
     def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
         """tool_check_duplicate must tolerate None entries in the result lists
         that ChromaDB 1.5.x returns for partially-flushed rows.
@@ -2879,6 +2904,52 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["wing"] == "new_wing"
         assert result["room"] == "new_room"
+
+    def test_update_drawer_content_purges_matching_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Correcting a drawer's content purges its source's closets, which
+        otherwise keep quoting the pre-correction text indefinitely (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", content="[RETRACTED]")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 1
+
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert closets_col.get(include=[])["ids"] == []
+
+    def test_update_drawer_wing_and_room_does_not_purge_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A wing/room move alone leaves the quoted text correct, so it must
+        not purge closets the way a content edit does (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", wing="new_wing", room="new_room")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 0
+
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert len(closets_col.get(include=[])["ids"]) == 1
 
     def test_update_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)

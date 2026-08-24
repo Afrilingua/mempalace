@@ -267,7 +267,7 @@ model it runs:
 ```bash
 mempalace logstream watch \
   --agent <AGENT_ID> \
-  --type task.request --type patch.ready \
+  --type task.request --type task.reply --type patch.ready \
   --state-file ~/.mempalace/watch/<AGENT_ID>.json --json
 ```
 
@@ -284,16 +284,21 @@ Four things to get right, in the order people get them wrong:
   interrupted. Only `0` starts work.
 - **Always pass `--state-file` — but it is the watcher's cursor, not the
   agent's.** The file lets a restarted watcher resume exactly where it
-  stopped: it may replay one event, it never silently misses one. On a
+  stopped: it may replay the batch it printed but had not yet checkpointed
+  — up to `--limit` events, 50 by default — so dedupe by event id; it
+  never silently misses one. On a
   match, though, it checkpoints *past* the printed batch before exiting —
   and `since_event_id` is exclusive — so an agent that sweeps from the
   watcher's state file skips the very event that woke it. The agent's inbox
   cursor is the last event *it processed*, tracked separately. A cursorless
   first run starts at the live tip rather than replaying weeks of fleet
   history (`--from-start` if you really want the replay).
-- **Repeat `--type` to mean "or".** Filter to the events that genuinely need
-  you (`task.request`, `patch.ready`) so routine status traffic doesn't burn
-  wake-ups.
+- **Repeat `--type` to mean "or" — and wake for replies, not just work.**
+  Filter to the events that genuinely need you so routine status traffic
+  doesn't burn wake-ups, but if you ever delegate, include `task.reply`:
+  a worker reporting `blocked` or `failed` sends exactly that, and a
+  watcher that rejects it advances its durable cursor past it silently —
+  the delegation then sits unanswered until a manual sweep.
 
 How the loop plugs into a harness:
 
@@ -304,7 +309,10 @@ How the loop plugs into a harness:
   past the match. Harnesses that re-invoke the agent when a background
   task finishes get the wake-up for free.
 - **A daemon or dashboard** passes `--follow`, which stays alive past the
-  first match and emits one JSON event per line (NDJSON) with `--json`.
+  first match; with `--json` it emits NDJSON — one compact **batch
+  envelope** per line (`{"events": [...], "count": N, "cursor": ...}`),
+  not one event per line. A single poll can match several events, so
+  parse the `events` array.
 - **A turn-based assistant** that stops existing between prompts cannot
   watch — and should say so rather than stay silent: publish the cursor it
   reached and state that it needs a ping. A false watcher is worse than a

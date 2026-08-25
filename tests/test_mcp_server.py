@@ -6574,6 +6574,66 @@ class TestStaleLibraryGate:
         assert "mempalace_reconnect" in hint, "the hint must rule out the wrong remedy by name"
         assert "MEMPALACE_MCP_ALLOW_STALE_LIBRARY" in hint
 
+    def test_refusal_message_names_the_remedy(self, monkeypatch):
+        """Several MCP clients surface only the top-level message and drop
+        `data`, so the message alone must be enough to act on."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+
+        refusal = mcp_server._mcp_stale_library_refusal(1, "mempalace_add_drawer")
+
+        message = refusal["error"]["message"].lower()
+        assert "restart" in message
+        assert "mempalace_reconnect cannot clear this" in refusal["error"]["message"]
+
+    def test_reconnect_result_warns_when_stale(self, monkeypatch):
+        """A reconnect after an upgrade must not answer plain success while
+        every write keeps failing — reconnect cannot reload Python modules."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert result["restart_required"] is True
+        assert "restart" in result["warning"].lower()
+        assert "writes stay refused" in result["warning"]
+        assert result["library_versions"]["packages"] == [
+            {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
+        ]
+
+    def test_reconnect_result_clean_when_versions_match(self, monkeypatch):
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.6.0"})
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert set(result) == {"success", "message"}
+
+    def test_reconnect_warning_suppressed_by_escape_hatch(self, monkeypatch):
+        """With the gate disabled writes actually work, so warning that they
+        are refused would be false."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+        monkeypatch.setenv("MEMPALACE_MCP_ALLOW_STALE_LIBRARY", "1")
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert set(result) == {"success", "message"}
+
     def test_status_payload_carries_its_documented_fields(self, monkeypatch):
         """website/reference/mcp-tools.md promises these keys."""
         from mempalace import mcp_server

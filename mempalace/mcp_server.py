@@ -4362,6 +4362,31 @@ def tool_memories_filed_away():
 # ==================== SETTINGS TOOLS ====================
 
 
+def _attach_stale_library_warning(result: dict) -> dict:
+    """Stamp the stale-library write-guard state onto a reconnect result.
+
+    Reconnect reopens the database but cannot reload Python modules, so it
+    never clears the stale-library gate (#899). Without this, a reconnect
+    after an upgrade answers "success: Reconnected to palace" while every
+    write keeps failing — the caller has no way to tell the two states
+    apart from the reconnect result alone.
+    """
+    payload = _stale_library_payload()
+    if payload.get("stale") and "gate_disabled_by" not in payload:
+        described = ", ".join(
+            f"{entry['package']} {entry['serving']} -> {entry['installed']}"
+            for entry in payload.get("packages", [])
+        )
+        result["library_versions"] = payload
+        result["restart_required"] = True
+        result["warning"] = (
+            f"Reconnected, but this server is still running superseded code ({described}); "
+            "writes stay refused until the MCP server (or the host application that "
+            "spawned it) is restarted — reconnect cannot reload Python modules."
+        )
+    return result
+
+
 def tool_reconnect():
     """Force the MCP server to drop cached ChromaDB + KnowledgeGraph state.
 
@@ -4499,21 +4524,25 @@ def tool_reconnect():
                 result["error"] = "; ".join(close_errors)
             return result
         if close_errors:
-            return {
-                "success": False,
-                "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+            return _attach_stale_library_warning(
+                {
+                    "success": False,
+                    "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+                    "drawers": col.count(),
+                    "vector_disabled": _vector_disabled,
+                    "vector_disabled_reason": _vector_disabled_reason,
+                    "error": "; ".join(close_errors),
+                }
+            )
+        return _attach_stale_library_warning(
+            {
+                "success": True,
+                "message": "Reconnected to palace",
                 "drawers": col.count(),
                 "vector_disabled": _vector_disabled,
                 "vector_disabled_reason": _vector_disabled_reason,
-                "error": "; ".join(close_errors),
             }
-        return {
-            "success": True,
-            "message": "Reconnected to palace",
-            "drawers": col.count(),
-            "vector_disabled": _vector_disabled,
-            "vector_disabled_reason": _vector_disabled_reason,
-        }
+        )
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -6346,9 +6375,15 @@ def _mcp_stale_library_refusal(req_id, tool_name: str):
         "id": req_id,
         "error": {
             "code": _STALE_LIBRARY_ERROR_CODE,
+            # The remedy rides in the message itself, not only in data.hint:
+            # several MCP clients surface only the top-level message of an
+            # error, so a hint-only remedy never reaches the model that has
+            # to act on it.
             "message": (
                 "Server is running a library version that is no longer installed "
-                f"({described}); refusing writes until it is restarted"
+                f"({described}); refusing writes until it is restarted. Restart the "
+                "MCP server (or the host application that spawned it) to pick up the "
+                "installed version — mempalace_reconnect cannot clear this"
             ),
             "data": {
                 "tool": tool_name,

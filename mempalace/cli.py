@@ -2331,6 +2331,13 @@ def cmd_instructions(args):
     run_instructions(name=args.name)
 
 
+def cmd_rules(args):
+    """Output the shared-brain agent rules block for a given agent identity."""
+    from .instructions_cli import run_rules
+
+    run_rules(agent_id=args.agent)
+
+
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
     base_server_cmd = "mempalace-mcp"
@@ -3034,6 +3041,20 @@ def main():
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
+    # rules
+    p_rules = sub.add_parser(
+        "rules",
+        help=(
+            "Output the canonical shared-brain agent rules block for a system "
+            "prompt (CLAUDE.md, GEMINI.md, AGENTS.md, ...)"
+        ),
+    )
+    p_rules.add_argument(
+        "--agent",
+        required=True,
+        help="Stable agent identity to render into the rules, e.g. mac-claude",
+    )
+
     # repair
     p_repair = sub.add_parser(
         "repair",
@@ -3504,6 +3525,7 @@ def main():
 
     dispatch = {
         "init": cmd_init,
+        "rules": cmd_rules,
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,

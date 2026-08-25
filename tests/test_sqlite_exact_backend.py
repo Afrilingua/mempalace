@@ -145,6 +145,37 @@ def test_sqlite_exact_get_preserves_requested_id_order_and_duplicates(tmp_path):
     assert result.documents == ["doc b", "doc a", "doc b"]
 
 
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"where": {"wing": "keep"}},
+        {"where_document": {"$contains": "needle"}},
+        {
+            "where": {"wing": "keep"},
+            "where_document": {"$contains": "needle"},
+        },
+    ],
+)
+def test_sqlite_exact_get_ids_intersects_filters(tmp_path, filters):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["requested", "not-requested", "filtered-out"],
+        documents=["needle requested", "needle other", "different"],
+        metadatas=[{"wing": "keep"}, {"wing": "keep"}, {"wing": "drop"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+
+    result = col.get(
+        ids=["filtered-out", "requested", "requested"],
+        include=[],
+        **filters,
+    )
+
+    assert result.ids == ["requested", "requested"]
+    assert result.documents == []
+    assert result.metadatas == []
+
+
 def _doc_select_sql(col, action):
     """Run ``action`` while tracing SQL; return (result, [documents SELECTs]).
 
@@ -1209,6 +1240,37 @@ def test_sqlite_exact_query_cache_invalidates_on_add(tmp_path):
     )
     second = col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
     assert second.ids[0] == ["new"]
+
+
+def test_sqlite_exact_query_cache_invalidates_after_external_handle_write(tmp_path):
+    reader_backend, reader = _collection(tmp_path)
+    reader.add(
+        ids=["old"],
+        documents=["old"],
+        metadatas=[{}],
+        embeddings=[[0.0, 1.0]],
+    )
+    first = reader.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert first.ids[0] == ["old"]
+
+    writer_backend = SQLiteExactBackend()
+    writer = writer_backend.get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="mempalace_drawers",
+        create=False,
+    )
+    writer.add(
+        ids=["new"],
+        documents=["new"],
+        metadatas=[{}],
+        embeddings=[[1.0, 0.0]],
+    )
+
+    second = reader.query(query_embeddings=[[1.0, 0.0]], n_results=2)
+    assert second.ids[0] == ["new", "old"]
+
+    writer_backend.close()
+    reader_backend.close()
 
 
 def test_sqlite_exact_wing_room_counts(tmp_path):

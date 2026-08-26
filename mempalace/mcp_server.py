@@ -2456,6 +2456,7 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    candidate_strategy: str = "vector",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2466,6 +2467,9 @@ def tool_search(
         return {"error": str(e)}
     # since/before are validated inside search_memories (shared
     # parse_window), which returns the same {"error": ...} shape.
+    candidate_strategy = candidate_strategy or "vector"
+    if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
+        return {"error": "candidate_strategy must be one of ('vector', 'union')"}
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
@@ -2488,6 +2492,7 @@ def tool_search(
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
+        candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
     )
     if _is_transient_index_error(result):
@@ -2508,6 +2513,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
         )
         if not _is_transient_index_error(result):
@@ -5203,6 +5209,11 @@ TOOLS = {
                 "max_distance": {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                },
+                "candidate_strategy": {
+                    "type": "string",
+                    "enum": ["vector", "union"],
+                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
                 },
                 "context": {
                     "type": "string",

@@ -3229,13 +3229,24 @@ def tool_delete_drawer(drawer_id: str):
         col.delete(ids=record["ids"])
         _invalidate_overview_caches()
 
-        logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
+        # Closets are keyed by source_file, not drawer_id (#1722), so a
+        # drawer-only delete strands a closet quoting the now-deleted text (#2325).
+        source_file = record["metadata"].get("source_file")
+        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
+
+        logger.info(
+            "Deleted drawer: %s (%s rows, %s closet(s) purged)",
+            drawer_id,
+            len(record["ids"]),
+            closets_deleted,
+        )
 
         return {
             "success": True,
             "drawer_id": drawer_id,
             "deleted_ids": record["ids"],
             "chunks_deleted": len(record["ids"]),
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3844,6 +3855,13 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
+        # A closet quotes the source file, not the stored drawer, so it only
+        # goes stale on a content change; wing/room alone leaves it correct (#2325).
+        closets_deleted = 0
+        source_file = old_meta.get("source_file")
+        if content is not None and source_file:
+            closets_deleted = _purge_source_closets(source_file, commit=True)
+
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
 
@@ -3873,6 +3891,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 "room": new_meta.get("room", ""),
                 "chunks": len(chunk_ids),
                 "chunk_ids": chunk_ids,
+                "closets_deleted": closets_deleted,
             }
 
         update_kwargs = {"ids": [record["ids"][0]]}
@@ -3890,6 +3909,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "drawer_id": drawer_id,
             "wing": new_meta.get("wing", ""),
             "room": new_meta.get("room", ""),
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

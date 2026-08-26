@@ -26,9 +26,7 @@ def test_qdrant_rest_client_sends_versioned_user_agent(monkeypatch):
 
     monkeypatch.setattr(qdrant.urlrequest, "urlopen", fake_urlopen)
 
-    client = _QdrantRESTClient(
-        _QdrantConfig(url="https://qdrant.example.invalid", timeout=7.5)
-    )
+    client = _QdrantRESTClient(_QdrantConfig(url="https://qdrant.example.invalid", timeout=7.5))
 
     assert client.request("GET", "/collections") == {}
     assert captured["user_agent"] == f"mempalace/{__version__}"

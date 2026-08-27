@@ -23,18 +23,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import urllib.error
-import urllib.request
+
+from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub, forward_json_rpc
 
 from .update_awareness import cached_update_status, schedule_update_check
 
 logger = logging.getLogger(__name__)
 
 # Shared with the in-server forwarder and the CLI forwarder.
-_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
-_HUB_PROXY_TIMEOUT_S = 600.0
+_HUB_FORWARD_ENV = HUB_FORWARD_ENV
+_HUB_PROXY_TIMEOUT_S = HUB_PROXY_TIMEOUT_S
 
 _DEGRADED_NOTICE = (
     "MemPalace is running WITHOUT its shared hub. This session is now serving "
@@ -43,10 +43,6 @@ _DEGRADED_NOTICE = (
     "If several agents are running, expect memory pressure until the hub is "
     "back — check that the MemPalace hub process is alive."
 )
-
-
-def _truthy_env_off(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
 
 
 def _is_plain_stdio_invocation(argv: list) -> bool:
@@ -99,34 +95,12 @@ def _palace_path(argv: list):
 
 def _hub_target(palace_path):
     """Return ``(base_url, headers)`` for a live hub serving our palace, else None."""
-    if _truthy_env_off(_HUB_FORWARD_ENV) or not palace_path:
-        return None
-    try:
-        from . import server_registry
-
-        info = server_registry.read_live_serverinfo(palace_path)
-        if not info or info.get("pid") == os.getpid():
-            return None
-        base_url = server_registry.client_base_url(info)
-        headers = {"Content-Type": "application/json"}
-        token = server_registry.load_server_token(palace_path)
-    except Exception:
-        logger.debug("hub discovery failed", exc_info=True)
-        return None
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return base_url, headers
+    return discover_hub(palace_path)
 
 
 def _forward(base_url: str, headers: dict, request: dict):
     """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
-        raw = resp.read()
-    if not raw:
-        return None
-    return json.loads(raw.decode("utf-8"))
+    return forward_json_rpc(base_url, headers, request, timeout=_HUB_PROXY_TIMEOUT_S)
 
 
 def _annotate_degraded(response):

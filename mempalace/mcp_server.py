@@ -374,6 +374,7 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         # Chroma/FTS5 dependency, so agent coordination stays available
         # even while the main palace index is corrupt and under repair.
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",
@@ -433,6 +434,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_update_drawer",
         "mempalace_diary_write",
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -449,6 +451,7 @@ _MUTATING_TOOLS = frozenset(
 _PEER_WRITER_EXEMPT_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_ack",
         "mempalace_artifact_put",
         "mempalace_patch_submit",
@@ -4719,6 +4722,36 @@ def tool_event_append(
     return {"success": True, "event": event}
 
 
+def tool_task_create(
+    project: str,
+    from_agent: str,
+    to_agent: str,
+    goal: str,
+    branch: str,
+    base_commit: str,
+    done: str,
+):
+    """Create one canonical task request for local or remote MCP clients."""
+    from .tasks import create_task
+
+    try:
+        result = _call_logstream(
+            lambda ls: create_task(
+                ls,
+                project=project,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                goal=goal,
+                branch=branch,
+                base_commit=base_commit,
+                done=done,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, **result}
+
+
 _PREVIEW_BODY_CHARS = 200
 
 
@@ -5626,6 +5659,42 @@ TOOLS = {
             "required": ["type", "stream", "room", "from_agent"],
         },
         "handler": tool_event_append,
+    },
+    "mempalace_task_create": {
+        "description": (
+            "Create a complete immutable task.request for another agent and return its exact"
+            " stored event plus one short ready-to-paste handoff line. Use this instead of"
+            " assembling raw task fields, especially when connected to a remote shared-brain"
+            " hub. The caller must preview the exact task with the user before this append."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Project routing name"},
+                "from_agent": {"type": "string", "description": "Requesting agent identity"},
+                "to_agent": {"type": "string", "description": "Worker agent identity"},
+                "goal": {"type": "string", "description": "Exact verbatim task goal"},
+                "branch": {"type": "string", "description": "Git branch for the work"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Exact commit the worker must start from",
+                },
+                "done": {
+                    "type": "string",
+                    "description": "Exact verbatim definition of done",
+                },
+            },
+            "required": [
+                "project",
+                "from_agent",
+                "to_agent",
+                "goal",
+                "branch",
+                "base_commit",
+                "done",
+            ],
+        },
+        "handler": tool_task_create,
     },
     "mempalace_event_list": {
         "description": (
@@ -7037,6 +7106,7 @@ _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 _HTTP_LOCK_FREE_TOOLS = frozenset(
     {
         "mempalace_event_append",
+        "mempalace_task_create",
         "mempalace_event_list",
         "mempalace_event_wait",
         "mempalace_event_ack",

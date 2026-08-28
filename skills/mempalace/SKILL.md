@@ -120,6 +120,15 @@ Summarize the installed version, palace location or hub URL (without secrets),
 MCP connection, stable agent identity, watcher mode, and the first safe next
 action. For active delegation, hand off to the `mempalace-task` skill.
 
+Ask whether the user wants weekly stable-release checks. The default is no.
+Explain that enabling them contacts PyPI but sends no palace content, identity,
+or telemetry. When enabling, record the installer actually used with
+`mempalace update configure --enable --installer uv-tool` (or `pipx` / `pip`);
+use `--disable` to opt out. Checks never install anything. When `mempalace_status` reports an
+available release, surface it naturally and ask before preparing an
+upgrade. Use `mempalace update plan` to show the exact actions; never execute
+them without explicit approval.
+
 ## Recalling past work
 
 This skill covers setup, mining, and status. For questions about past

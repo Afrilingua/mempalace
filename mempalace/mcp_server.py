@@ -6567,8 +6567,12 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
     if tool_name == "mempalace_status" and isinstance(result, dict):
+        from .update_awareness import cached_update_status, schedule_update_check
+
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
+        result.setdefault("updates", cached_update_status())
+        schedule_update_check()
 
     return result
 
@@ -8484,6 +8488,13 @@ def main():
     os.environ.pop("PYTHONPATH", None)
 
     _install_shutdown_signal_handlers()
+
+    # Consent is persisted locally and defaults off. When enabled, refresh the
+    # release cache in the background so the first agent status call never
+    # waits on PyPI and can naturally surface a newly available version.
+    from .update_awareness import schedule_update_check
+
+    schedule_update_check()
 
     if _args.transport == "http":
         _run_http_loop()

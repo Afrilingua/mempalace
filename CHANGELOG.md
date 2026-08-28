@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Features
 
+- **Release awareness is opt-in and agent-visible.** `mempalace update` can configure or explicitly run stable-release checks and prepare an exact upgrade plan, while `mempalace_status` exposes only cached state so agents can ask for authorization without blocking or installing anything automatically.
+
 - **Skill-first setup is now the recommended agent onboarding path.** `npx skills add MemPalace/mempalace` discovers a guided `mempalace` setup skill that can bootstrap the Python package and MCP connection, distinguish a private local palace from a shared-brain hub or client, assign a stable fleet identity, install the canonical shared-brain rules, and verify logstream readiness. The new `mempalace-task` skill covers active coordination without mixing it into the recall protocol.
 - **High-level task creation turns raw logstream primitives into a complete handoff.** `mempalace task create` and the equivalent remote-safe `mempalace_task_create` MCP tool accept the goal, worker identities, project, branch, immutable hexadecimal base commit id, and definition of done; they reject mutable branch/tag base references, create the canonical immutable `task.request`, generate its correlation id, and return one ready-to-paste line that wakes the destination agent while the exact specification stays in the logstream. `task launch` is an explicit controlled-mode adapter for Codex and Claude: it validates the complete stored request, proves the worker checkout is clean and on the stored branch/base commit, validates the worker identity, releases the logstream handle, and invokes the runner without a shell or permission-bypass flags.
 

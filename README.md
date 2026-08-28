@@ -62,6 +62,13 @@ operations, `mempalace-recall` for search-before-answer recall, and
 itself install the MemPalace CLI or MCP server; the setup skill guides the
 agent through those system changes and verifies the live connection.
 
+During guided setup the agent can offer weekly stable-release checks. They are
+disabled by default, contact only PyPI when enabled, and never install updates
+automatically. Cached availability appears in `mempalace_status`, allowing the
+agent to explain the release and request authorization before showing an exact
+upgrade plan. Setup records whether the runtime came from `uv tool`, `pipx`, or
+`pip` so the plan never proposes an upgrade command for the wrong installation.
+
 ### Direct CLI setup
 
 MemPalace ships a CLI, so install it in an isolated environment to avoid

@@ -11,7 +11,7 @@ capture on the hub machine.
 
 This module gives those local processes a way to find the hub instead of
 fighting it: the HTTP transport records ``{pid, host, port, scheme,
-read_only}`` next to the per-palace bearer token
+read_only, capabilities}`` next to the per-palace bearer token
 (``~/.mempalace/server/<key>/``), and callers use
 :func:`read_live_serverinfo` to decide "forward this write over HTTP" vs
 "no hub — do the write directly".
@@ -66,7 +66,15 @@ def serverinfo_path(palace_path: str) -> Path:
     return server_state_dir(palace_path) / "serverinfo.json"
 
 
-def write_serverinfo(palace_path: str, *, host: str, port: int, scheme: str, read_only: bool):
+def write_serverinfo(
+    palace_path: str,
+    *,
+    host: str,
+    port: int,
+    scheme: str,
+    read_only: bool,
+    capabilities=None,
+):
     """Record this process as the palace's HTTP hub. Returns the file path.
 
     0600 like the token: the record itself is not secret, but the directory
@@ -84,6 +92,7 @@ def write_serverinfo(palace_path: str, *, host: str, port: int, scheme: str, rea
         "port": int(port),
         "scheme": scheme,
         "read_only": bool(read_only),
+        "capabilities": sorted(set(capabilities or [])),
         "palace_path": _canonical(palace_path),
     }
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

@@ -78,7 +78,12 @@ class TestServerRegistry:
     def test_write_then_read_live_roundtrip(self, isolated_home):
         palace = str(isolated_home / "palace")
         path = server_registry.write_serverinfo(
-            palace, host="127.0.0.1", port=8765, scheme="http", read_only=False
+            palace,
+            host="127.0.0.1",
+            port=8765,
+            scheme="http",
+            read_only=False,
+            capabilities=["search_cli_compatible"],
         )
         if os.name != "nt":
             assert oct(os.stat(path).st_mode & 0o777) == "0o600"
@@ -89,6 +94,7 @@ class TestServerRegistry:
         assert info["pid"] == os.getpid()
         assert info["port"] == 8765
         assert info["read_only"] is False
+        assert info["capabilities"] == ["search_cli_compatible"]
 
     def test_shares_directory_with_server_token(self, isolated_home):
         palace = str(isolated_home / "palace")
@@ -220,9 +226,16 @@ def fake_hub(isolated_home):
     hub.stop()
 
 
-def _register_hub(palace, hub, read_only=False):
+def _register_hub(palace, hub, read_only=False, capabilities=None):
+    if capabilities is None:
+        capabilities = ["search_cli_compatible"]
     server_registry.write_serverinfo(
-        palace, host="127.0.0.1", port=hub.port, scheme="http", read_only=read_only
+        palace,
+        host="127.0.0.1",
+        port=hub.port,
+        scheme="http",
+        read_only=read_only,
+        capabilities=capabilities,
     )
 
 
@@ -353,6 +366,14 @@ class TestForwardSearchToHub:
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         _register_hub(palace, fake_hub)
         monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    def test_old_hub_without_cli_compatible_capability_keeps_direct_path(
+        self, isolated_home, fake_hub
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=[])
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         assert fake_hub.requests == []
 

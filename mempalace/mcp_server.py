@@ -2483,6 +2483,8 @@ def tool_search(
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
+        if source_file is not None:
+            return {"error": "cli-compatible search does not support source_file"}
         if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
             return {"error": "cli-compatible search requires an unchanged query"}
         _refresh_vector_disabled_flag()
@@ -8131,6 +8133,7 @@ def _serve_http(host: str, port: int) -> None:
                 port=bound_port,
                 scheme=getattr(httpd, "scheme", "http"),
                 read_only=_READ_ONLY,
+                capabilities=["search_cli_compatible"],
             )
             import atexit
 

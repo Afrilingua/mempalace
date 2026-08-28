@@ -734,6 +734,8 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
     info = server_registry.read_live_serverinfo(palace_path)
     if not info:
         return False
+    if "search_cli_compatible" not in info.get("capabilities", []):
+        return False
 
     base_url = server_registry.client_base_url(info)
     headers = {"Content-Type": "application/json"}

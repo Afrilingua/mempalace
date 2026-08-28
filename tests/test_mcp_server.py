@@ -1934,6 +1934,15 @@ class TestSearchTool:
         assert seen["collection"] is collection
         assert seen["n_results"] == 7
 
+    def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(query="needle", source_file="notes.md", cli_compatible=True)
+
+        assert "source_file" in result["error"]
+
     def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server

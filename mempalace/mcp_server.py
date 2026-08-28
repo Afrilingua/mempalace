@@ -3408,8 +3408,16 @@ def tool_mine(
         }
 
     src = os.path.expanduser(source) if source else ""
-    if not src or not os.path.isdir(src):
-        return {"success": False, "error": f"source directory not found: {source!r}"}
+    # convos accepts one conversation file as well as a directory — the CLI has
+    # always documented it that way ("Directory to mine, or one conversation
+    # file with --mode convos"), and the hooks rely on it: _ingest_transcript
+    # submits a single .jsonl. Because cmd_mine forwards to the hub whenever one
+    # is live, a directory-only precondition here made that documented form
+    # unreachable in the configuration most users run, so every hook transcript
+    # ingest failed against a running hub (#2281). The other modes still walk a
+    # tree, so they keep the directory requirement.
+    if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
+        return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():
         if mode == "convos":
@@ -5357,6 +5365,7 @@ TOOLS = {
     "mempalace_mine": {
         "description": (
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
+            "mode='convos' also accepts a single conversation file. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
             "the mempalace[extract] extra). Runs synchronously and returns the miner's "
@@ -5369,7 +5378,7 @@ TOOLS = {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Directory to mine.",
+                    "description": "Directory to mine, or one conversation file with mode='convos'.",
                 },
                 "mode": {
                     "type": "string",

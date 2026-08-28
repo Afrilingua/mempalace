@@ -683,7 +683,19 @@ class MempalaceConfig:
         overrides without treating hook/UI settings or inactive-backend values
         as stale search state.  The digest keeps secrets out of the registry.
         """
-        backend = self.backend
+        try:
+            # Match the backend selection used by palace.get_collection(),
+            # including artifact auto-detection for an existing palace.
+            from .palace import resolve_backend_name
+
+            backend = resolve_backend_name(self.palace_path)
+            backend_resolution_error = None
+        except Exception as exc:  # noqa: BLE001 - fingerprint must remain total
+            # A mismatched or otherwise invalid palace still needs a stable
+            # digest so the Hub gate can fall back to the direct path, where
+            # normal backend opening reports the actionable error.
+            backend = self.backend
+            backend_resolution_error = f"{type(exc).__name__}: {exc}"
         embedding_model = self.embedding_model
         effective = {
             "backend": backend,
@@ -691,6 +703,8 @@ class MempalaceConfig:
             "embedding_model": embedding_model,
             "lang_explicit": self.lang_explicit,
         }
+        if backend_resolution_error is not None:
+            effective["backend_resolution_error"] = backend_resolution_error
         if embedding_model == "openai-compat":
             effective.update(
                 embedding_api_key=self.embedding_api_key,

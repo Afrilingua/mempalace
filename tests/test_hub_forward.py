@@ -406,7 +406,28 @@ class TestForwardSearchToHub:
         _register_hub(palace, fake_hub)
         config_dir = isolated_home / ".mempalace"
         config_dir.mkdir(exist_ok=True)
-        (config_dir / "config.json").write_text(json.dumps({"backend": "qdrant"}))
+        (config_dir / "config.json").write_text(
+            json.dumps({"backend": "qdrant", "palace_path": palace})
+        )
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    def test_artifact_detected_backend_config_drift_keeps_direct_path(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+        monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
+        palace_path = isolated_home / "palace"
+        palace_path.mkdir()
+        (palace_path / "qdrant_backend.json").write_text("{}")
+        palace = str(palace_path)
+        config_dir = isolated_home / ".mempalace"
+        config_dir.mkdir(exist_ok=True)
+        config_path = config_dir / "config.json"
+        config_path.write_text(json.dumps({"qdrant_timeout": 5}))
+        _register_hub(palace, fake_hub)
+        config_path.write_text(json.dumps({"qdrant_timeout": 15}))
 
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         assert fake_hub.requests == []

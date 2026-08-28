@@ -129,6 +129,31 @@ class TestDispatch:
             "with mempalace_patch_submit or reply with blocked/failed evidence."
         )
 
+    def test_task_create_rejects_a_mutable_base_reference(self, patched_server):
+        created = _result(
+            _call(
+                patched_server,
+                "mempalace_task_create",
+                {
+                    "project": "mempalace",
+                    "from_agent": "mac-claude",
+                    "to_agent": "windows-codex",
+                    "goal": "Fix remote task creation.",
+                    "branch": "fix/remote-task",
+                    "base_commit": "main",
+                    "done": "Focused tests pass and a patch is submitted.",
+                },
+            )
+        )
+
+        assert created == {
+            "success": False,
+            "error": (
+                "task base commit must be a hexadecimal Git object id "
+                "(at least 7 characters), not a branch or tag"
+            ),
+        }
+
     def test_append_then_list(self, patched_server):
         appended = _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
         assert appended["success"] is True

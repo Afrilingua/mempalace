@@ -223,6 +223,26 @@ class TestTaskCli:
             "with mempalace_patch_submit or reply with blocked/failed evidence."
         )
 
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("branch", "", "branch must not be empty"),
+            ("base_commit", "", "base commit must not be empty"),
+            ("base_commit", "main", "not a branch or tag"),
+        ],
+    )
+    def test_create_rejects_incomplete_or_mutable_git_coordinates(
+        self, palace_path, capsys, field, value, message
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(_task_create_args(palace_path, json=True, **{field: value}))
+
+        assert exc.value.code == 1
+        assert message in json.loads(capsys.readouterr().out)["error"]
+
+        cmd_logstream(_list_args(palace_path, type="task.request"))
+        assert json.loads(capsys.readouterr().out)["events"] == []
+
     def test_launch_resolves_task_and_runs_codex_headlessly(
         self, palace_path, tmp_path, capsys, monkeypatch
     ):
@@ -389,6 +409,37 @@ class TestTaskCli:
 
         assert calls[0][0][:3] == ["codex", "exec", "--cd"]
         assert created["task"]["correlation_id"] in calls[0][0][-1]
+
+    def test_launch_rejects_incomplete_remote_task_with_a_controlled_error(self, tmp_path, capsys):
+        task_file = tmp_path / "task-request.json"
+        task_file.write_text(
+            json.dumps(
+                {
+                    "type": "task.request",
+                    "correlation_id": "task_incomplete",
+                    "to_agent": "windows-codex",
+                    "base_commit": "abc1234",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_task(
+                SimpleNamespace(
+                    task_action="launch",
+                    correlation_id=None,
+                    task_file=str(task_file),
+                    runner="codex",
+                    workspace=str(tmp_path),
+                    agent=None,
+                    json=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert "missing required field(s): branch" in error
 
 
 class TestArtifactCli:

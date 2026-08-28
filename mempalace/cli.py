@@ -1971,7 +1971,7 @@ def cmd_task(args):
     """Create and run complete logstream tasks through a small public interface."""
     import json
 
-    from .tasks import create_task, task_handoff
+    from .tasks import create_task, task_handoff, validate_task_request
 
     as_json = getattr(args, "json", False)
     task_file = getattr(args, "task_file", None)
@@ -2015,11 +2015,8 @@ def cmd_task(args):
             try:
                 if task_file:
                     task = json.loads(Path(task_file).read_text(encoding="utf-8"))
-                    if not isinstance(task, dict) or task.get("type") != "task.request":
-                        raise ValueError("--task-file must contain one task.request event object")
-                    correlation_id = task.get("correlation_id")
-                    if not correlation_id:
-                        raise ValueError("--task-file task.request has no correlation_id")
+                    validate_task_request(task, source="--task-file")
+                    correlation_id = task["correlation_id"]
                 else:
                     correlation_id = args.correlation_id
                     events = ls.list_events(
@@ -2031,7 +2028,7 @@ def cmd_task(args):
                         raise ValueError(
                             f"task {correlation_id!r} has multiple requests; refusing to guess"
                         )
-                    task = events[0]
+                    task = validate_task_request(events[0], source=f"task {correlation_id!r}")
                 addressed_agent = task["to_agent"]
                 if args.agent and addressed_agent not in (None, "*", args.agent):
                     raise ValueError(
@@ -3609,7 +3606,9 @@ def main():
     )
     p_task_create.add_argument("--branch", required=True, help="Git branch for the work")
     p_task_create.add_argument(
-        "--base-commit", required=True, help="Exact commit the worker must start from"
+        "--base-commit",
+        required=True,
+        help="Immutable hexadecimal commit id the worker must start from (not a branch or tag)",
     )
     task_done = p_task_create.add_mutually_exclusive_group(required=True)
     task_done.add_argument("--done", default=None, help="Verbatim definition of done")

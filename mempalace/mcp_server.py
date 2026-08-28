@@ -5677,7 +5677,10 @@ TOOLS = {
                 "branch": {"type": "string", "description": "Git branch for the work"},
                 "base_commit": {
                     "type": "string",
-                    "description": "Exact commit the worker must start from",
+                    "description": (
+                        "Immutable hexadecimal commit id the worker must start from;"
+                        " branches and tags are rejected"
+                    ),
                 },
                 "done": {
                     "type": "string",

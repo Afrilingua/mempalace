@@ -507,7 +507,7 @@ body structure, and routing identical to `mempalace task create`.
 | `to_agent` | string | **Yes** | Worker agent identity |
 | `goal` | string | **Yes** | Exact verbatim task goal |
 | `branch` | string | **Yes** | Git branch for the work |
-| `base_commit` | string | **Yes** | Exact commit the worker must start from |
+| `base_commit` | string | **Yes** | Immutable hexadecimal commit id the worker must start from; branches and tags are rejected |
 | `done` | string | **Yes** | Exact verbatim definition of done |
 
 **Returns:** `{ success, task, handoff }`. The caller must preview the exact

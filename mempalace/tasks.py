@@ -4,6 +4,44 @@ import re
 import secrets
 
 
+_IMMUTABLE_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _required_text(value, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"task {field_name} must not be empty")
+    return value.strip()
+
+
+def validate_task_base_commit(value: str) -> str:
+    """Require an immutable abbreviated or full Git object id."""
+    value = _required_text(value, "base commit")
+    if not _IMMUTABLE_COMMIT_RE.fullmatch(value):
+        raise ValueError(
+            "task base commit must be a hexadecimal Git object id "
+            "(at least 7 characters), not a branch or tag"
+        )
+    return value.lower()
+
+
+def validate_task_request(task, *, source: str = "task request") -> dict:
+    """Validate every field the controlled launcher relies on."""
+    if not isinstance(task, dict) or task.get("type") != "task.request":
+        raise ValueError(f"{source} must contain one task.request event object")
+    required = ("correlation_id", "to_agent", "branch", "base_commit")
+    missing = [field for field in required if field not in task]
+    if missing:
+        raise ValueError(f"{source} is missing required field(s): {', '.join(missing)}")
+
+    _required_text(task["correlation_id"], "correlation id")
+    _required_text(task["branch"], "branch")
+    validate_task_base_commit(task["base_commit"])
+    addressed_agent = task["to_agent"]
+    if addressed_agent is not None:
+        _required_text(addressed_agent, "destination agent")
+    return task
+
+
 def task_slug(value: str, fallback: str = "work") -> str:
     """Return a short routing-safe label for task ids and project streams."""
     if not isinstance(value, str):
@@ -32,6 +70,11 @@ def create_task(
     done: str,
 ) -> dict:
     """Append one canonical task request and return it with its handoff line."""
+    project = _required_text(project, "project")
+    from_agent = _required_text(from_agent, "requesting agent")
+    to_agent = _required_text(to_agent, "destination agent")
+    branch = _required_text(branch, "branch")
+    base_commit = validate_task_base_commit(base_commit)
     if not isinstance(goal, str) or not goal.strip():
         raise ValueError("task goal must not be empty")
     if not isinstance(done, str) or not done.strip():

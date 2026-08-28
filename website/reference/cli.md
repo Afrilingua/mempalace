@@ -242,6 +242,8 @@ The command appends an immutable `task.request`, generates a
 `task_<goal>_<entropy>` correlation id, and prints a `Ready to paste` line.
 Use `--goal-file` or `--done-file` when the exact text is multiline. `--json`
 returns `{"task": <event>, "handoff": <line>}`.
+`--base-commit` must be an immutable hexadecimal object id (abbreviated or
+full), not a branch or tag whose target could move after the event is stored.
 
 An explicitly controlled workflow can start a supported headless runner from
 the stored task:

@@ -30,11 +30,12 @@ Gather these fields from the user or current repository state:
 - requesting and destination agent identities;
 - exact goal;
 - target branch;
-- exact base commit;
+- exact hexadecimal base commit id (never a branch or tag);
 - definition of done.
 
-Resolve the branch and base commit from the intended worker checkout, not from
-an unrelated repository. Before appending anything, show the user the **exact normalized task**:
+Resolve the branch and hexadecimal base commit id from the intended worker
+checkout, not from an unrelated repository. Never pass a mutable branch or tag
+as the base commit. Before appending anything, show the user the **exact normalized task**:
 the identities, project, goal, branch, base commit, definition of done, and the
 fact that delivery must close through MemPalace. Logstream events are immutable,
 so obtain approval of that exact content unless the user already explicitly

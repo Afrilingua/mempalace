@@ -29,6 +29,7 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("MEMPALACE_HUB_FORWARD", raising=False)
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
     return tmp_path
 
 
@@ -155,7 +156,7 @@ class TestServerRegistry:
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
-    def __init__(self, mine_result=None, search_result=None, rpc_error=None):
+    def __init__(self, mine_result=None, search_result=None, rpc_error=None, required_token=None):
         self.requests = []
         self.auth_headers = []
         outer = self
@@ -191,10 +192,14 @@ class _FakeHub:
                     self.send_error(404)
 
             def do_POST(self):
+                authorization = self.headers.get("Authorization")
+                outer.auth_headers.append(authorization)
+                if required_token is not None and authorization != f"Bearer {required_token}":
+                    self.send_error(401)
+                    return
                 length = int(self.headers.get("Content-Length", "0"))
                 request = json.loads(self.rfile.read(length))
                 outer.requests.append(request)
-                outer.auth_headers.append(self.headers.get("Authorization"))
                 if rpc_error is not None:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
@@ -382,6 +387,48 @@ class TestForwardSearchToHub:
             assert captured.out == "exact CLI output\n"
             assert "forwarding search to palace hub" in captured.err
             assert captured.err.endswith("legacy metric warning\n")
+        finally:
+            hub.stop()
+
+    @pytest.mark.parametrize("local_token", [None, "stale-token"])
+    def test_authenticated_hub_without_matching_token_keeps_direct_path(
+        self, isolated_home, local_token
+    ):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="actual-token")
+        try:
+            _register_hub(palace, hub)
+            if local_token is not None:
+                server_registry.server_token_path(palace).write_text(local_token)
+
+            assert cli._forward_search_to_hub(_search_args(), palace) is False
+            assert hub.requests == []
+        finally:
+            hub.stop()
+
+    def test_authenticated_hub_with_matching_token_forwards(self, isolated_home):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="actual-token")
+        try:
+            _register_hub(palace, hub)
+            server_registry.server_token_path(palace).write_text("actual-token")
+
+            assert cli._forward_search_to_hub(_search_args(), palace) is True
+            assert len(hub.requests) == 1
+            assert hub.auth_headers == ["Bearer actual-token"]
+        finally:
+            hub.stop()
+
+    def test_authenticated_hub_uses_matching_environment_token(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="environment-token")
+        try:
+            _register_hub(palace, hub)
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "environment-token")
+
+            assert cli._forward_search_to_hub(_search_args(), palace) is True
+            assert len(hub.requests) == 1
+            assert hub.auth_headers == ["Bearer environment-token"]
         finally:
             hub.stop()
 

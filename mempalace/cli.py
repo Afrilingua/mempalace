@@ -777,15 +777,17 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
         ensure_ascii=False,
     ).encode("utf-8")
 
-    print(
-        f"mempalace: forwarding search to palace hub {base_url} (pid {info.get('pid')})",
-        file=sys.stderr,
-    )
     try:
         request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
         with urllib.request.urlopen(request, timeout=_HUB_SEARCH_TIMEOUT_S) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            # Authentication failed before the Hub accepted the search, so
+            # direct execution is still safe. This covers Hubs started with
+            # an explicit/env token that is intentionally not persisted in
+            # the per-palace token file, as well as a stale local token.
+            return False
         print(f"mempalace: hub rejected search ({exc.code} {exc.reason})", file=sys.stderr)
         sys.exit(1)
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
@@ -796,6 +798,11 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    print(
+        f"mempalace: forwarding search to palace hub {base_url} (pid {info.get('pid')})",
+        file=sys.stderr,
+    )
 
     if payload.get("error"):
         err = payload["error"]

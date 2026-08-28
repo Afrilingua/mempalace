@@ -1134,6 +1134,33 @@ class MempalaceConfig:
             return max(1, (os.cpu_count() or 2) // 2)
         return val if val > 0 else 0
 
+    @property
+    def embeddinggemma_batch_size(self) -> int:
+        """Documents per ``session.run()`` for the EmbeddingGemma ONNX model (#2330).
+
+        The sub-batching added for #1770 bounds a run by document COUNT, not
+        allocation: attention buffers scale with ``batch * padded_len ** 2``, so
+        a batch of long documents can still exceed available memory at the
+        module default (``mempalace.embedding._EMBEDDINGGEMMA_BATCH_SIZE``, 32).
+        Read from env ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE`` first, then
+        ``embeddinggemma_batch_size`` in ``config.json``, then the module
+        default. Unset, non-numeric, or non-positive values fall back to the
+        default rather than raising; ``EmbeddinggemmaONNX.__init__`` still
+        raises on an explicitly-passed non-positive ``batch_size``.
+        """
+        from .embedding import _EMBEDDINGGEMMA_BATCH_SIZE
+
+        raw = os.environ.get("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE")
+        if raw is None:
+            raw = self._file_config.get("embeddinggemma_batch_size")
+        if raw is None:
+            return _EMBEDDINGGEMMA_BATCH_SIZE
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _EMBEDDINGGEMMA_BATCH_SIZE
+        return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 

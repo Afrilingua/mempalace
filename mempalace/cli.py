@@ -736,6 +736,9 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
         return False
     if "search_cli_compatible" not in info.get("capabilities", []):
         return False
+    current_config = MempalaceConfig(palace_path=palace_path)
+    if info.get("search_config_fingerprint") != current_config.search_config_fingerprint:
+        return False
 
     base_url = server_registry.client_base_url(info)
     headers = {"Content-Type": "application/json"}

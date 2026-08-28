@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from mempalace import cli, server_registry
+from mempalace.config import MempalaceConfig
 
 
 @pytest.fixture
@@ -84,6 +85,7 @@ class TestServerRegistry:
             scheme="http",
             read_only=False,
             capabilities=["search_cli_compatible"],
+            search_config_fingerprint="config-digest",
         )
         if os.name != "nt":
             assert oct(os.stat(path).st_mode & 0o777) == "0o600"
@@ -95,6 +97,7 @@ class TestServerRegistry:
         assert info["port"] == 8765
         assert info["read_only"] is False
         assert info["capabilities"] == ["search_cli_compatible"]
+        assert info["search_config_fingerprint"] == "config-digest"
 
     def test_shares_directory_with_server_token(self, isolated_home):
         palace = str(isolated_home / "palace")
@@ -226,9 +229,11 @@ def fake_hub(isolated_home):
     hub.stop()
 
 
-def _register_hub(palace, hub, read_only=False, capabilities=None):
+def _register_hub(palace, hub, read_only=False, capabilities=None, search_config_fingerprint=None):
     if capabilities is None:
         capabilities = ["search_cli_compatible"]
+    if search_config_fingerprint is None:
+        search_config_fingerprint = MempalaceConfig(palace_path=palace).search_config_fingerprint
     server_registry.write_serverinfo(
         palace,
         host="127.0.0.1",
@@ -236,6 +241,7 @@ def _register_hub(palace, hub, read_only=False, capabilities=None):
         scheme="http",
         read_only=read_only,
         capabilities=capabilities,
+        search_config_fingerprint=search_config_fingerprint,
     )
 
 
@@ -374,6 +380,32 @@ class TestForwardSearchToHub:
     ):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub, capabilities=[])
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    def test_persisted_config_drift_keeps_direct_path(self, isolated_home, fake_hub):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        config_dir = isolated_home / ".mempalace"
+        config_dir.mkdir(exist_ok=True)
+        (config_dir / "config.json").write_text(json.dumps({"backend": "qdrant"}))
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    def test_hub_start_environment_drift_keeps_direct_path(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        monkeypatch.setenv("MEMPALACE_BACKEND", "qdrant")
+        hub_fingerprint = MempalaceConfig(palace_path=palace).search_config_fingerprint
+        monkeypatch.delenv("MEMPALACE_BACKEND")
+        _register_hub(
+            palace,
+            fake_hub,
+            search_config_fingerprint=hub_fingerprint,
+        )
+
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         assert fake_hub.requests == []
 

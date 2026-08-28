@@ -8134,6 +8134,7 @@ def _serve_http(host: str, port: int) -> None:
                 scheme=getattr(httpd, "scheme", "http"),
                 read_only=_READ_ONLY,
                 capabilities=["search_cli_compatible"],
+                search_config_fingerprint=_config.search_config_fingerprint,
             )
             import atexit
 

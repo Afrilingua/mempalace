@@ -5,6 +5,7 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 """
 
 import errno
+import hashlib
 import json
 import os
 import stat
@@ -667,6 +668,49 @@ class MempalaceConfig:
                 self._file_config_state = "read"
             else:
                 self._file_config_state = "unparsed"
+
+    @property
+    def search_config_fingerprint(self) -> str:
+        """Stable digest of the effective search configuration for this process.
+
+        A long-running Hub keeps this configuration snapshot and may also keep
+        a collection opened from it.  CLI search forwarding compares this
+        digest with a freshly loaded config so a changed ``config.json`` falls
+        back to the direct path instead of querying stale Hub state.
+
+        Include the full parsed object conservatively along with resolved
+        search settings, so both file edits and Hub-start environment overrides
+        are detected.  The digest keeps secrets out of the local registry.
+        """
+        effective = {
+            "backend": self.backend,
+            "collection_name": self.collection_name,
+            "embedding_api_key": self.embedding_api_key,
+            "embedding_api_model": self.embedding_api_model,
+            "embedding_api_url": self.embedding_api_url,
+            "embedding_device": self.embedding_device,
+            "embedding_model": self.embedding_model,
+            "embedding_threads": self.embedding_threads,
+            "lang_explicit": self.lang_explicit,
+            "milvus_consistency_level": self.milvus_consistency_level,
+            "milvus_db_name": self.milvus_db_name,
+            "milvus_namespace": self.milvus_namespace,
+            "milvus_token": self.milvus_token,
+            "milvus_uri": self.milvus_uri,
+            "pgvector_dsn": self.pgvector_dsn,
+            "pgvector_namespace": self.pgvector_namespace,
+            "qdrant_api_key": self.qdrant_api_key,
+            "qdrant_namespace": self.qdrant_namespace,
+            "qdrant_timeout": self.qdrant_timeout,
+            "qdrant_url": self.qdrant_url,
+        }
+        payload = json.dumps(
+            {"effective": effective, "persisted": self._file_config},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def _persist_file_config(self):
         """Write ``_file_config`` to ``config.json``, keeping what it replaces.

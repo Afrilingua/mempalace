@@ -684,17 +684,24 @@ class MempalaceConfig:
         as stale search state.  The digest keeps secrets out of the registry.
         """
         backend = self.backend
+        embedding_model = self.embedding_model
         effective = {
             "backend": backend,
             "collection_name": self.collection_name,
-            "embedding_api_key": self.embedding_api_key,
-            "embedding_api_model": self.embedding_api_model,
-            "embedding_api_url": self.embedding_api_url,
-            "embedding_device": self.embedding_device,
-            "embedding_model": self.embedding_model,
-            "embedding_threads": self.embedding_threads,
+            "embedding_model": embedding_model,
             "lang_explicit": self.lang_explicit,
         }
+        if embedding_model == "openai-compat":
+            effective.update(
+                embedding_api_key=self.embedding_api_key,
+                embedding_api_model=self.embedding_api_model,
+                embedding_api_url=self.embedding_api_url,
+            )
+        else:
+            effective.update(
+                embedding_device=self.embedding_device,
+                embedding_threads=self.embedding_threads,
+            )
         try:
             if backend == "qdrant":
                 effective.update(

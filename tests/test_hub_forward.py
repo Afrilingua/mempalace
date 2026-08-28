@@ -430,6 +430,78 @@ class TestForwardSearchToHub:
         assert cli._forward_search_to_hub(_search_args(), palace) is True
         assert len(fake_hub.requests) == 1
 
+    @pytest.mark.parametrize(
+        ("setting", "value"),
+        [
+            ("embedding_api_key", "rotated-secret"),
+            ("embedding_api_model", "new-api-model"),
+            ("embedding_api_url", "https://embeddings.example.test"),
+        ],
+    )
+    def test_dormant_embedding_api_config_keeps_hub_path(
+        self, isolated_home, fake_hub, setting, value
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        config_dir = isolated_home / ".mempalace"
+        config_dir.mkdir(exist_ok=True)
+        (config_dir / "config.json").write_text(json.dumps({setting: value}))
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is True
+        assert len(fake_hub.requests) == 1
+
+    def test_active_embedding_api_config_drift_keeps_direct_path(self, isolated_home, fake_hub):
+        palace = str(isolated_home / "palace")
+        config_dir = isolated_home / ".mempalace"
+        config_dir.mkdir(exist_ok=True)
+        config_path = config_dir / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "embedding_model": "openai-compat",
+                    "embedding_api_model": "embed-v1",
+                    "embedding_api_url": "https://old.example.test",
+                }
+            )
+        )
+        _register_hub(palace, fake_hub)
+        config_path.write_text(
+            json.dumps(
+                {
+                    "embedding_model": "openai-compat",
+                    "embedding_api_model": "embed-v1",
+                    "embedding_api_url": "https://new.example.test",
+                }
+            )
+        )
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    @pytest.mark.parametrize(
+        ("setting", "value"),
+        [("embedding_device", "cpu"), ("embedding_threads", 2)],
+    )
+    def test_dormant_local_embedding_config_keeps_hub_path(
+        self, isolated_home, fake_hub, setting, value
+    ):
+        palace = str(isolated_home / "palace")
+        config_dir = isolated_home / ".mempalace"
+        config_dir.mkdir(exist_ok=True)
+        config_path = config_dir / "config.json"
+        config = {
+            "embedding_model": "openai-compat",
+            "embedding_api_model": "embed-v1",
+            "embedding_api_url": "https://embeddings.example.test",
+        }
+        config_path.write_text(json.dumps(config))
+        _register_hub(palace, fake_hub)
+        config[setting] = value
+        config_path.write_text(json.dumps(config))
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is True
+        assert len(fake_hub.requests) == 1
+
     def test_hub_start_environment_drift_keeps_direct_path(
         self, isolated_home, fake_hub, monkeypatch
     ):

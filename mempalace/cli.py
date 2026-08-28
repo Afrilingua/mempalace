@@ -761,8 +761,6 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
         "query": args.query,
         "limit": args.results,
         "cli_compatible": True,
-        # The direct CLI historically did not apply a distance cutoff.
-        "max_distance": 0.0,
     }
     for name in ("wing", "room", "since", "before"):
         value = getattr(args, name, None)

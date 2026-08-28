@@ -1912,6 +1912,23 @@ class TestSearchTool:
         assert "error" not in result
         assert seen["candidate_strategy"] == "union"
 
+    def test_search_preserves_default_max_distance(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["max_distance"] = kwargs.get("max_distance")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="needle")
+
+        assert "error" not in result
+        assert seen["max_distance"] == 1.5
+
     def test_search_cli_compatible_reuses_hub_collection(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -1942,6 +1959,26 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="needle", source_file="notes.md", cli_compatible=True)
 
         assert "source_file" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("arguments", "control"),
+        [
+            ({"candidate_strategy": "union"}, "candidate_strategy"),
+            ({"min_similarity": 0.5}, "min_similarity"),
+            ({"max_distance": 0.5}, "max_distance"),
+            ({"context": "background"}, "context"),
+        ],
+    )
+    def test_search_cli_compatible_rejects_ignored_controls(
+        self, monkeypatch, config, kg, arguments, control
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(query="needle", cli_compatible=True, **arguments)
+
+        assert control in result["error"]
 
     def test_search_cli_compatible_returns_stderr(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

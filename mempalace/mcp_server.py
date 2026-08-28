@@ -2458,7 +2458,7 @@ def tool_search(
     source_file: str = None,
     since: str = None,
     before: str = None,
-    max_distance: float = 1.5,
+    max_distance: float = None,
     min_similarity: float = None,
     context: str = None,
     candidate_strategy: str = "vector",
@@ -2476,10 +2476,6 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
-    # Backwards compat: accept old name
-    # Backwards compat: convert old similarity scale (higher=stricter) to
-    # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
-    dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
@@ -2488,6 +2484,19 @@ def tool_search(
 
         if source_file is not None:
             return {"error": "cli-compatible search does not support source_file"}
+        unsupported_controls = []
+        if candidate_strategy != "vector":
+            unsupported_controls.append("candidate_strategy")
+        if min_similarity is not None:
+            unsupported_controls.append("min_similarity")
+        if max_distance is not None:
+            unsupported_controls.append("max_distance")
+        if context is not None:
+            unsupported_controls.append("context")
+        if unsupported_controls:
+            return {
+                "error": "cli-compatible search does not support " + ", ".join(unsupported_controls)
+            }
         if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
             return {"error": "cli-compatible search requires an unchanged query"}
         _refresh_vector_disabled_flag()
@@ -2515,6 +2524,12 @@ def tool_search(
         if error_output.getvalue():
             result["cli_error_output"] = error_output.getvalue()
         return result
+
+    # Backwards compat: convert old similarity scale (higher=stricter) to
+    # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
+    dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
+    if dist is None:
+        dist = 1.5
 
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()

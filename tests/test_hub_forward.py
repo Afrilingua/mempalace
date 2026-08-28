@@ -1,4 +1,4 @@
-"""Hub discovery + mine forwarding.
+"""Hub discovery plus CLI and stdio forwarding.
 
 A long-lived HTTP hub (``mempalace serve``) holds the MCP writer lease for
 its lifetime, which locks the save hooks' spawned ``mempalace mine`` CLI out
@@ -6,9 +6,13 @@ of the palace — transcript capture would silently stop on the hub machine.
 These tests cover the fix: the HTTP transport records a per-palace
 serverinfo file, and ``cmd_mine`` forwards forwardable mines to the live hub
 over HTTP instead of colliding with the lease.
+
+Read-only ``mempalace search`` also forwards to the live hub so agent shell
+commands do not cold-load a private copy of a large HNSW index per process.
 """
 
 import argparse
+import builtins
 import json
 import os
 import threading
@@ -46,6 +50,22 @@ def _mine_args(source_dir, **overrides):
         extract="exchange",
         max_chunks_per_file=None,
         kg_extract=False,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _search_args(**overrides):
+    defaults = dict(
+        query="needle",
+        palace=None,
+        backend=None,
+        global_backend=None,
+        wing=None,
+        room=None,
+        results=5,
+        since=None,
+        before=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -126,12 +146,26 @@ class TestServerRegistry:
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
-    def __init__(self, mine_result=None, rpc_error=None):
+    def __init__(self, mine_result=None, search_result=None, rpc_error=None):
         self.requests = []
         self.auth_headers = []
         outer = self
 
         mine_result = mine_result or {"success": True, "mode": "convos", "output": "filed 1"}
+        search_result = search_result or {
+            "query": "needle",
+            "filters": {"wing": None, "room": None},
+            "results": [
+                {
+                    "text": "matching drawer",
+                    "wing": "project",
+                    "room": "decisions",
+                    "source_file": "notes.md",
+                    "similarity": 0.91,
+                    "bm25_score": 1.25,
+                }
+            ],
+        }
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -155,10 +189,12 @@ class _FakeHub:
                 if rpc_error is not None:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
+                    tool_name = request.get("params", {}).get("name")
+                    tool_result = search_result if tool_name == "mempalace_search" else mine_result
                     payload = {
                         "jsonrpc": "2.0",
                         "id": request.get("id"),
-                        "result": {"content": [{"type": "text", "text": json.dumps(mine_result)}]},
+                        "result": {"content": [{"type": "text", "text": json.dumps(tool_result)}]},
                     }
                 body = json.dumps(payload).encode()
                 self.send_response(200)
@@ -267,6 +303,81 @@ class TestForwardMineToHub:
             assert "read-only server" in capsys.readouterr().err
         finally:
             hub.stop()
+
+
+class TestForwardSearchToHub:
+    def test_forwards_to_read_only_hub_and_prints_cli_results(self, isolated_home, capsys):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub()
+        try:
+            _register_hub(palace, hub, read_only=True)
+            args = _search_args(
+                wing="project",
+                room="decisions",
+                results=8,
+                since="2026-08-01",
+                before="2026-09-01",
+            )
+            assert cli._forward_search_to_hub(args, palace) is True
+            (request,) = hub.requests
+            assert request["params"]["name"] == "mempalace_search"
+            assert request["params"]["arguments"] == {
+                "query": "needle",
+                "limit": 8,
+                "max_distance": 0.0,
+                "wing": "project",
+                "room": "decisions",
+                "since": "2026-08-01",
+                "before": "2026-09-01",
+            }
+            out = capsys.readouterr().out
+            assert 'Results for: "needle"' in out
+            assert "project / decisions" in out
+            assert "matching drawer" in out
+        finally:
+            hub.stop()
+
+    def test_no_hub_or_kill_switch_keeps_direct_path(self, isolated_home, monkeypatch, fake_hub):
+        palace = str(isolated_home / "palace")
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        _register_hub(palace, fake_hub)
+        monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    def test_hub_rpc_error_exits_without_local_fallback(self, isolated_home, capsys):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(rpc_error={"code": -32000, "message": "search failed"})
+        try:
+            _register_hub(palace, hub)
+            with pytest.raises(SystemExit) as exc:
+                cli._forward_search_to_hub(_search_args(), palace)
+            assert exc.value.code == 1
+            assert "search failed" in capsys.readouterr().err
+        finally:
+            hub.stop()
+
+    def test_cmd_search_does_not_open_local_searcher_when_hub_handles_request(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        args = _search_args(palace=palace)
+
+        real_import = builtins.__import__
+
+        def import_without_local_searcher(name, *args, **kwargs):
+            if name == "mempalace.searcher":
+                raise AssertionError("forwarded search must not import the local storage stack")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_local_searcher)
+        cli.cmd_search(args)
+        assert len(fake_hub.requests) == 1
+
+    def test_explicit_backend_is_not_forwardable(self):
+        assert cli._search_args_forwardable(_search_args()) is True
+        assert cli._search_args_forwardable(_search_args(backend="sqlite_exact")) is False
 
 
 class TestForwardability:

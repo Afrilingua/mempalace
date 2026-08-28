@@ -589,10 +589,171 @@ _HUB_HEALTH_TIMEOUT_S = 0.75
 # minutes inside the hub; the forwarder is a background/CLI process, not a
 # hook-budgeted one, so it waits.
 _HUB_MINE_TIMEOUT_S = 3600.0
+_HUB_SEARCH_TIMEOUT_S = 600.0
 
 
 def _hub_forward_disabled() -> bool:
     return os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _search_args_forwardable(args) -> bool:
+    """Return whether the hub's ``mempalace_search`` tool can express this CLI search."""
+    return not _backend_arg(args)
+
+
+def _print_hub_search_result(args, result: dict) -> bool:
+    """Render an MCP search result using the CLI's human-readable shape."""
+    if not isinstance(result, dict):
+        return False
+
+    error = result.get("error")
+    if error:
+        details = result.get("details")
+        message = f"{error}: {details}" if details else str(error)
+        print(f"mempalace: hub search failed: {message}", file=sys.stderr)
+        return False
+
+    hits = result.get("results")
+    if not isinstance(hits, list):
+        return False
+
+    if result.get("vector_disabled") or result.get("fallback") == "bm25_only_via_sqlite":
+        print(
+            "\n  NOTICE: vector search disabled — showing BM25-only results.\n"
+            "          Run `mempalace repair` to restore vector search.\n"
+        )
+
+    if not hits:
+        print(f'\n  No results found for: "{args.query}"')
+        return True
+
+    print(f"\n{'=' * 60}")
+    print(f'  Results for: "{args.query}"')
+    if args.wing:
+        print(f"  Wing: {args.wing}")
+    if args.room:
+        print(f"  Room: {args.room}")
+    if args.since:
+        print(f"  Since: {args.since}")
+    if args.before:
+        print(f"  Before: {args.before}")
+    print(f"{'=' * 60}\n")
+
+    for index, hit in enumerate(hits, 1):
+        wing = hit.get("wing", "?")
+        room = hit.get("room", "?")
+        source = hit.get("source_file", "?")
+        similarity = hit.get("similarity")
+        bm25 = hit.get("bm25_score", 0.0)
+
+        print(f"  [{index}] {wing} / {room}")
+        print(f"      Source: {source}")
+        if similarity is None:
+            print(f"      Match:  bm25={bm25}  (vector disabled)")
+        else:
+            print(f"      Match:  similarity={similarity}  bm25={bm25}")
+        print()
+        for line in (hit.get("text") or "").strip().split("\n"):
+            print(f"      {line}")
+        print()
+        print(f"  {'-' * 56}")
+
+    print()
+    return True
+
+
+def _forward_search_to_hub(args, palace_path: str) -> bool:
+    """Run a CLI search in the palace's HTTP hub, if one is alive.
+
+    A local Chroma search cold-loads the palace's full HNSW index. Reusing the
+    long-lived hub prevents every shell command or agent worker from holding a
+    private copy. If the hub accepts the request but fails mid-flight, do not
+    fall back locally: that would recreate the memory spike this path avoids.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    from . import server_registry
+
+    if _hub_forward_disabled():
+        return False
+    info = server_registry.read_live_serverinfo(palace_path)
+    if not info:
+        return False
+
+    base_url = server_registry.client_base_url(info)
+    headers = {"Content-Type": "application/json"}
+    token = server_registry.load_server_token(palace_path)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
+        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+    arguments = {
+        "query": args.query,
+        "limit": args.results,
+        # The direct CLI historically did not apply a distance cutoff.
+        "max_distance": 0.0,
+    }
+    for name in ("wing", "room", "since", "before"):
+        value = getattr(args, name, None)
+        if value:
+            arguments[name] = value
+
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_search", "arguments": arguments},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    print(
+        f"mempalace: forwarding search to palace hub {base_url} (pid {info.get('pid')})",
+        file=sys.stderr,
+    )
+    try:
+        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+        with urllib.request.urlopen(request, timeout=_HUB_SEARCH_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        print(f"mempalace: hub rejected search ({exc.code} {exc.reason})", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        print(
+            f"mempalace: hub at {base_url} did not complete the search ({exc}); "
+            "not retrying directly because that would load another full index. "
+            f"Set {_HUB_FORWARD_ENV}=0 to force a direct search.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if payload.get("error"):
+        err = payload["error"]
+        print(
+            f"mempalace: hub refused search: {err.get('message', 'unknown error')}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        result = json.loads(payload["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        print("mempalace: hub returned an unrecognized search response", file=sys.stderr)
+        sys.exit(1)
+
+    if not _print_hub_search_result(args, result):
+        sys.exit(1)
+    return True
 
 
 def _mine_args_forwardable(args, include_ignored) -> bool:
@@ -1328,9 +1489,12 @@ def cmd_daemon(args):
 
 
 def cmd_search(args):
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if _search_args_forwardable(args) and _forward_search_to_hub(args, palace_path):
+        return
+
     from .searcher import search, SearchError
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     try:
         search(
             query=args.query,

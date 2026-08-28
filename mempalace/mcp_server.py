@@ -2519,6 +2519,7 @@ def tool_search(
                             _config.palace_path,
                             _config.collection_name,
                             create=False,
+                            repeat_unknown_warning=True,
                         )
                     except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
                         return {"error": "Embedder identity mismatch", "details": str(exc)}

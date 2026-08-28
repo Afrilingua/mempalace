@@ -1975,7 +1975,7 @@ class TestSearchTool:
         assert "minilm" in result["details"]
         assert "embeddinggemma" in result["details"]
 
-    def test_search_cli_compatible_returns_unknown_embedder_warning(self, monkeypatch, config, kg):
+    def test_search_cli_compatible_repeats_unknown_embedder_warning(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import embedding, mcp_server, palace
 
@@ -1997,13 +1997,16 @@ class TestSearchTool:
                 warnings.showwarning = lambda message, *_args, **_kwargs: print(
                     message, file=sys.stderr
                 )
-                result = mcp_server.tool_search(query="needle", cli_compatible=True)
+                results = [
+                    mcp_server.tool_search(query="needle", cli_compatible=True) for _ in range(2)
+                ]
         finally:
             palace._VALIDATED_IDENTITY.clear()
 
-        assert result["cli_output"] == "output\n"
-        assert "no recorded embedder identity" in result["cli_error_output"]
-        assert "mempalace palace set-embedder" in result["cli_error_output"]
+        for result in results:
+            assert result["cli_output"] == "output\n"
+            assert "no recorded embedder identity" in result["cli_error_output"]
+            assert "mempalace palace set-embedder" in result["cli_error_output"]
 
     def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

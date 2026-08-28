@@ -28,6 +28,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from .update_awareness import cached_update_status, schedule_update_check
+
 logger = logging.getLogger(__name__)
 
 # Shared with the in-server forwarder and the CLI forwarder.
@@ -147,6 +149,38 @@ def _annotate_degraded(response):
     return response
 
 
+def _annotate_forwarded_update_status(request: dict, response):
+    """Attach this proxy runtime's cached state beside the hub's state."""
+    params = request.get("params") or {}
+    if request.get("method") != "tools/call" or params.get("name") != "mempalace_status":
+        return response
+
+    local_status = cached_update_status()
+    schedule_update_check()
+    try:
+        content = response["result"]["content"]
+    except (KeyError, TypeError):
+        return response
+    for block in content if isinstance(content, list) else ():
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        try:
+            payload = json.loads(block.get("text", ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        remote_updates = payload.get("updates")
+        if not isinstance(remote_updates, dict):
+            remote_updates = {}
+        elif "server" not in remote_updates and "client" not in remote_updates:
+            remote_updates = {"server": remote_updates}
+        payload["updates"] = {**remote_updates, "client": local_status}
+        block["text"] = json.dumps(payload, indent=2, ensure_ascii=False)
+        break
+    return response
+
+
 class _LocalServer:
     """Lazily-imported full server, plus the background services it expects.
 
@@ -222,7 +256,7 @@ def _handle(request: dict, palace_path, local: _LocalServer):
     if target is not None:
         base_url, headers = target
         try:
-            return _forward(base_url, headers, request)
+            return _annotate_forwarded_update_status(request, _forward(base_url, headers, request))
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
             # Reaching the hub and getting an HTTP error means it may have run
             # the call; so does any mid-flight failure on a mutating tool.

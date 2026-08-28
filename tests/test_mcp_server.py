@@ -7165,9 +7165,11 @@ class TestStaleLibraryGate:
             {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
         ]
         assert decorated["updates"] == {
-            "enabled": True,
-            "installed": "3.6.0",
-            "available": True,
+            "server": {
+                "enabled": True,
+                "installed": "3.6.0",
+                "available": True,
+            }
         }
 
     def test_unreadable_metadata_fails_open_but_says_so(self, monkeypatch):

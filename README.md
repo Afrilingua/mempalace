@@ -64,8 +64,9 @@ agent through those system changes and verifies the live connection.
 
 During guided setup the agent can offer weekly stable-release checks. They are
 disabled by default, contact only PyPI when enabled, and never install updates
-automatically. Cached availability appears in `mempalace_status`, allowing the
-agent to explain the release and request authorization before showing an exact
+automatically. Cached availability appears in scoped `mempalace_status` fields
+for the serving runtime and, when a local proxy is present, its client runtime,
+allowing the agent to explain the release and request authorization before showing an exact
 upgrade plan. Setup records whether the runtime came from `uv tool`, `pipx`, or
 `pip` so the plan never proposes an upgrade command for the wrong installation.
 

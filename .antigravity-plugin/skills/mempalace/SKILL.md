@@ -97,6 +97,7 @@ Release checks are opt-in. Ask before enabling weekly checks with
 `mempalace update configure --enable --installer uv-tool` (or `pipx` / `pip`,
 matching the installation); the default is disabled. Enabling checks
 contacts PyPI but sends no palace content, identity, or telemetry. When
-`mempalace_status` reports an available release, surface it to the user and use
-`mempalace update plan` to show the exact actions. Never install an update
-without explicit user authorization.
+`mempalace_status` reports an available release, distinguish `updates.server`
+from a local proxy's `updates.client`. Use the local update plan only for the
+client scope; a remote server update must be planned and authorized on the hub
+host by its operator. Never install an update without explicit user authorization.

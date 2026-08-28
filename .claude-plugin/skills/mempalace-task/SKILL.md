@@ -17,8 +17,9 @@ discipline live in the public
    either is missing, do not assume the older runtime has update-awareness
    commands. Explain that it is incompatible, hand off to the `mempalace` setup
    skill, and propose the package-manager-appropriate upgrade (`uv tool upgrade
-   mempalace`, `pipx upgrade mempalace`, or `python -m pip install --upgrade
-   mempalace`) plus `npx skills update mempalace mempalace-recall
+   mempalace`, `pipx upgrade mempalace`, or the interpreter backing the active
+   MemPalace command followed by `-m pip install --upgrade mempalace`) plus
+   `npx skills update mempalace mempalace-recall
    mempalace-task`. Require explicit authorization before running anything.
 2. Confirm the MemPalace MCP tools are connected and the active palace is the
    intended shared brain.

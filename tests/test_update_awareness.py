@@ -1,5 +1,7 @@
 """Public-interface tests for opt-in release awareness."""
 
+import json
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -168,9 +170,43 @@ def test_cached_agent_status_and_plan_never_apply_the_upgrade(tmp_path):
     assert cached_update_status(config_dir=tmp_path, installed_version="3.8.0")["available"]
     plan = prepare_upgrade(config_dir=tmp_path, installed_version="3.8.0")
     assert plan["requires_user_authorization"] is True
-    assert plan["actions"][0] == "uv tool upgrade mempalace"
-    assert plan["actions"][1] == ("npx skills update mempalace mempalace-recall mempalace-task")
-    assert all("--yes" not in action for action in plan["actions"])
+    assert plan["actions"][0] == {
+        "kind": "command",
+        "argv": ["uv", "tool", "upgrade", "mempalace"],
+    }
+    assert plan["actions"][1] == {
+        "kind": "command",
+        "argv": ["npx", "skills", "update", "mempalace", "mempalace-recall", "mempalace-task"],
+    }
+    assert plan["actions"][2] == {
+        "kind": "instruction",
+        "text": "restart the MemPalace MCP server or shared hub",
+    }
+    assert plan["actions"][3] == {
+        "kind": "instruction",
+        "text": "refresh agent MCP tool lists",
+    }
+    assert "--yes" not in json.dumps(plan["actions"])
+
+
+def test_pip_plan_targets_the_interpreter_running_mempalace(tmp_path, monkeypatch):
+    runtime = tmp_path / "venv" / "bin" / "python"
+    monkeypatch.setattr(sys, "executable", str(runtime))
+    configure_updates(config_dir=tmp_path, enabled=True, installer="pip")
+    check_updates(
+        config_dir=tmp_path,
+        installed_version="3.8.0",
+        fetch_latest=lambda: "3.9.0",
+        now=NOW,
+        force=True,
+    )
+
+    plan = prepare_upgrade(config_dir=tmp_path, installed_version="3.8.0")
+
+    assert plan["actions"][0] == {
+        "kind": "command",
+        "argv": [str(runtime), "-m", "pip", "install", "--upgrade", "mempalace"],
+    }
 
 
 def test_opted_in_background_check_publishes_cached_state_for_agents(tmp_path):

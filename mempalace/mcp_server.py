@@ -6571,7 +6571,7 @@ def _decorate_mcp_tool_result(tool_name: str, result):
 
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
-        result.setdefault("updates", cached_update_status())
+        result.setdefault("updates", {"server": cached_update_status()})
         schedule_update_check()
 
     return result
@@ -8265,7 +8265,11 @@ def _dispatch_stdio_request(request: dict):
         return handle_request(request)
     base_url, headers = target
     try:
-        return _forward_request_to_hub(base_url, headers, request)
+        from .mcp_proxy import _annotate_forwarded_update_status
+
+        return _annotate_forwarded_update_status(
+            request, _forward_request_to_hub(base_url, headers, request)
+        )
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
@@ -19,10 +20,19 @@ _CACHE_FILE = "updates-cache.json"
 _STABLE_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 _CHECK_LOCK = threading.Lock()
 _INSTALL_ACTIONS = {
-    "uv-tool": "uv tool upgrade mempalace",
-    "pipx": "pipx upgrade mempalace",
-    "pip": "python -m pip install --upgrade mempalace",
+    "uv-tool": ("uv", "tool", "upgrade", "mempalace"),
+    "pipx": ("pipx", "upgrade", "mempalace"),
+    "pip": None,
 }
+
+
+def _installer_action(installer: str) -> dict:
+    argv = (
+        [sys.executable, "-m", "pip", "install", "--upgrade", "mempalace"]
+        if installer == "pip"
+        else list(_INSTALL_ACTIONS[installer] or ())
+    )
+    return {"kind": "command", "argv": argv}
 
 
 def _config_dir(value=None) -> Path:
@@ -183,7 +193,7 @@ def prepare_upgrade(
             "installed": installed_version,
             "latest": status["latest"],
             "requires_installer_selection": True,
-            "installers": dict(_INSTALL_ACTIONS),
+            "installers": {name: _installer_action(name) for name in _INSTALL_ACTIONS},
             "actions": [],
         }
     return {
@@ -192,10 +202,23 @@ def prepare_upgrade(
         "latest": status["latest"],
         "requires_user_authorization": True,
         "actions": [
-            _INSTALL_ACTIONS[installer],
-            "npx skills update mempalace mempalace-recall mempalace-task",
-            "restart the MemPalace MCP server or shared hub",
-            "refresh agent MCP tool lists",
+            _installer_action(installer),
+            {
+                "kind": "command",
+                "argv": [
+                    "npx",
+                    "skills",
+                    "update",
+                    "mempalace",
+                    "mempalace-recall",
+                    "mempalace-task",
+                ],
+            },
+            {
+                "kind": "instruction",
+                "text": "restart the MemPalace MCP server or shared hub",
+            },
+            {"kind": "instruction", "text": "refresh agent MCP tool lists"},
         ],
     }
 

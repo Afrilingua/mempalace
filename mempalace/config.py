@@ -678,9 +678,10 @@ class MempalaceConfig:
         digest with a freshly loaded config so a changed ``config.json`` falls
         back to the direct path instead of querying stale Hub state.
 
-        Include the full parsed object conservatively along with resolved
-        search settings, so both file edits and Hub-start environment overrides
-        are detected.  The digest keeps secrets out of the local registry.
+        Hash only resolved settings that affect the currently selected search
+        backend.  This detects relevant file edits and Hub-start environment
+        overrides without treating hook/UI settings or inactive-backend values
+        as stale search state.  The digest keeps secrets out of the registry.
         """
         backend = self.backend
         effective = {
@@ -722,10 +723,7 @@ class MempalaceConfig:
             # CLI crash before the direct-path fallback can be selected.
             effective["backend_config_error"] = f"{type(exc).__name__}: {exc}"
         payload = json.dumps(
-            {"effective": effective, "persisted": self._file_config},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+            effective, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 

@@ -411,15 +411,24 @@ class TestForwardSearchToHub:
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         assert fake_hub.requests == []
 
-    def test_invalid_unused_config_drift_keeps_direct_path(self, isolated_home, fake_hub):
+    def test_hook_setting_write_keeps_hub_path(self, isolated_home, fake_hub):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+
+        MempalaceConfig().set_hook_setting("silent_save", True)
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is True
+        assert len(fake_hub.requests) == 1
+
+    def test_invalid_inactive_backend_setting_keeps_hub_path(self, isolated_home, fake_hub):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub)
         config_dir = isolated_home / ".mempalace"
         config_dir.mkdir(exist_ok=True)
         (config_dir / "config.json").write_text(json.dumps({"milvus_consistency_level": "invalid"}))
 
-        assert cli._forward_search_to_hub(_search_args(), palace) is False
-        assert fake_hub.requests == []
+        assert cli._forward_search_to_hub(_search_args(), palace) is True
+        assert len(fake_hub.requests) == 1
 
     def test_hub_start_environment_drift_keeps_direct_path(
         self, isolated_home, fake_hub, monkeypatch

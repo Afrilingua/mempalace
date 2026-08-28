@@ -258,14 +258,15 @@ def client_base_url(info: dict) -> str:
 def load_server_token(palace_path: str) -> str:
     """The available Hub bearer token, or "" when none is configured.
 
-    An explicit environment token has the same precedence as ``cmd_serve``;
-    otherwise use the per-palace token file created for an auto-generated
-    credential.
+    Prefer the target palace's token file.  A process-level environment token
+    may belong to a different palace when multiple hubs are running, so it is
+    only a fallback for hubs started with an explicit token that was not
+    persisted.
     """
-    env_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
-    if env_token:
-        return env_token
     try:
-        return server_token_path(palace_path).read_text(encoding="utf-8").strip()
+        palace_token = server_token_path(palace_path).read_text(encoding="utf-8").strip()
     except OSError:
-        return ""
+        palace_token = ""
+    if palace_token:
+        return palace_token
+    return os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()

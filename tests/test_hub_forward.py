@@ -149,6 +149,21 @@ class TestServerRegistry:
         info = {"host": "192.168.0.7", "port": 9999, "scheme": "https"}
         assert server_registry.client_base_url(info) == "https://192.168.0.7:9999"
 
+    def test_target_palace_token_precedes_process_environment(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace-b")
+        token_path = server_registry.server_token_path(palace)
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text("palace-b-token\n")
+        monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "palace-a-token")
+
+        assert server_registry.load_server_token(palace) == "palace-b-token"
+
+    def test_process_environment_is_fallback_without_palace_token(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace")
+        monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "explicit-token")
+
+        assert server_registry.load_server_token(palace) == "explicit-token"
+
 
 # ── mine forwarding ──────────────────────────────────────────────────
 
@@ -274,6 +289,22 @@ class TestForwardMineToHub:
         token_path.write_text("sekrit\n")
         cli._forward_mine_to_hub(_mine_args(tmp_path), palace)
         assert fake_hub.auth_headers == ["Bearer sekrit"]
+
+    def test_uses_target_palace_token_instead_of_unrelated_environment_token(
+        self, isolated_home, tmp_path, monkeypatch
+    ):
+        palace = str(isolated_home / "palace-b")
+        hub = _FakeHub(required_token="palace-b-token")
+        try:
+            _register_hub(palace, hub)
+            server_registry.server_token_path(palace).write_text("palace-b-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "palace-a-token")
+
+            assert cli._forward_mine_to_hub(_mine_args(tmp_path), palace) is True
+            assert hub.auth_headers == ["Bearer palace-b-token"]
+            assert len(hub.requests) == 1
+        finally:
+            hub.stop()
 
     def test_no_hub_returns_false(self, isolated_home, tmp_path):
         palace = str(isolated_home / "palace")
@@ -429,6 +460,22 @@ class TestForwardSearchToHub:
             assert cli._forward_search_to_hub(_search_args(), palace) is True
             assert len(hub.requests) == 1
             assert hub.auth_headers == ["Bearer environment-token"]
+        finally:
+            hub.stop()
+
+    def test_authenticated_hub_prefers_target_token_over_unrelated_environment(
+        self, isolated_home, monkeypatch
+    ):
+        palace = str(isolated_home / "palace-b")
+        hub = _FakeHub(required_token="palace-b-token")
+        try:
+            _register_hub(palace, hub)
+            server_registry.server_token_path(palace).write_text("palace-b-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "palace-a-token")
+
+            assert cli._forward_search_to_hub(_search_args(), palace) is True
+            assert hub.auth_headers == ["Bearer palace-b-token"]
+            assert len(hub.requests) == 1
         finally:
             hub.stop()
 

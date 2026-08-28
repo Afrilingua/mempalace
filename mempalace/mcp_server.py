@@ -82,8 +82,10 @@ from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
+    SearchError,
     _distance_to_similarity,
     _metric_for_collection,
+    search as cli_search,
     search_memories,
 )
 from .palace_graph import (  # noqa: E402
@@ -2460,6 +2462,7 @@ def tool_search(
     min_similarity: float = None,
     context: str = None,
     candidate_strategy: str = "vector",
+    cli_compatible: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2479,6 +2482,30 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    if cli_compatible:
+        if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
+            return {"error": "cli-compatible search requires an unchanged query"}
+        _refresh_vector_disabled_flag()
+        collection = None if _vector_disabled else _get_collection()
+        if collection is None and not _vector_disabled:
+            return _collection_error_or_no_palace()
+        try:
+            _, output = _capture_fd_stdout(
+                lambda: cli_search(
+                    query=query,
+                    palace_path=_config.palace_path,
+                    wing=wing,
+                    room=room,
+                    n_results=limit,
+                    since=since,
+                    before=before,
+                    collection=collection,
+                )
+            )
+        except SearchError as exc:
+            return {"error": str(exc)}
+        return {"query": query, "cli_output": output}
+
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -5255,6 +5282,10 @@ TOOLS = {
                     "type": "string",
                     "enum": ["vector", "union"],
                     "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                },
+                "cli_compatible": {
+                    "type": "boolean",
+                    "description": "Preserve standalone CLI candidate selection, ranking, and output. Used by the CLI Hub forwarder.",
                 },
                 "context": {
                     "type": "string",

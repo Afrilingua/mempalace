@@ -591,6 +591,29 @@ _HUB_HEALTH_TIMEOUT_S = 0.75
 _HUB_MINE_TIMEOUT_S = 3600.0
 _HUB_SEARCH_TIMEOUT_S = 600.0
 _HUB_SEARCH_MAX_RESULTS = 100
+_SEARCH_OVERRIDE_ENV_VARS = (
+    "MEMPALACE_BACKEND",
+    "MEMPALACE_BACKEND_EXPLICIT",
+    "MEMPALACE_EMBEDDING_API_KEY",
+    "MEMPALACE_EMBEDDING_API_MODEL",
+    "MEMPALACE_EMBEDDING_API_URL",
+    "MEMPALACE_EMBEDDING_DEVICE",
+    "MEMPALACE_EMBEDDING_MODEL",
+    "MEMPALACE_EMBEDDING_THREADS",
+    "MEMPALACE_LANG",
+    "MEMPAL_LANG",
+    "MEMPALACE_MILVUS_CONSISTENCY_LEVEL",
+    "MEMPALACE_MILVUS_DB_NAME",
+    "MEMPALACE_MILVUS_NAMESPACE",
+    "MEMPALACE_MILVUS_TOKEN",
+    "MEMPALACE_MILVUS_URI",
+    "MEMPALACE_PGVECTOR_DSN",
+    "MEMPALACE_PGVECTOR_NAMESPACE",
+    "MEMPALACE_QDRANT_API_KEY",
+    "MEMPALACE_QDRANT_NAMESPACE",
+    "MEMPALACE_QDRANT_TIMEOUT",
+    "MEMPALACE_QDRANT_URL",
+)
 
 
 def _hub_forward_disabled() -> bool:
@@ -601,7 +624,7 @@ def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
     if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
-    if any(os.environ.get(name, "").strip() for name in ("MEMPALACE_LANG", "MEMPAL_LANG")):
+    if any(os.environ.get(name, "").strip() for name in _SEARCH_OVERRIDE_ENV_VARS):
         return False
 
     # The MCP tool sanitizes queries longer than its safe passthrough window.
@@ -637,6 +660,11 @@ def _print_hub_search_result(args, result: dict) -> bool:
         message = f"{error}: {details}" if details else str(error)
         print(f"mempalace: hub search failed: {message}", file=sys.stderr)
         return False
+
+    cli_output = result.get("cli_output")
+    if isinstance(cli_output, str):
+        print(cli_output, end="")
+        return True
 
     hits = result.get("results")
     if not isinstance(hits, list):
@@ -724,6 +752,7 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
     arguments = {
         "query": args.query,
         "limit": args.results,
+        "cli_compatible": True,
         # The direct CLI historically did not apply a distance cutoff.
         "max_distance": 0.0,
     }

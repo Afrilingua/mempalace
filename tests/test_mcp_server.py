@@ -1912,6 +1912,28 @@ class TestSearchTool:
         assert "error" not in result
         assert seen["candidate_strategy"] == "union"
 
+    def test_search_cli_compatible_reuses_hub_collection(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        collection = object()
+        seen = {}
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+        def fake_cli_search(**kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(mcp_server, "cli_search", fake_cli_search)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "exact CLI\n"))
+
+        result = mcp_server.tool_search(query="needle", limit=7, cli_compatible=True)
+
+        assert result == {"query": "needle", "cli_output": "exact CLI\n"}
+        assert seen["collection"] is collection
+        assert seen["n_results"] == 7
+
     def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server

@@ -324,6 +324,7 @@ class TestForwardSearchToHub:
             assert request["params"]["arguments"] == {
                 "query": "needle",
                 "limit": 8,
+                "cli_compatible": True,
                 "max_distance": 0.0,
                 "wing": "project",
                 "room": "decisions",
@@ -334,6 +335,16 @@ class TestForwardSearchToHub:
             assert 'Results for: "needle"' in out
             assert "project / decisions" in out
             assert "matching drawer" in out
+        finally:
+            hub.stop()
+
+    def test_prints_cli_compatible_hub_output_verbatim(self, isolated_home, capsys):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(search_result={"query": "needle", "cli_output": "exact CLI output\n"})
+        try:
+            _register_hub(palace, hub)
+            assert cli._forward_search_to_hub(_search_args(), palace) is True
+            assert capsys.readouterr().out == "exact CLI output\n"
         finally:
             hub.stop()
 
@@ -412,10 +423,20 @@ class TestForwardSearchToHub:
             is True
         )
 
-    @pytest.mark.parametrize("env_name", ["MEMPALACE_LANG", "MEMPAL_LANG"])
-    def test_per_invocation_language_override_is_not_forwardable(self, monkeypatch, env_name):
-        monkeypatch.delenv("MEMPALACE_LANG", raising=False)
-        monkeypatch.delenv("MEMPAL_LANG", raising=False)
+    @pytest.mark.parametrize(
+        "env_name",
+        [
+            "MEMPALACE_LANG",
+            "MEMPAL_LANG",
+            "MEMPALACE_BACKEND",
+            "MEMPALACE_EMBEDDING_MODEL",
+            "MEMPALACE_EMBEDDING_API_URL",
+            "MEMPALACE_QDRANT_URL",
+        ],
+    )
+    def test_per_invocation_search_override_is_not_forwardable(self, monkeypatch, env_name):
+        for name in cli._SEARCH_OVERRIDE_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv(env_name, "en")
         assert cli._search_args_forwardable(_search_args()) is False
 

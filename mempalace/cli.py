@@ -663,6 +663,9 @@ def _print_hub_search_result(args, result: dict) -> bool:
 
     cli_output = result.get("cli_output")
     if isinstance(cli_output, str):
+        cli_error_output = result.get("cli_error_output")
+        if isinstance(cli_error_output, str):
+            print(cli_error_output, end="", file=sys.stderr)
         print(cli_output, end="")
         return True
 

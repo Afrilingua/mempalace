@@ -682,8 +682,9 @@ class MempalaceConfig:
         search settings, so both file edits and Hub-start environment overrides
         are detected.  The digest keeps secrets out of the local registry.
         """
+        backend = self.backend
         effective = {
-            "backend": self.backend,
+            "backend": backend,
             "collection_name": self.collection_name,
             "embedding_api_key": self.embedding_api_key,
             "embedding_api_model": self.embedding_api_model,
@@ -692,18 +693,34 @@ class MempalaceConfig:
             "embedding_model": self.embedding_model,
             "embedding_threads": self.embedding_threads,
             "lang_explicit": self.lang_explicit,
-            "milvus_consistency_level": self.milvus_consistency_level,
-            "milvus_db_name": self.milvus_db_name,
-            "milvus_namespace": self.milvus_namespace,
-            "milvus_token": self.milvus_token,
-            "milvus_uri": self.milvus_uri,
-            "pgvector_dsn": self.pgvector_dsn,
-            "pgvector_namespace": self.pgvector_namespace,
-            "qdrant_api_key": self.qdrant_api_key,
-            "qdrant_namespace": self.qdrant_namespace,
-            "qdrant_timeout": self.qdrant_timeout,
-            "qdrant_url": self.qdrant_url,
         }
+        try:
+            if backend == "qdrant":
+                effective.update(
+                    qdrant_api_key=self.qdrant_api_key,
+                    qdrant_namespace=self.qdrant_namespace,
+                    qdrant_timeout=self.qdrant_timeout,
+                    qdrant_url=self.qdrant_url,
+                )
+            elif backend == "milvus":
+                effective.update(
+                    milvus_consistency_level=self.milvus_consistency_level,
+                    milvus_db_name=self.milvus_db_name,
+                    milvus_namespace=self.milvus_namespace,
+                    milvus_token=self.milvus_token,
+                    milvus_uri=self.milvus_uri,
+                )
+            elif backend == "pgvector":
+                effective.update(
+                    pgvector_dsn=self.pgvector_dsn,
+                    pgvector_namespace=self.pgvector_namespace,
+                )
+        except (TypeError, ValueError) as exc:
+            # Invalid active-backend settings still need a stable digest. The
+            # backend will report their validation error if search reaches it;
+            # fingerprinting must never turn an unrelated config edit into a
+            # CLI crash before the direct-path fallback can be selected.
+            effective["backend_config_error"] = f"{type(exc).__name__}: {exc}"
         payload = json.dumps(
             {"effective": effective, "persisted": self._file_config},
             ensure_ascii=False,

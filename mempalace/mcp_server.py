@@ -2483,6 +2483,9 @@ def tool_search(
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
     if cli_compatible:
+        import contextlib
+        import io
+
         if source_file is not None:
             return {"error": "cli-compatible search does not support source_file"}
         if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
@@ -2491,22 +2494,27 @@ def tool_search(
         collection = None if _vector_disabled else _get_collection()
         if collection is None and not _vector_disabled:
             return _collection_error_or_no_palace()
+        error_output = io.StringIO()
         try:
-            _, output = _capture_fd_stdout(
-                lambda: cli_search(
-                    query=query,
-                    palace_path=_config.palace_path,
-                    wing=wing,
-                    room=room,
-                    n_results=limit,
-                    since=since,
-                    before=before,
-                    collection=collection,
+            with contextlib.redirect_stderr(error_output):
+                _, output = _capture_fd_stdout(
+                    lambda: cli_search(
+                        query=query,
+                        palace_path=_config.palace_path,
+                        wing=wing,
+                        room=room,
+                        n_results=limit,
+                        since=since,
+                        before=before,
+                        collection=collection,
+                    )
                 )
-            )
         except SearchError as exc:
             return {"error": str(exc)}
-        return {"query": query, "cli_output": output}
+        result = {"query": query, "cli_output": output}
+        if error_output.getvalue():
+            result["cli_error_output"] = error_output.getvalue()
+        return result
 
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()

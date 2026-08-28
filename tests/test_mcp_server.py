@@ -1943,6 +1943,28 @@ class TestSearchTool:
 
         assert "source_file" in result["error"]
 
+    def test_search_cli_compatible_returns_stderr(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+
+        def fake_cli_search(**_kwargs):
+            print("legacy metric warning", file=sys.stderr)
+
+        monkeypatch.setattr(mcp_server, "cli_search", fake_cli_search)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "CLI output\n"))
+
+        result = mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        assert result == {
+            "query": "needle",
+            "cli_output": "CLI output\n",
+            "cli_error_output": "legacy metric warning\n",
+        }
+
     def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server

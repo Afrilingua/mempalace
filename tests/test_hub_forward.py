@@ -367,6 +367,25 @@ class TestForwardSearchToHub:
         finally:
             hub.stop()
 
+    def test_prints_cli_compatible_hub_stderr_verbatim(self, isolated_home, capsys):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(
+            search_result={
+                "query": "needle",
+                "cli_output": "exact CLI output\n",
+                "cli_error_output": "legacy metric warning\n",
+            }
+        )
+        try:
+            _register_hub(palace, hub)
+            assert cli._forward_search_to_hub(_search_args(), palace) is True
+            captured = capsys.readouterr()
+            assert captured.out == "exact CLI output\n"
+            assert "forwarding search to palace hub" in captured.err
+            assert captured.err.endswith("legacy metric warning\n")
+        finally:
+            hub.stop()
+
     def test_no_hub_or_kill_switch_keeps_direct_path(self, isolated_home, monkeypatch, fake_hub):
         palace = str(isolated_home / "palace")
         assert cli._forward_search_to_hub(_search_args(), palace) is False
@@ -389,6 +408,16 @@ class TestForwardSearchToHub:
         config_dir = isolated_home / ".mempalace"
         config_dir.mkdir(exist_ok=True)
         (config_dir / "config.json").write_text(json.dumps({"backend": "qdrant"}))
+
+        assert cli._forward_search_to_hub(_search_args(), palace) is False
+        assert fake_hub.requests == []
+
+    def test_invalid_unused_config_drift_keeps_direct_path(self, isolated_home, fake_hub):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        config_dir = isolated_home / ".mempalace"
+        config_dir.mkdir(exist_ok=True)
+        (config_dir / "config.json").write_text(json.dumps({"milvus_consistency_level": "invalid"}))
 
         assert cli._forward_search_to_hub(_search_args(), palace) is False
         assert fake_hub.requests == []

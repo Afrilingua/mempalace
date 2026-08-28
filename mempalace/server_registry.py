@@ -11,10 +11,10 @@ capture on the hub machine.
 
 This module gives those local processes a way to find the hub instead of
 fighting it: the HTTP transport records ``{pid, host, port, scheme,
-read_only, capabilities, search_config_fingerprint, auth_token_source}``
-next to the per-palace bearer token (``~/.mempalace/server/<key>/``), and
-callers use :func:`read_live_serverinfo` to decide "forward this write over
-HTTP" vs "no hub — do the write directly".
+read_only, capabilities, search_config_fingerprint}`` next to the per-palace
+bearer token (``~/.mempalace/server/<key>/``), and callers use
+:func:`read_live_serverinfo` to decide "forward this write over HTTP" vs
+"no hub — do the write directly".
 
 The registry is local-machine only by design: it lives under the user's
 home, is keyed by the canonical palace path, and a record is trusted only
@@ -25,7 +25,6 @@ that every reader ignores and the next hub overwrites.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -75,24 +74,6 @@ def _read_server_token_file(palace_path: str) -> str:
         return ""
 
 
-def _active_auth_token_source(palace_path: str) -> str:
-    """Describe where this Hub's effective HTTP token came from.
-
-    ``cmd_serve`` always passes the effective token to the HTTP child through
-    ``MEMPALACE_MCP_HTTP_TOKEN``.  When that value equals the per-palace file,
-    local clients should prefer the palace credential; when it differs, the
-    Hub was started with an explicit/process token and clients should prefer
-    their matching process token.  No secret or digest is published.
-    """
-    process_token = os.environ.get(_TOKEN_ENV, "").strip()
-    if not process_token:
-        return "none"
-    palace_token = _read_server_token_file(palace_path)
-    if palace_token and hmac.compare_digest(process_token, palace_token):
-        return "palace"
-    return "process"
-
-
 def write_serverinfo(
     palace_path: str,
     *,
@@ -122,7 +103,6 @@ def write_serverinfo(
         "read_only": bool(read_only),
         "capabilities": sorted(set(capabilities or [])),
         "search_config_fingerprint": search_config_fingerprint,
-        "auth_token_source": _active_auth_token_source(palace_path),
         "palace_path": _canonical(palace_path),
     }
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -283,29 +263,17 @@ def client_base_url(info: dict) -> str:
 
 
 def load_server_tokens(palace_path: str) -> tuple[str, ...]:
-    """Return distinct local token candidates in the live Hub's preferred order.
+    """Return distinct local token candidates in safe retry order.
 
-    New Hubs publish whether their effective token came from the per-palace
-    file, the process environment, or nowhere.  That disambiguates both
-    multi-palace processes (prefer the target palace file) and a stale palace
-    file left behind when the Hub was restarted with ``--token`` (prefer the
-    current process token).  Records from older Hubs retain palace-first
-    behavior for backward compatibility.
+    The target palace's credential always goes first so a process token for a
+    different palace is never sent unnecessarily.  A distinct process token
+    is retained as a second candidate for a Hub restarted with ``--token``
+    while an older generated palace credential remains on disk.
     """
     palace_token = _read_server_token_file(palace_path)
     process_token = os.environ.get(_TOKEN_ENV, "").strip()
-    info = read_live_serverinfo(palace_path)
-    source = info.get("auth_token_source") if info else None
-
-    if source == "none":
-        ordered = ()
-    elif source == "process":
-        ordered = (process_token, palace_token)
-    else:
-        ordered = (palace_token, process_token)
-
     candidates = []
-    for token in ordered:
+    for token in (palace_token, process_token):
         if token and token not in candidates:
             candidates.append(token)
     return tuple(candidates)
@@ -315,3 +283,37 @@ def load_server_token(palace_path: str) -> str:
     """Return the preferred Hub bearer token, or "" when none is configured."""
     candidates = load_server_tokens(palace_path)
     return candidates[0] if candidates else ""
+
+
+def urlopen_with_server_tokens(
+    palace_path: str,
+    url: str,
+    *,
+    data=None,
+    headers=None,
+    timeout=None,
+):
+    """Open one Hub request, retrying only a pre-acceptance HTTP 401.
+
+    At most two distinct local credentials exist.  A 401 means the Hub's
+    authentication gate rejected the request before dispatch, so trying the
+    second credential is safe even for mutating JSON-RPC calls.  Every other
+    HTTP or transport failure is surfaced immediately and is never replayed.
+    """
+    import urllib.error
+    import urllib.request
+
+    candidates = load_server_tokens(palace_path) or ("",)
+    for index, token in enumerate(candidates):
+        attempt_headers = dict(headers or {})
+        if token:
+            attempt_headers["Authorization"] = f"Bearer {token}"
+        else:
+            attempt_headers.pop("Authorization", None)
+        request = urllib.request.Request(url, data=data, headers=attempt_headers)
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401 or index + 1 >= len(candidates):
+                raise
+            exc.close()

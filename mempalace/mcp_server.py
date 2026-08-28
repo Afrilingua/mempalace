@@ -8287,12 +8287,9 @@ def _hub_proxy_target():
             return None
         base_url = server_registry.client_base_url(info)
         headers = {"Content-Type": "application/json"}
-        token = server_registry.load_server_token(_config.palace_path)
     except Exception:
         logger.debug("hub discovery failed; serving locally", exc_info=True)
         return None
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     if not _hub_proxy_announced:
         _hub_proxy_announced = True
         logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
@@ -8303,13 +8300,18 @@ def _truthy_env_off(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
 
 
-def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_path: str):
     """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    import urllib.request
+    from . import server_registry
 
     body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+    with server_registry.urlopen_with_server_tokens(
+        palace_path,
+        f"{base_url}/mcp",
+        data=body,
+        headers=headers,
+        timeout=_HUB_PROXY_TIMEOUT_S,
+    ) as resp:
         raw = resp.read()
     if not raw:
         return None
@@ -8340,7 +8342,7 @@ def _dispatch_stdio_request(request: dict):
         return handle_request(request)
     base_url, headers = target
     try:
-        return _forward_request_to_hub(base_url, headers, request)
+        return _forward_request_to_hub(base_url, headers, request, _config.palace_path)
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):

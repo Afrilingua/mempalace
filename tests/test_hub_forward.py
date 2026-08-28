@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from mempalace import cli, server_registry
+from mempalace import cli, mcp_proxy, server_registry
 from mempalace.config import MempalaceConfig
 
 
@@ -306,6 +306,22 @@ class TestForwardMineToHub:
         finally:
             hub.stop()
 
+    def test_retries_process_token_after_stale_palace_token_401(
+        self, isolated_home, tmp_path, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="current-token")
+        try:
+            _register_hub(palace, hub)
+            server_registry.server_token_path(palace).write_text("stale-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
+
+            assert cli._forward_mine_to_hub(_mine_args(tmp_path), palace) is True
+            assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
+            assert len(hub.requests) == 1
+        finally:
+            hub.stop()
+
     def test_no_hub_returns_false(self, isolated_home, tmp_path):
         palace = str(isolated_home / "palace")
         assert cli._forward_mine_to_hub(_mine_args(tmp_path), palace) is False
@@ -475,6 +491,22 @@ class TestForwardSearchToHub:
 
             assert cli._forward_search_to_hub(_search_args(), palace) is True
             assert hub.auth_headers == ["Bearer palace-b-token"]
+            assert len(hub.requests) == 1
+        finally:
+            hub.stop()
+
+    def test_authenticated_hub_retries_process_token_after_stale_palace_token(
+        self, isolated_home, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="current-token")
+        try:
+            _register_hub(palace, hub)
+            server_registry.server_token_path(palace).write_text("stale-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
+
+            assert cli._forward_search_to_hub(_search_args(), palace) is True
+            assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
             assert len(hub.requests) == 1
         finally:
             hub.stop()
@@ -797,6 +829,27 @@ class TestStdioProxy:
         assert response["id"] == 7
         assert "result" in response
 
+    def test_retries_process_token_after_stale_palace_token_401(self, proxied_palace, monkeypatch):
+        from mempalace import mcp_server
+
+        hub = _FakeHub(required_token="current-token")
+        try:
+            local_calls = self._local_sentinel(monkeypatch)
+            _register_hub(proxied_palace, hub)
+            self._disown_record(proxied_palace)
+            server_registry.server_token_path(proxied_palace).write_text("stale-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
+            request = {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
+
+            response = mcp_server._dispatch_stdio_request(request)
+
+            assert local_calls == []
+            assert response["id"] == 7
+            assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
+            assert hub.requests == [request]
+        finally:
+            hub.stop()
+
     def test_no_hub_handles_locally(self, proxied_palace, monkeypatch):
         from mempalace import mcp_server
 
@@ -877,6 +930,30 @@ class TestStdioProxy:
             "params": {"name": "mempalace_add_drawer", "arguments": {"content": "x"}},
         }
         assert mcp_server._dispatch_stdio_request(notification) is None
+
+
+class TestThinStdioProxyTokenRetry:
+    def test_retries_process_token_after_stale_palace_token_401(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="current-token")
+        try:
+            server_registry.server_token_path(palace).parent.mkdir(parents=True, exist_ok=True)
+            server_registry.server_token_path(palace).write_text("stale-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
+            request = {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
+
+            response = mcp_proxy._forward(
+                f"http://127.0.0.1:{hub.port}",
+                {"Content-Type": "application/json"},
+                request,
+                palace,
+            )
+
+            assert response["id"] == 7
+            assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
+            assert hub.requests == [request]
+        finally:
+            hub.stop()
 
 
 class TestServeHttpRegistersServerinfo:

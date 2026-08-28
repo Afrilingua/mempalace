@@ -26,7 +26,6 @@ import logging
 import os
 import sys
 import urllib.error
-import urllib.request
 
 logger = logging.getLogger(__name__)
 
@@ -107,20 +106,24 @@ def _hub_target(palace_path):
             return None
         base_url = server_registry.client_base_url(info)
         headers = {"Content-Type": "application/json"}
-        token = server_registry.load_server_token(palace_path)
     except Exception:
         logger.debug("hub discovery failed", exc_info=True)
         return None
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     return base_url, headers
 
 
-def _forward(base_url: str, headers: dict, request: dict):
+def _forward(base_url: str, headers: dict, request: dict, palace_path: str):
     """POST one JSON-RPC request to the hub; None for notifications (202)."""
+    from . import server_registry
+
     body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+    with server_registry.urlopen_with_server_tokens(
+        palace_path,
+        f"{base_url}/mcp",
+        data=body,
+        headers=headers,
+        timeout=_HUB_PROXY_TIMEOUT_S,
+    ) as resp:
         raw = resp.read()
     if not raw:
         return None
@@ -222,7 +225,7 @@ def _handle(request: dict, palace_path, local: _LocalServer):
     if target is not None:
         base_url, headers = target
         try:
-            return _forward(base_url, headers, request)
+            return _forward(base_url, headers, request, palace_path)
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
             # Reaching the hub and getting an HTTP error means it may have run
             # the call; so does any mid-flight failure on a mutating tool.

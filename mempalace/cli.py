@@ -601,15 +601,29 @@ def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
     if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
+    if any(os.environ.get(name, "").strip() for name in ("MEMPALACE_LANG", "MEMPAL_LANG")):
+        return False
 
     # The MCP tool sanitizes queries longer than its safe passthrough window.
     # Keep any query it would rewrite on the direct CLI path so forwarding
     # never changes the user's search text silently.
-    from .config import strip_lone_surrogates
+    from .config import sanitize_name, strip_lone_surrogates
     from .query_sanitizer import SAFE_QUERY_LENGTH
 
     cleaned = strip_lone_surrogates(args.query.strip())
-    return cleaned == args.query and len(cleaned) <= SAFE_QUERY_LENGTH
+    if cleaned != args.query or len(cleaned) > SAFE_QUERY_LENGTH:
+        return False
+
+    for field_name in ("wing", "room"):
+        value = getattr(args, field_name, None)
+        if value is None:
+            continue
+        try:
+            if sanitize_name(value, field_name) != value:
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def _print_hub_search_result(args, result: dict) -> bool:

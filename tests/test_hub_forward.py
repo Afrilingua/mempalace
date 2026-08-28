@@ -395,6 +395,35 @@ class TestForwardSearchToHub:
     def test_result_count_at_mcp_boundaries_is_forwardable(self, results):
         assert cli._search_args_forwardable(_search_args(results=results)) is True
 
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"wing": "sales/2026"},
+            {"room": " release_notes "},
+            {"wing": ""},
+        ],
+    )
+    def test_name_filter_the_hub_rejects_or_rewrites_is_not_forwardable(self, overrides):
+        assert cli._search_args_forwardable(_search_args(**overrides)) is False
+
+    def test_valid_name_filters_are_forwardable(self):
+        assert (
+            cli._search_args_forwardable(_search_args(wing="sales_2026", room="release_notes"))
+            is True
+        )
+
+    @pytest.mark.parametrize("env_name", ["MEMPALACE_LANG", "MEMPAL_LANG"])
+    def test_per_invocation_language_override_is_not_forwardable(self, monkeypatch, env_name):
+        monkeypatch.delenv("MEMPALACE_LANG", raising=False)
+        monkeypatch.delenv("MEMPAL_LANG", raising=False)
+        monkeypatch.setenv(env_name, "en")
+        assert cli._search_args_forwardable(_search_args()) is False
+
+    def test_blank_language_override_does_not_disable_forwarding(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_LANG", "  ")
+        monkeypatch.setenv("MEMPAL_LANG", "")
+        assert cli._search_args_forwardable(_search_args()) is True
+
 
 class TestForwardability:
     def test_plain_convo_mine_is_forwardable(self, tmp_path):

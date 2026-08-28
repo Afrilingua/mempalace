@@ -2008,6 +2008,51 @@ class TestSearchTool:
             assert "no recorded embedder identity" in result["cli_error_output"]
             assert "mempalace palace set-embedder" in result["cli_error_output"]
 
+    def test_search_cli_compatible_serializes_output_capture(self, monkeypatch, config, kg):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server, palace
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+        monkeypatch.setattr(palace, "_enforce_embedder_identity", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def capture(fn):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return fn(), "output\n"
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", capture)
+        start = threading.Barrier(3)
+
+        def invoke():
+            start.wait()
+            return mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(invoke) for _ in range(2)]
+            start.wait()
+            results = [future.result(timeout=5) for future in futures]
+
+        assert [result["cli_output"] for result in results] == ["output\n", "output\n"]
+        assert max_active == 1
+
     def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server

@@ -335,6 +335,10 @@ _kg_cache_lock = threading.Lock()
 
 _logstream_by_path: dict[str, Logstream] = {}
 _logstream_cache_lock = threading.Lock()
+# CLI-compatible search temporarily redirects process-wide stderr and fd 1.
+# Keep that entire scope single-threaded even when tool_search is invoked
+# outside the HTTP dispatch lock (tests, embedded hosts, future transports).
+_cli_search_capture_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -2501,7 +2505,7 @@ def tool_search(
             return {"error": "cli-compatible search requires an unchanged query"}
         error_output = io.StringIO()
         try:
-            with contextlib.redirect_stderr(error_output):
+            with _cli_search_capture_lock, contextlib.redirect_stderr(error_output):
                 _refresh_vector_disabled_flag()
                 collection = None if _vector_disabled else _get_collection()
                 if collection is None and not _vector_disabled:

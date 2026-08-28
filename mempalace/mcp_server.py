@@ -2499,29 +2499,29 @@ def tool_search(
             }
         if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
             return {"error": "cli-compatible search requires an unchanged query"}
-        _refresh_vector_disabled_flag()
-        collection = None if _vector_disabled else _get_collection()
-        if collection is None and not _vector_disabled:
-            return _collection_error_or_no_palace()
-        if collection is not None:
-            from .backends.base import (
-                DimensionMismatchError,
-                EmbedderIdentityMismatchError,
-            )
-            from .palace import _enforce_embedder_identity
-
-            try:
-                _enforce_embedder_identity(
-                    collection,
-                    _config.palace_path,
-                    _config.collection_name,
-                    create=False,
-                )
-            except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
-                return {"error": "Embedder identity mismatch", "details": str(exc)}
         error_output = io.StringIO()
         try:
             with contextlib.redirect_stderr(error_output):
+                _refresh_vector_disabled_flag()
+                collection = None if _vector_disabled else _get_collection()
+                if collection is None and not _vector_disabled:
+                    return _collection_error_or_no_palace()
+                if collection is not None:
+                    from .backends.base import (
+                        DimensionMismatchError,
+                        EmbedderIdentityMismatchError,
+                    )
+                    from .palace import _enforce_embedder_identity
+
+                    try:
+                        _enforce_embedder_identity(
+                            collection,
+                            _config.palace_path,
+                            _config.collection_name,
+                            create=False,
+                        )
+                    except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
+                        return {"error": "Embedder identity mismatch", "details": str(exc)}
                 _, output = _capture_fd_stdout(
                     lambda: cli_search(
                         query=query,

@@ -14,6 +14,7 @@ import sqlite3
 from types import SimpleNamespace
 import subprocess
 import sys
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -1973,6 +1974,36 @@ class TestSearchTool:
         assert result["error"] == "Embedder identity mismatch"
         assert "minilm" in result["details"]
         assert "embeddinggemma" in result["details"]
+
+    def test_search_cli_compatible_returns_unknown_embedder_warning(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import embedding, mcp_server, palace
+
+        collection = MagicMock()
+        collection.effective_embedder_identity.return_value = None
+        collection.get_stored_embedder_identity.return_value = None
+        collection.count.return_value = 1
+        monkeypatch.setattr(embedding, "current_model_name", lambda: "minilm")
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "output\n"))
+        palace._VALIDATED_IDENTITY.clear()
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.showwarning = lambda message, *_args, **_kwargs: print(
+                    message, file=sys.stderr
+                )
+                result = mcp_server.tool_search(query="needle", cli_compatible=True)
+        finally:
+            palace._VALIDATED_IDENTITY.clear()
+
+        assert result["cli_output"] == "output\n"
+        assert "no recorded embedder identity" in result["cli_error_output"]
+        assert "mempalace palace set-embedder" in result["cli_error_output"]
 
     def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

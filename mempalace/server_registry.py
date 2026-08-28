@@ -11,11 +11,10 @@ capture on the hub machine.
 
 This module gives those local processes a way to find the hub instead of
 fighting it: the HTTP transport records ``{pid, host, port, scheme,
-read_only, capabilities, search_config_fingerprint}`` next to the per-palace
-bearer token
-(``~/.mempalace/server/<key>/``), and callers use
-:func:`read_live_serverinfo` to decide "forward this write over HTTP" vs
-"no hub — do the write directly".
+read_only, capabilities, search_config_fingerprint, auth_token_source}``
+next to the per-palace bearer token (``~/.mempalace/server/<key>/``), and
+callers use :func:`read_live_serverinfo` to decide "forward this write over
+HTTP" vs "no hub — do the write directly".
 
 The registry is local-machine only by design: it lives under the user's
 home, is keyed by the canonical palace path, and a record is trusted only
@@ -26,6 +25,7 @@ that every reader ignores and the next hub overwrites.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # Bind-address wildcards: a hub bound to "all interfaces" is dialed via
 # loopback by local forwarders.
 _WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]"}
+_TOKEN_ENV = "MEMPALACE_MCP_HTTP_TOKEN"
 
 
 def _canonical(palace_path: str) -> str:
@@ -65,6 +66,31 @@ def server_token_path(palace_path: str) -> Path:
 
 def serverinfo_path(palace_path: str) -> Path:
     return server_state_dir(palace_path) / "serverinfo.json"
+
+
+def _read_server_token_file(palace_path: str) -> str:
+    try:
+        return server_token_path(palace_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _active_auth_token_source(palace_path: str) -> str:
+    """Describe where this Hub's effective HTTP token came from.
+
+    ``cmd_serve`` always passes the effective token to the HTTP child through
+    ``MEMPALACE_MCP_HTTP_TOKEN``.  When that value equals the per-palace file,
+    local clients should prefer the palace credential; when it differs, the
+    Hub was started with an explicit/process token and clients should prefer
+    their matching process token.  No secret or digest is published.
+    """
+    process_token = os.environ.get(_TOKEN_ENV, "").strip()
+    if not process_token:
+        return "none"
+    palace_token = _read_server_token_file(palace_path)
+    if palace_token and hmac.compare_digest(process_token, palace_token):
+        return "palace"
+    return "process"
 
 
 def write_serverinfo(
@@ -96,6 +122,7 @@ def write_serverinfo(
         "read_only": bool(read_only),
         "capabilities": sorted(set(capabilities or [])),
         "search_config_fingerprint": search_config_fingerprint,
+        "auth_token_source": _active_auth_token_source(palace_path),
         "palace_path": _canonical(palace_path),
     }
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -255,18 +282,36 @@ def client_base_url(info: dict) -> str:
     return f"{scheme}://{host}:{info['port']}"
 
 
-def load_server_token(palace_path: str) -> str:
-    """The available Hub bearer token, or "" when none is configured.
+def load_server_tokens(palace_path: str) -> tuple[str, ...]:
+    """Return distinct local token candidates in the live Hub's preferred order.
 
-    Prefer the target palace's token file.  A process-level environment token
-    may belong to a different palace when multiple hubs are running, so it is
-    only a fallback for hubs started with an explicit token that was not
-    persisted.
+    New Hubs publish whether their effective token came from the per-palace
+    file, the process environment, or nowhere.  That disambiguates both
+    multi-palace processes (prefer the target palace file) and a stale palace
+    file left behind when the Hub was restarted with ``--token`` (prefer the
+    current process token).  Records from older Hubs retain palace-first
+    behavior for backward compatibility.
     """
-    try:
-        palace_token = server_token_path(palace_path).read_text(encoding="utf-8").strip()
-    except OSError:
-        palace_token = ""
-    if palace_token:
-        return palace_token
-    return os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+    palace_token = _read_server_token_file(palace_path)
+    process_token = os.environ.get(_TOKEN_ENV, "").strip()
+    info = read_live_serverinfo(palace_path)
+    source = info.get("auth_token_source") if info else None
+
+    if source == "none":
+        ordered = ()
+    elif source == "process":
+        ordered = (process_token, palace_token)
+    else:
+        ordered = (palace_token, process_token)
+
+    candidates = []
+    for token in ordered:
+        if token and token not in candidates:
+            candidates.append(token)
+    return tuple(candidates)
+
+
+def load_server_token(palace_path: str) -> str:
+    """Return the preferred Hub bearer token, or "" when none is configured."""
+    candidates = load_server_tokens(palace_path)
+    return candidates[0] if candidates else ""

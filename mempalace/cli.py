@@ -590,6 +590,7 @@ _HUB_HEALTH_TIMEOUT_S = 0.75
 # hook-budgeted one, so it waits.
 _HUB_MINE_TIMEOUT_S = 3600.0
 _HUB_SEARCH_TIMEOUT_S = 600.0
+_HUB_SEARCH_MAX_RESULTS = 100
 
 
 def _hub_forward_disabled() -> bool:
@@ -597,8 +598,18 @@ def _hub_forward_disabled() -> bool:
 
 
 def _search_args_forwardable(args) -> bool:
-    """Return whether the hub's ``mempalace_search`` tool can express this CLI search."""
-    return not _backend_arg(args)
+    """Return whether ``mempalace_search`` preserves this CLI search exactly."""
+    if _backend_arg(args) or not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
+        return False
+
+    # The MCP tool sanitizes queries longer than its safe passthrough window.
+    # Keep any query it would rewrite on the direct CLI path so forwarding
+    # never changes the user's search text silently.
+    from .config import strip_lone_surrogates
+    from .query_sanitizer import SAFE_QUERY_LENGTH
+
+    cleaned = strip_lone_surrogates(args.query.strip())
+    return cleaned == args.query and len(cleaned) <= SAFE_QUERY_LENGTH
 
 
 def _print_hub_search_result(args, result: dict) -> bool:

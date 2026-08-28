@@ -379,6 +379,22 @@ class TestForwardSearchToHub:
         assert cli._search_args_forwardable(_search_args()) is True
         assert cli._search_args_forwardable(_search_args(backend="sqlite_exact")) is False
 
+    @pytest.mark.parametrize("length", [201, 250, 251])
+    def test_query_the_hub_would_sanitize_is_not_forwardable(self, length):
+        assert cli._search_args_forwardable(_search_args(query="x" * 200)) is True
+        assert cli._search_args_forwardable(_search_args(query="x" * length)) is False
+
+    def test_query_the_hub_would_strip_is_not_forwardable(self):
+        assert cli._search_args_forwardable(_search_args(query=" needle ")) is False
+
+    @pytest.mark.parametrize("results", [0, -1, 101, 500])
+    def test_result_count_outside_mcp_range_is_not_forwardable(self, results):
+        assert cli._search_args_forwardable(_search_args(results=results)) is False
+
+    @pytest.mark.parametrize("results", [1, 100])
+    def test_result_count_at_mcp_boundaries_is_forwardable(self, results):
+        assert cli._search_args_forwardable(_search_args(results=results)) is True
+
 
 class TestForwardability:
     def test_plain_convo_mine_is_forwardable(self, tmp_path):

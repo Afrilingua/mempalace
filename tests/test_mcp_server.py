@@ -1951,6 +1951,29 @@ class TestSearchTool:
         assert seen["collection"] is collection
         assert seen["n_results"] == 7
 
+    def test_search_cli_compatible_rejects_embedder_identity_mismatch(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import embedding, mcp_server, palace
+        from mempalace.backends.base import EmbedderIdentity
+
+        collection = MagicMock()
+        collection.effective_embedder_identity.return_value = None
+        collection.get_stored_embedder_identity.return_value = EmbedderIdentity("minilm", 384)
+        monkeypatch.setattr(embedding, "current_model_name", lambda: "embeddinggemma")
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: pytest.fail())
+        palace._VALIDATED_IDENTITY.clear()
+
+        result = mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        assert result["error"] == "Embedder identity mismatch"
+        assert "minilm" in result["details"]
+        assert "embeddinggemma" in result["details"]
+
     def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server

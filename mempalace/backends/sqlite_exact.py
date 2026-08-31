@@ -222,6 +222,10 @@ _CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
 # "search the wing/room, not the whole palace" — as a sqlite index.
 _LOCUS_FIELDS = ("wing", "room", "hall")
 _LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
+# Expression index for closet-enrichment ``get(where={source_file})``.
+# Locus columns stay wing/room/hall (low-cardinality facets); source_file
+# is high-cardinality and stays in metadata_json.
+_SOURCE_FILE_INDEX = "idx_documents_coll_source_file"
 
 
 def _json_field_sql(key: str) -> str:
@@ -1547,12 +1551,13 @@ class SQLiteExactBackend(BaseBackend):
 
     @staticmethod
     def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
-        """Add VIRTUAL wing/room/hall columns and a composite index.
+        """Add VIRTUAL wing/room/hall columns, the locus index, and source_file.
 
         VIRTUAL generated columns are metadata-only (no table rewrite), so a
         1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
         metadata_json once and stores the loci. Existing palaces migrate
-        here on the next writable open.
+        here on the next writable open. The source_file expression index is
+        the closet-enrichment lookup (``get(where={source_file})``).
         """
         cols = _document_column_names(conn)
         for field in _LOCUS_FIELDS:
@@ -1570,6 +1575,15 @@ class SQLiteExactBackend(BaseBackend):
             f"""
             CREATE INDEX IF NOT EXISTS {_LOCUS_INDEX}
                 ON documents(collection_id, wing, room, hall)
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_SOURCE_FILE_INDEX}
+                ON documents(
+                    collection_id,
+                    (json_extract(metadata_json, '$.source_file'))
+                )
             """
         )
 

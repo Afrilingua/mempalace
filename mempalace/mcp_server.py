@@ -82,8 +82,10 @@ from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
+    SearchError,
     _distance_to_similarity,
     _metric_for_collection,
+    search as cli_search,
     search_memories,
 )
 from .palace_graph import (  # noqa: E402
@@ -333,6 +335,10 @@ _kg_cache_lock = threading.Lock()
 
 _logstream_by_path: dict[str, Logstream] = {}
 _logstream_cache_lock = threading.Lock()
+# CLI-compatible search temporarily redirects process-wide stderr and fd 1.
+# Keep that entire scope single-threaded even when tool_search is invoked
+# outside the HTTP dispatch lock (tests, embedded hosts, future transports).
+_cli_search_capture_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -2456,10 +2462,11 @@ def tool_search(
     source_file: str = None,
     since: str = None,
     before: str = None,
-    max_distance: float = 1.5,
+    max_distance: float = None,
     min_similarity: float = None,
     context: str = None,
     candidate_strategy: str = "vector",
+    cli_compatible: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2473,12 +2480,78 @@ def tool_search(
     candidate_strategy = candidate_strategy or "vector"
     if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
         return {"error": "candidate_strategy must be one of ('vector', 'union')"}
-    # Backwards compat: accept old name
+    # Mitigate system prompt contamination (Issue #333)
+    sanitized = sanitize_query(query)
+    if cli_compatible:
+        import contextlib
+        import io
+
+        if source_file is not None:
+            return {"error": "cli-compatible search does not support source_file"}
+        unsupported_controls = []
+        if candidate_strategy != "vector":
+            unsupported_controls.append("candidate_strategy")
+        if min_similarity is not None:
+            unsupported_controls.append("min_similarity")
+        if max_distance is not None:
+            unsupported_controls.append("max_distance")
+        if context is not None:
+            unsupported_controls.append("context")
+        if unsupported_controls:
+            return {
+                "error": "cli-compatible search does not support " + ", ".join(unsupported_controls)
+            }
+        if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
+            return {"error": "cli-compatible search requires an unchanged query"}
+        error_output = io.StringIO()
+        try:
+            with _cli_search_capture_lock, contextlib.redirect_stderr(error_output):
+                _refresh_vector_disabled_flag()
+                collection = None if _vector_disabled else _get_collection()
+                if collection is None and not _vector_disabled:
+                    return _collection_error_or_no_palace()
+                if collection is not None:
+                    from .backends.base import (
+                        DimensionMismatchError,
+                        EmbedderIdentityMismatchError,
+                    )
+                    from .palace import _enforce_embedder_identity
+
+                    try:
+                        _enforce_embedder_identity(
+                            collection,
+                            _config.palace_path,
+                            _config.collection_name,
+                            create=False,
+                            repeat_unknown_warning=True,
+                        )
+                    except (EmbedderIdentityMismatchError, DimensionMismatchError) as exc:
+                        return {"error": "Embedder identity mismatch", "details": str(exc)}
+                _, output = _capture_fd_stdout(
+                    lambda: cli_search(
+                        query=query,
+                        palace_path=_config.palace_path,
+                        wing=wing,
+                        room=room,
+                        n_results=limit,
+                        since=since,
+                        before=before,
+                        collection=collection,
+                    )
+                )
+        except SearchError as exc:
+            return {"error": str(exc)}
+        result = {"query": query, "cli_output": output}
+        if error_output.getvalue():
+            result["cli_error_output"] = error_output.getvalue()
+        return result
+
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
-    # Mitigate system prompt contamination (Issue #333)
-    sanitized = sanitize_query(query)
+    if dist is None:
+        dist = 1.5
+
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
@@ -5275,6 +5348,10 @@ TOOLS = {
                     "type": "string",
                     "enum": ["vector", "union"],
                     "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                },
+                "cli_compatible": {
+                    "type": "boolean",
+                    "description": "Preserve standalone CLI candidate selection, ranking, and output. Used by the CLI Hub forwarder.",
                 },
                 "context": {
                     "type": "string",
@@ -8228,6 +8305,8 @@ def _serve_http(host: str, port: int) -> None:
                 port=bound_port,
                 scheme=getattr(httpd, "scheme", "http"),
                 read_only=_READ_ONLY,
+                capabilities=["search_cli_compatible"],
+                search_config_fingerprint=_config.search_config_fingerprint,
             )
             import atexit
 
@@ -8336,12 +8415,9 @@ def _hub_proxy_target():
             return None
         base_url = server_registry.client_base_url(info)
         headers = {"Content-Type": "application/json"}
-        token = server_registry.load_server_token(_config.palace_path)
     except Exception:
         logger.debug("hub discovery failed; serving locally", exc_info=True)
         return None
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     if not _hub_proxy_announced:
         _hub_proxy_announced = True
         logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
@@ -8352,13 +8428,18 @@ def _truthy_env_off(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
 
 
-def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_path: str):
     """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    import urllib.request
+    from . import server_registry
 
     body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
-    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+    with server_registry.urlopen_with_server_tokens(
+        palace_path,
+        f"{base_url}/mcp",
+        data=body,
+        headers=headers,
+        timeout=_HUB_PROXY_TIMEOUT_S,
+    ) as resp:
         raw = resp.read()
     if not raw:
         return None
@@ -8392,7 +8473,8 @@ def _dispatch_stdio_request(request: dict):
         from .mcp_proxy import _annotate_forwarded_update_status
 
         return _annotate_forwarded_update_status(
-            request, _forward_request_to_hub(base_url, headers, request)
+            request,
+            _forward_request_to_hub(base_url, headers, request, _config.palace_path),
         )
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)

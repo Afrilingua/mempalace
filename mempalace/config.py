@@ -5,6 +5,7 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 """
 
 import errno
+import hashlib
 import json
 import os
 import stat
@@ -667,6 +668,85 @@ class MempalaceConfig:
                 self._file_config_state = "read"
             else:
                 self._file_config_state = "unparsed"
+
+    @property
+    def search_config_fingerprint(self) -> str:
+        """Stable digest of the effective search configuration for this process.
+
+        A long-running Hub keeps this configuration snapshot and may also keep
+        a collection opened from it.  CLI search forwarding compares this
+        digest with a freshly loaded config so a changed ``config.json`` falls
+        back to the direct path instead of querying stale Hub state.
+
+        Hash only resolved settings that affect the currently selected search
+        backend.  This detects relevant file edits and Hub-start environment
+        overrides without treating hook/UI settings or inactive-backend values
+        as stale search state.  The digest keeps secrets out of the registry.
+        """
+        try:
+            # Match the backend selection used by palace.get_collection(),
+            # including artifact auto-detection for an existing palace.
+            from .palace import resolve_backend_name
+
+            backend = resolve_backend_name(self.palace_path)
+            backend_resolution_error = None
+        except Exception as exc:  # noqa: BLE001 - fingerprint must remain total
+            # A mismatched or otherwise invalid palace still needs a stable
+            # digest so the Hub gate can fall back to the direct path, where
+            # normal backend opening reports the actionable error.
+            backend = self.backend
+            backend_resolution_error = f"{type(exc).__name__}: {exc}"
+        embedding_model = self.embedding_model
+        effective = {
+            "backend": backend,
+            "collection_name": self.collection_name,
+            "embedding_model": embedding_model,
+            "lang_explicit": self.lang_explicit,
+        }
+        if backend_resolution_error is not None:
+            effective["backend_resolution_error"] = backend_resolution_error
+        if embedding_model == "openai-compat":
+            effective.update(
+                embedding_api_key=self.embedding_api_key,
+                embedding_api_model=self.embedding_api_model,
+                embedding_api_url=self.embedding_api_url,
+            )
+        else:
+            effective.update(
+                embedding_device=self.embedding_device,
+                embedding_threads=self.embedding_threads,
+            )
+        try:
+            if backend == "qdrant":
+                effective.update(
+                    qdrant_api_key=self.qdrant_api_key,
+                    qdrant_namespace=self.qdrant_namespace,
+                    qdrant_timeout=self.qdrant_timeout,
+                    qdrant_url=self.qdrant_url,
+                )
+            elif backend == "milvus":
+                effective.update(
+                    milvus_consistency_level=self.milvus_consistency_level,
+                    milvus_db_name=self.milvus_db_name,
+                    milvus_namespace=self.milvus_namespace,
+                    milvus_token=self.milvus_token,
+                    milvus_uri=self.milvus_uri,
+                )
+            elif backend == "pgvector":
+                effective.update(
+                    pgvector_dsn=self.pgvector_dsn,
+                    pgvector_namespace=self.pgvector_namespace,
+                )
+        except (TypeError, ValueError) as exc:
+            # Invalid active-backend settings still need a stable digest. The
+            # backend will report their validation error if search reaches it;
+            # fingerprinting must never turn an unrelated config edit into a
+            # CLI crash before the direct-path fallback can be selected.
+            effective["backend_config_error"] = f"{type(exc).__name__}: {exc}"
+        payload = json.dumps(
+            effective, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def _persist_file_config(self):
         """Write ``_file_config`` to ``config.json``, keeping what it replaces.

@@ -26,7 +26,7 @@ import logging
 import sys
 import urllib.error
 
-from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub, forward_json_rpc
+from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub
 
 from .update_awareness import cached_update_status, schedule_update_check
 
@@ -98,9 +98,22 @@ def _hub_target(palace_path):
     return discover_hub(palace_path)
 
 
-def _forward(base_url: str, headers: dict, request: dict):
+def _forward(base_url: str, headers: dict, request: dict, palace_path: str):
     """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    return forward_json_rpc(base_url, headers, request, timeout=_HUB_PROXY_TIMEOUT_S)
+    from . import server_registry
+
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    with server_registry.urlopen_with_server_tokens(
+        palace_path,
+        f"{base_url}/mcp",
+        data=body,
+        headers=headers,
+        timeout=_HUB_PROXY_TIMEOUT_S,
+    ) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
 
 
 def _annotate_degraded(response):
@@ -230,7 +243,9 @@ def _handle(request: dict, palace_path, local: _LocalServer):
     if target is not None:
         base_url, headers = target
         try:
-            return _annotate_forwarded_update_status(request, _forward(base_url, headers, request))
+            return _annotate_forwarded_update_status(
+                request, _forward(base_url, headers, request, palace_path)
+            )
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
             # Reaching the hub and getting an HTTP error means it may have run
             # the call; so does any mid-flight failure on a mutating tool.

@@ -4706,6 +4706,7 @@ def tool_event_append(
     body: str = "",
     metadata: dict = None,
     artifact_ids: list = None,
+    topic: str = None,
 ):
     """Append one immutable coordination event."""
     try:
@@ -4723,6 +4724,7 @@ def tool_event_append(
                 body=body,
                 metadata=metadata,
                 artifact_ids=artifact_ids,
+                topic=topic,
             )
         )
     except ValueError as e:
@@ -4786,37 +4788,43 @@ def _preview_event(event: dict) -> dict:
 def tool_event_list(
     stream: str = None,
     room: str = None,
+    topic: str = None,
     type: str = None,
     to_agent: str = None,
     from_agent: str = None,
     correlation_id: str = None,
     status: str = None,
     since_event_id: str = None,
+    before_event_id: str = None,
     since_created_at: str = None,
     limit: int = 50,
+    order: str = "asc",
     preview: bool = False,
 ):
-    """List coordination events with structured filters, oldest first.
+    """List coordination events with structured filters.
 
+    ``order='desc'`` returns newest events first (e.g. for sweeping recent inbox
+    or checking recent project history in a single call). Default is ``'asc'``.
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
-    stays cheap. ``since_event_id`` is strictly after that id, so do not
-    pass the truncated event's own id to re-fetch it — repeat the original
-    filters with ``preview=false``.
+    stays cheap.
     """
     try:
         events = _call_logstream(
             lambda ls: ls.list_events(
                 stream=stream,
                 room=room,
+                topic=topic,
                 type=type,
                 to_agent=to_agent,
                 from_agent=from_agent,
                 correlation_id=correlation_id,
                 status=status,
                 since_event_id=since_event_id,
+                before_event_id=before_event_id,
                 since_created_at=since_created_at,
                 limit=limit,
+                order=order,
             )
         )
     except ValueError as e:
@@ -4829,6 +4837,7 @@ def tool_event_list(
 def tool_event_wait(
     stream: str = None,
     room: str = None,
+    topic: str = None,
     type: str = None,
     to_agent: str = None,
     from_agent: str = None,
@@ -4851,6 +4860,7 @@ def tool_event_wait(
                 timeout_ms=timeout_ms,
                 stream=stream,
                 room=room,
+                topic=topic,
                 type=type,
                 to_agent=to_agent,
                 from_agent=from_agent,
@@ -4867,11 +4877,19 @@ def tool_event_wait(
     return result
 
 
-def tool_event_ack(event_id: str, from_agent: str, status: str = None, body: str = ""):
+def tool_event_ack(
+    event_id: str,
+    from_agent: str,
+    status: str = None,
+    body: str = "",
+    topic: str = None,
+):
     """Append an event.ack referencing a prior event (never mutates it)."""
     try:
         event = _call_logstream(
-            lambda ls: ls.ack_event(event_id, from_agent=from_agent, status=status, body=body)
+            lambda ls: ls.ack_event(
+                event_id, from_agent=from_agent, status=status, body=body, topic=topic
+            )
         )
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -4913,6 +4931,7 @@ def tool_patch_submit(
     base_commit: str = None,
     body: str = "",
     metadata: dict = None,
+    topic: str = None,
 ):
     """Store a patch artifact and append its patch.ready event in one call."""
     try:
@@ -4928,6 +4947,7 @@ def tool_patch_submit(
                 base_commit=base_commit,
                 body=body,
                 metadata=metadata,
+                topic=topic,
             )
         )
     except ValueError as e:
@@ -5630,6 +5650,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Sub-channel, e.g. 'delegation', 'patches', 'reviews', 'status'",
                 },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic to group related work/sub-team, e.g. 'auth-v2', 'ui-redesign' (optional)",
+                },
                 "from_agent": {"type": "string", "description": "Writer agent identity"},
                 "to_agent": {
                     "type": "string",
@@ -5710,22 +5734,24 @@ TOOLS = {
     },
     "mempalace_event_list": {
         "description": (
-            "List agent-coordination events with structured filters, oldest first (append"
-            " order, not timestamp order). Use since_event_id as the resume cursor: it means"
-            " strictly after that event in append order, so it cannot skip anything. Do NOT"
-            " resume with since_created_at — a peer's event syncs in whenever it arrives, so"
-            " it can already be older than a timestamp cursor and be missed permanently;"
-            " since_created_at is a time window ('what happened today'), not a cursor. Store"
-            " the id of the last event you processed — that is your whole watcher state. Pass"
-            " preview=true when sweeping a busy stream. to_agent=<you> also matches '*'"
-            " broadcasts, so no second call is needed. To wait for something that has not"
-            " happened yet, use mempalace_event_wait instead of polling this."
+            "List agent-coordination events with structured filters. Use order='desc' to return"
+            " newest events first (e.g. for sweeping recent inbox or inspecting project tail in"
+            " a single call); default order is 'asc' (oldest first, append order). Use"
+            " since_event_id as the resume cursor: it means strictly AFTER that event in append"
+            " order (rowid > anchor), so it cannot skip anything. For reverse/historical paging,"
+            " use before_event_id (rowid < anchor). Do NOT resume with since_created_at — a"
+            " peer's event syncs in whenever it arrives, so it can already be older than a"
+            " timestamp cursor and be missed permanently; since_created_at is a time window"
+            " ('what happened today'), not a cursor. Pass preview=true when sweeping a busy"
+            " stream. to_agent=<you> also matches '*' broadcasts. To wait for future events, use"
+            " mempalace_event_wait."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "stream": {"type": "string", "description": "Filter by stream (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "topic": {"type": "string", "description": "Filter by topic (optional)"},
                 "type": {"type": "string", "description": "Filter by event type (optional)"},
                 "to_agent": {
                     "type": "string",
@@ -5739,7 +5765,11 @@ TOOLS = {
                 "status": {"type": "string", "description": "Filter by status (optional)"},
                 "since_event_id": {
                     "type": "string",
-                    "description": "Return only events strictly after this event id (optional)",
+                    "description": "Return only events strictly after this event id in append order (optional)",
+                },
+                "before_event_id": {
+                    "type": "string",
+                    "description": "Return only events strictly before this event id in append order (optional)",
                 },
                 "since_created_at": {
                     "type": "string",
@@ -5751,6 +5781,10 @@ TOOLS = {
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+                "order": {
+                    "type": "string",
+                    "description": "'asc' (oldest first, default) or 'desc' (newest first, optional)",
+                },
                 "preview": {
                     "type": "boolean",
                     "description": (
@@ -5774,13 +5808,14 @@ TOOLS = {
             " not wrap it in a tight retry loop: on timeout just call it again with"
             " since_event_id updated to the last event you processed. For long-lived consumers"
             " (daemons, dashboards) prefer the push stream at GET /logstream/stream, which"
-            " takes the same filters and the same since_event_id resume."
+            " takes the live-tail filter subset and the same since_event_id resume."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "stream": {"type": "string", "description": "Filter by stream (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "topic": {"type": "string", "description": "Filter by topic (optional)"},
                 "type": {"type": "string", "description": "Filter by event type (optional)"},
                 "to_agent": {
                     "type": "string",
@@ -5833,6 +5868,10 @@ TOOLS = {
                     ),
                 },
                 "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+                "topic": {
+                    "type": "string",
+                    "description": "Topic override (defaults to target event's topic, optional)",
+                },
             },
             "required": ["event_id", "from_agent"],
         },
@@ -5889,6 +5928,7 @@ TOOLS = {
                     "description": "Logical stream, e.g. 'project/mempalace'",
                 },
                 "room": {"type": "string", "description": "Sub-channel (default 'patches')"},
+                "topic": {"type": "string", "description": "Topic name (optional)"},
                 "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
                 "correlation_id": {
                     "type": "string",
@@ -7802,7 +7842,8 @@ def _sse_release_slot(httpd) -> None:
 def _http_serve_logstream_stream(handler) -> None:
     """RFC 003 phase 5: live logstream tail over Server-Sent Events.
 
-    Query params are exactly the ``event_list`` filters plus
+    Query params are the live-tail subset of ``event_list`` filters (stream,
+    room, topic, type, to/from agent, correlation id, and status), plus
     ``since_event_id`` (or the standard ``Last-Event-ID`` header): with a
     cursor the server replays everything after it, then tails live; without
     one it tails only post-connect events. Each event is one SSE frame
@@ -7824,6 +7865,7 @@ def _http_serve_logstream_stream(handler) -> None:
         for key in (
             "stream",
             "room",
+            "topic",
             "type",
             "to_agent",
             "from_agent",

@@ -1292,8 +1292,22 @@ class SQLiteExactCollection(BaseCollection):
             with self._cursor() as cur:
                 page_count = cur.execute("PRAGMA page_count").fetchone()
                 freelist = cur.execute("PRAGMA freelist_count").fetchone()
+                data_version = cur.execute("PRAGMA data_version").fetchone()
             state["page_count"] = int(page_count[0]) if page_count else 0
             state["freelist_pages"] = int(freelist[0]) if freelist else 0
+            db_path = SQLiteExactBackend._db_path(self._handle.palace_path)
+            file_token = []
+            for suffix in ("", "-wal"):
+                path = f"{db_path}{suffix}"
+                try:
+                    stat = os.stat(path)
+                    file_token.append([suffix or "db", stat.st_size, stat.st_mtime_ns])
+                except FileNotFoundError:
+                    file_token.append([suffix or "db", None, None])
+            state["consistency_token"] = {
+                "data_version": int(data_version[0]) if data_version else 0,
+                "files": file_token,
+            }
         except Exception:
             pass
         return state

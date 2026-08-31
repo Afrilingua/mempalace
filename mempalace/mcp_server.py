@@ -7150,15 +7150,83 @@ def _json_rpc_parse_error(req_id=None):
 # Module-level constants for the HTTP transport.
 # Defined here (not inside main()) so _serve_http() / _build_http_server()
 # can reference them as free names without a NameError.
-_HTTP_REQUEST_LOCK = threading.Lock()
+#
+# ThreadingHTTPServer can run requests in parallel, but an exclusive lock
+# around every JSON-RPC method made a slow palace search stall handshakes and
+# every other reader. Protocol methods and independent stores bypass this
+# lock; palace reads share it; palace writes take it exclusively.
+class _RWLock:
+    """Writer-preferring readers-writer lock."""
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    def acquire_read(self) -> None:
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self) -> None:
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+    def read_lock(self):
+        lock = self
+
+        class _Read:
+            def __enter__(self):
+                lock.acquire_read()
+                return lock
+
+            def __exit__(self, exc_type, exc, tb):
+                lock.release_read()
+                return False
+
+        return _Read()
+
+    def __enter__(self):
+        self.acquire_write()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release_write()
+        return False
+
+
+_HTTP_REQUEST_LOCK = _RWLock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+
+_HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
 
 # RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
 # database with internal locking) — never Chroma or the KG. Dispatching them
 # outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
 # long-poll from stalling every other agent on a shared hub, and lets the
 # SSE stream coexist with normal tool traffic.
+# Knowledge-graph tools use their own SQLite database and lock. Mesh peers
+# and the AAAK spec are process-local reads.
 _HTTP_LOCK_FREE_TOOLS = frozenset(
     {
         "mempalace_event_append",
@@ -7169,6 +7237,14 @@ _HTTP_LOCK_FREE_TOOLS = frozenset(
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
+        "mempalace_kg_query",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
+        "mempalace_kg_timeline",
+        "mempalace_kg_stats",
+        "mempalace_mesh_peers",
+        "mempalace_get_aaak_spec",
     }
 )
 
@@ -7429,19 +7505,25 @@ def _sse_max_clients() -> int:
 def _http_dispatch(request):
     """Dispatch one JSON-RPC request with the transport's locking policy.
 
-    The global request lock preserves the single-process / single-palace-
-    handle behavior stdio deployments rely on. Logstream tools are the one
-    exception: they never touch Chroma/KG state and carry their own database
-    lock, and serializing them would let one agent's event_wait long-poll
-    (up to 5 minutes) starve the whole hub.
+    Protocol methods and independent stores are lock-free. Palace reads share
+    the lock; palace writes take it exclusively. Unclassified tools fail
+    closed onto the exclusive side.
     """
-    if (
-        isinstance(request, dict)
-        and request.get("method") == "tools/call"
-        and isinstance(request.get("params"), dict)
-        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
-    ):
+    method = request.get("method") or "" if isinstance(request, dict) else ""
+    if method in _HTTP_PROTOCOL_METHODS or method.startswith("notifications/"):
         return handle_request(request)
+    tool_name = None
+    if method == "tools/call" and isinstance(request.get("params"), dict):
+        tool_name = request["params"].get("name")
+    if tool_name in _HTTP_LOCK_FREE_TOOLS:
+        return handle_request(request)
+    # service.classify_tool is the authoritative read/write registry. The
+    # lock-free set above is a storage-boundary override for independent DBs.
+    from .service import classify_tool
+
+    if classify_tool(tool_name) == "read":
+        with _HTTP_REQUEST_LOCK.read_lock():
+            return handle_request(request)
     with _HTTP_REQUEST_LOCK:
         return handle_request(request)
 

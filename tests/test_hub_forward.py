@@ -343,6 +343,37 @@ class TestStdioProxy:
         assert response["id"] == 7
         assert "result" in response
 
+    def test_dynamic_proxy_status_adds_local_client_update_state(self, proxied_palace, monkeypatch):
+        from mempalace import mcp_server, mcp_proxy
+
+        hub = _FakeHub(mine_result={"updates": {"server": {"enabled": True, "installed": "3.9.0"}}})
+        try:
+            self._local_sentinel(monkeypatch)
+            _register_hub(proxied_palace, hub)
+            self._disown_record(proxied_palace)
+            monkeypatch.setattr(
+                mcp_proxy,
+                "cached_update_status",
+                lambda: {"enabled": True, "installed": "3.8.0"},
+            )
+            monkeypatch.setattr(mcp_proxy, "schedule_update_check", lambda: False)
+            request = {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {"name": "mempalace_status", "arguments": {}},
+            }
+
+            response = mcp_server._dispatch_stdio_request(request)
+
+            payload = json.loads(response["result"]["content"][0]["text"])
+            assert payload["updates"] == {
+                "server": {"enabled": True, "installed": "3.9.0"},
+                "client": {"enabled": True, "installed": "3.8.0"},
+            }
+        finally:
+            hub.stop()
+
     def test_no_hub_handles_locally(self, proxied_palace, monkeypatch):
         from mempalace import mcp_server
 

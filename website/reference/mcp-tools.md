@@ -10,9 +10,19 @@ Palace overview: total drawers, wing and room counts, AAAK spec, and memory prot
 
 **Parameters:** None
 
-**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect, sqlite_integrity, library_versions }`
+**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect, sqlite_integrity, library_versions, updates }`
 
 `library_versions` reports the versions this server loaded and whether they still match what is installed on disk. `stale: true` means they no longer match, which happens when the package is upgraded or removed while the server is running; write tools are then refused with error `-32005` until the server is restarted, unless `MEMPALACE_MCP_ALLOW_STALE_LIBRARY=1` is set in its environment, in which case `gate_disabled_by` names that variable. An `unreadable` key lists the distributions the check is not covering — either their installed metadata could not be read, or they could not be resolved at all when the server started — so `stale: false` is never mistaken for "checked and fine" when nothing was checked.
+
+`updates.server` is cached release state for the runtime serving the palace.
+When a local stdio process proxies to a hub, it also adds `updates.client` for
+that proxy's locally installed runtime; a direct HTTP client receives only the
+server scope because it has no local MemPalace process to inspect. Checks are
+disabled by default and refresh in a background thread, so this tool never
+waits on PyPI. An available release is informational only and must be authorized
+by the user before any upgrade commands run. A remote `updates.server` release
+must be planned on the hub host; a client's local plan applies only to
+`updates.client`.
 
 ---
 

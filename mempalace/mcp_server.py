@@ -6567,8 +6567,12 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     """Attach MCP transport-only diagnostics outside handle_request complexity."""
 
     if tool_name == "mempalace_status" and isinstance(result, dict):
+        from .update_awareness import cached_update_status, schedule_update_check
+
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
         result.setdefault("library_versions", _stale_library_payload())
+        result.setdefault("updates", {"server": cached_update_status()})
+        schedule_update_check()
 
     return result
 
@@ -8261,7 +8265,11 @@ def _dispatch_stdio_request(request: dict):
         return handle_request(request)
     base_url, headers = target
     try:
-        return _forward_request_to_hub(base_url, headers, request)
+        from .mcp_proxy import _annotate_forwarded_update_status
+
+        return _annotate_forwarded_update_status(
+            request, _forward_request_to_hub(base_url, headers, request)
+        )
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
@@ -8484,6 +8492,13 @@ def main():
     os.environ.pop("PYTHONPATH", None)
 
     _install_shutdown_signal_handlers()
+
+    # Consent is persisted locally and defaults off. When enabled, refresh the
+    # release cache in the background so the first agent status call never
+    # waits on PyPI and can naturally surface a newly available version.
+    from .update_awareness import schedule_update_check
+
+    schedule_update_check()
 
     if _args.transport == "http":
         _run_http_loop()

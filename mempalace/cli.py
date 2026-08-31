@@ -1438,6 +1438,31 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_update(args):
+    """Configure, check, or prepare updates without installing automatically."""
+    import json
+
+    from .update_awareness import check_updates, configure_updates, prepare_upgrade
+
+    try:
+        if args.update_action == "configure":
+            result = configure_updates(
+                enabled=args.enabled,
+                interval_days=args.interval_days,
+                installer=args.installer,
+            )
+        elif args.update_action == "check":
+            result = check_updates(force=True)
+        elif args.update_action == "plan":
+            result = prepare_upgrade(installer=args.installer)
+        else:
+            raise ValueError("choose update configure, check, or plan")
+    except (OSError, ValueError) as exc:
+        print(f"mempalace update: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 # ── Logstream (RFC 003 agent coordination) ────────────────────────────────
 
 
@@ -3413,6 +3438,19 @@ def main():
         default=None,
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
+    p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
+    update_sub = p_update.add_subparsers(dest="update_action")
+    p_update_configure = update_sub.add_parser("configure", help="Configure periodic checks")
+    update_consent = p_update_configure.add_mutually_exclusive_group(required=True)
+    update_consent.add_argument("--enable", dest="enabled", action="store_true")
+    update_consent.add_argument("--disable", dest="enabled", action="store_false")
+    p_update_configure.add_argument("--interval-days", type=int, default=7)
+    p_update_configure.add_argument("--installer", choices=("uv-tool", "pipx", "pip"))
+    update_sub.add_parser("check", help="Explicitly check the latest stable release")
+    p_update_plan = update_sub.add_parser(
+        "plan", help="Show the exact upgrade plan without applying it"
+    )
+    p_update_plan.add_argument("--installer", choices=("uv-tool", "pipx", "pip"))
 
     # logstream (RFC 003 agent coordination)
     p_logstream = sub.add_parser(
@@ -3770,6 +3808,7 @@ def main():
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
         "status": cmd_status,
+        "update": cmd_update,
     }
     dispatch[args.command](args)
 

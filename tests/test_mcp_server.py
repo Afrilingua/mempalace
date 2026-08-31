@@ -7152,6 +7152,11 @@ class TestStaleLibraryGate:
 
         self._reset(monkeypatch)
         self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+        monkeypatch.setattr(
+            "mempalace.update_awareness.cached_update_status",
+            lambda: {"enabled": True, "installed": "3.6.0", "available": True},
+        )
+        monkeypatch.setattr("mempalace.update_awareness.schedule_update_check", lambda: False)
 
         decorated = mcp_server._decorate_mcp_tool_result("mempalace_status", {"total_drawers": 0})
 
@@ -7159,6 +7164,13 @@ class TestStaleLibraryGate:
         assert decorated["library_versions"]["packages"] == [
             {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
         ]
+        assert decorated["updates"] == {
+            "server": {
+                "enabled": True,
+                "installed": "3.6.0",
+                "available": True,
+            }
+        }
 
     def test_unreadable_metadata_fails_open_but_says_so(self, monkeypatch):
         """An unreadable metadata directory must not take the server down, but

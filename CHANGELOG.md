@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [3.9.0] — 2026-08-31
+
+One hub now serves every agent: CLI search reuses the live palace index, concurrent reads stop blocking each other, and skill-first coordination plus opt-in release awareness make shared-brain fleets easier to operate safely.
+
 ### Features
 
 - **Release awareness is opt-in and agent-visible.** `mempalace update` can configure or explicitly run stable-release checks and prepare an exact upgrade plan, while `mempalace_status` exposes only cached state so agents can ask for authorization without blocking or installing anything automatically.
@@ -759,7 +765,8 @@ Initial public release.
 
 ---
 
-[Unreleased]: https://github.com/MemPalace/mempalace/compare/v3.7.1...HEAD
+[Unreleased]: https://github.com/MemPalace/mempalace/compare/v3.9.0...HEAD
+[3.9.0]: https://github.com/MemPalace/mempalace/compare/v3.8.0...v3.9.0
 [3.8.0]: https://github.com/MemPalace/mempalace/compare/v3.7.1...v3.8.0
 [3.7.1]: https://github.com/MemPalace/mempalace/compare/v3.7.0...v3.7.1
 [3.7.0]: https://github.com/MemPalace/mempalace/compare/v3.6.0...v3.7.0

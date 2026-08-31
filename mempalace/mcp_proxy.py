@@ -23,15 +23,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import urllib.error
+
+from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub
+
+from .update_awareness import cached_update_status, schedule_update_check
 
 logger = logging.getLogger(__name__)
 
 # Shared with the in-server forwarder and the CLI forwarder.
-_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
-_HUB_PROXY_TIMEOUT_S = 600.0
+_HUB_FORWARD_ENV = HUB_FORWARD_ENV
+_HUB_PROXY_TIMEOUT_S = HUB_PROXY_TIMEOUT_S
 
 _DEGRADED_NOTICE = (
     "MemPalace is running WITHOUT its shared hub. This session is now serving "
@@ -40,10 +43,6 @@ _DEGRADED_NOTICE = (
     "If several agents are running, expect memory pressure until the hub is "
     "back — check that the MemPalace hub process is alive."
 )
-
-
-def _truthy_env_off(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
 
 
 def _is_plain_stdio_invocation(argv: list) -> bool:
@@ -96,20 +95,7 @@ def _palace_path(argv: list):
 
 def _hub_target(palace_path):
     """Return ``(base_url, headers)`` for a live hub serving our palace, else None."""
-    if _truthy_env_off(_HUB_FORWARD_ENV) or not palace_path:
-        return None
-    try:
-        from . import server_registry
-
-        info = server_registry.read_live_serverinfo(palace_path)
-        if not info or info.get("pid") == os.getpid():
-            return None
-        base_url = server_registry.client_base_url(info)
-        headers = {"Content-Type": "application/json"}
-    except Exception:
-        logger.debug("hub discovery failed", exc_info=True)
-        return None
-    return base_url, headers
+    return discover_hub(palace_path)
 
 
 def _forward(base_url: str, headers: dict, request: dict, palace_path: str):
@@ -147,6 +133,38 @@ def _annotate_degraded(response):
     if not isinstance(content, list):
         return response
     result["content"] = [{"type": "text", "text": f"[mempalace] {_DEGRADED_NOTICE}"}, *content]
+    return response
+
+
+def _annotate_forwarded_update_status(request: dict, response):
+    """Attach this proxy runtime's cached state beside the hub's state."""
+    params = request.get("params") or {}
+    if request.get("method") != "tools/call" or params.get("name") != "mempalace_status":
+        return response
+
+    local_status = cached_update_status()
+    schedule_update_check()
+    try:
+        content = response["result"]["content"]
+    except (KeyError, TypeError):
+        return response
+    for block in content if isinstance(content, list) else ():
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        try:
+            payload = json.loads(block.get("text", ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        remote_updates = payload.get("updates")
+        if not isinstance(remote_updates, dict):
+            remote_updates = {}
+        elif "server" not in remote_updates and "client" not in remote_updates:
+            remote_updates = {"server": remote_updates}
+        payload["updates"] = {**remote_updates, "client": local_status}
+        block["text"] = json.dumps(payload, indent=2, ensure_ascii=False)
+        break
     return response
 
 
@@ -225,7 +243,9 @@ def _handle(request: dict, palace_path, local: _LocalServer):
     if target is not None:
         base_url, headers = target
         try:
-            return _forward(base_url, headers, request, palace_path)
+            return _annotate_forwarded_update_status(
+                request, _forward(base_url, headers, request, palace_path)
+            )
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
             # Reaching the hub and getting an HTTP error means it may have run
             # the call; so does any mid-flight failure on a mutating tool.

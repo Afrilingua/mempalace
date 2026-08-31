@@ -1673,6 +1673,31 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_update(args):
+    """Configure, check, or prepare updates without installing automatically."""
+    import json
+
+    from .update_awareness import check_updates, configure_updates, prepare_upgrade
+
+    try:
+        if args.update_action == "configure":
+            result = configure_updates(
+                enabled=args.enabled,
+                interval_days=args.interval_days,
+                installer=args.installer,
+            )
+        elif args.update_action == "check":
+            result = check_updates(force=True)
+        elif args.update_action == "plan":
+            result = prepare_upgrade(installer=args.installer)
+        else:
+            raise ValueError("choose update configure, check, or plan")
+    except (OSError, ValueError) as exc:
+        print(f"mempalace update: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 # ── Logstream (RFC 003 agent coordination) ────────────────────────────────
 
 
@@ -1767,6 +1792,7 @@ def _parse_metadata_arg(raw):
 def _print_event_line(event):
     target = event["to_agent"] or "*"
     corr = f" corr={event['correlation_id']}" if event["correlation_id"] else ""
+    topic = f" topic={event['topic']}" if event.get("topic") else ""
     status = f" [{event['status']}]" if event["status"] else ""
     arts = f" artifacts={len(event['artifact_ids'])}" if event["artifact_ids"] else ""
     body = event["body"].replace("\n", " ")
@@ -1776,7 +1802,7 @@ def _print_event_line(event):
     print(
         f"  {event['id']}  {event['created_at']}  {event['type']}  "
         f"{event['stream']}/{event['room']}  {event['from_agent']}->{target}"
-        f"{status}{corr}{arts}{body}"
+        f"{status}{topic}{corr}{arts}{body}"
     )
 
 
@@ -1839,6 +1865,7 @@ def _watch_spec(args, as_json) -> dict:
     spec = {
         "streams": normalize_watch_values(args.stream),
         "rooms": normalize_watch_values(args.room),
+        "topics": normalize_watch_values(getattr(args, "topic", None)),
         "types": normalize_watch_values(args.type),
         "statuses": normalize_watch_values(args.status),
         "to_agents": normalize_watch_values(to_agents),
@@ -2046,6 +2073,7 @@ def cmd_logstream(args):
                     type=args.type,
                     stream=args.stream,
                     room=args.room,
+                    topic=getattr(args, "topic", None),
                     from_agent=args.from_agent,
                     to_agent=args.to_agent,
                     correlation_id=args.correlation_id,
@@ -2067,6 +2095,7 @@ def cmd_logstream(args):
             filters = {
                 "stream": args.stream,
                 "room": args.room,
+                "topic": getattr(args, "topic", None),
                 "type": args.type,
                 "to_agent": args.to_agent,
                 "from_agent": args.from_agent,
@@ -2077,7 +2106,12 @@ def cmd_logstream(args):
             }
             try:
                 if args.logstream_action == "list":
-                    events = ls.list_events(limit=args.limit, **filters)
+                    events = ls.list_events(
+                        limit=args.limit,
+                        order=getattr(args, "order", "asc"),
+                        before_event_id=getattr(args, "before_event_id", None),
+                        **filters,
+                    )
                     result = {"events": events, "count": len(events)}
                 else:
                     result = ls.wait_events(timeout_ms=args.timeout_ms, limit=args.limit, **filters)
@@ -2140,6 +2174,7 @@ def cmd_logstream(args):
                     from_agent=args.from_agent,
                     status=args.status,
                     body=args.body or "",
+                    topic=getattr(args, "topic", None),
                 )
             except ValueError as exc:
                 _logstream_fail(str(exc), as_json)
@@ -3648,6 +3683,19 @@ def main():
         default=None,
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
+    p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
+    update_sub = p_update.add_subparsers(dest="update_action")
+    p_update_configure = update_sub.add_parser("configure", help="Configure periodic checks")
+    update_consent = p_update_configure.add_mutually_exclusive_group(required=True)
+    update_consent.add_argument("--enable", dest="enabled", action="store_true")
+    update_consent.add_argument("--disable", dest="enabled", action="store_false")
+    p_update_configure.add_argument("--interval-days", type=int, default=7)
+    p_update_configure.add_argument("--installer", choices=("uv-tool", "pipx", "pip"))
+    update_sub.add_parser("check", help="Explicitly check the latest stable release")
+    p_update_plan = update_sub.add_parser(
+        "plan", help="Show the exact upgrade plan without applying it"
+    )
+    p_update_plan.add_argument("--installer", choices=("uv-tool", "pipx", "pip"))
 
     # logstream (RFC 003 agent coordination)
     p_logstream = sub.add_parser(
@@ -3659,6 +3707,7 @@ def main():
     def _add_logstream_filters(p):
         p.add_argument("--stream", default=None, help="Stream, e.g. project/mempalace")
         p.add_argument("--room", default=None, help="Room, e.g. delegation, patches")
+        p.add_argument("--topic", default=None, help="Topic, e.g. auth-v2")
         p.add_argument("--type", default=None, help="Event type, e.g. task.request")
         p.add_argument("--to-agent", default=None, help="Target agent (also matches '*')")
         p.add_argument("--from-agent", default=None, help="Writer agent")
@@ -3679,6 +3728,7 @@ def main():
     p_ls_append.add_argument("--type", required=True, help="Event type, e.g. task.request")
     p_ls_append.add_argument("--stream", required=True, help="Stream, e.g. project/mempalace")
     p_ls_append.add_argument("--room", required=True, help="Room, e.g. delegation")
+    p_ls_append.add_argument("--topic", default=None, help="Topic name, e.g. auth-v2")
     p_ls_append.add_argument("--from-agent", required=True, help="Writer agent identity")
     p_ls_append.add_argument("--to-agent", default=None, help="Target agent or '*'")
     p_ls_append.add_argument("--correlation-id", default=None, help="Task/conversation id")
@@ -3702,8 +3752,19 @@ def main():
     )
     p_ls_append.add_argument("--json", action="store_true", help="Machine-readable output")
 
-    p_ls_list = logstream_sub.add_parser("list", help="List events, oldest first")
+    p_ls_list = logstream_sub.add_parser("list", help="List events")
     _add_logstream_filters(p_ls_list)
+    p_ls_list.add_argument(
+        "--before-event-id",
+        default=None,
+        help="Only events strictly before this id in append order",
+    )
+    p_ls_list.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        default="asc",
+        help="asc (oldest first, default) or desc (newest first)",
+    )
     p_ls_list.add_argument("--limit", type=int, default=50, help="Max events (default 50)")
     p_ls_list.add_argument("--json", action="store_true", help="Machine-readable output")
 
@@ -3740,6 +3801,9 @@ def main():
     )
     p_ls_watch.add_argument(
         "--room", action="append", default=None, help="Room (repeatable; matches any)"
+    )
+    p_ls_watch.add_argument(
+        "--topic", action="append", default=None, help="Topic (repeatable; matches any)"
     )
     p_ls_watch.add_argument(
         "--type", action="append", default=None, help="Event type (repeatable; matches any)"
@@ -3811,6 +3875,9 @@ def main():
         "--status",
         default=None,
         help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_ack.add_argument(
+        "--topic", default=None, help="Topic override (defaults to target event's topic)"
     )
     p_ls_ack.add_argument("--body", default=None, help="Verbatim ack notes")
     p_ls_ack.add_argument("--json", action="store_true", help="Machine-readable output")
@@ -4005,6 +4072,7 @@ def main():
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
         "status": cmd_status,
+        "update": cmd_update,
     }
     dispatch[args.command](args)
 

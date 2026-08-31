@@ -2143,7 +2143,9 @@ def search_memories(
             "source_path": source,
             "created_at": meta.get("filed_at", "unknown"),
             "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
-            "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
+            # Similarity is the raw vector score. Closet boost ranks via
+            # effective_distance but must not inflate the advertised score.
+            "similarity": round(_distance_to_similarity(dist, metric), 3),
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),
